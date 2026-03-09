@@ -40,21 +40,20 @@ with st.sidebar.form("new_sku_form"):
             st.rerun()
 
 # --- 3. 全局搜索过滤功能 ---
-st.write("### 🔍 全局搜索")
-search_query = st.text_input("输入产品名称或颜色进行筛选...", placeholder="例如：钛杯 或 银色")
+st.write("### 🔍 快速查找 SKU")
+search_query = st.text_input("在此输入产品名或颜色（如：钛杯 / 银色），下方所有列表和选项将同步过滤", placeholder="搜索会同时影响下拉菜单的选项...")
 
-# --- 4. 主界面布局 ---
-st.title("🏙️ Takashimaya 零售管理系统")
-t1, t2, t3 = st.tabs(["📊 实时库存看板", "💰 销售记账与撤销", "📈 利润分析看板"])
-
-# 过滤逻辑
+# 辅助函数：用于过滤 DataFrame
 def filter_df(df, query):
     if query:
-        # 同时在名称和颜色列中搜索
         mask = df['商品名称'].str.contains(query, case=False, na=False) | \
                df['颜色'].str.contains(query, case=False, na=False)
         return df[mask]
     return df
+
+# --- 4. 主界面布局 ---
+st.title("🏙️ Takashimaya 零售管理系统")
+t1, t2, t3 = st.tabs(["📊 实时库存看板", "💰 销售记账与撤销", "📈 利润分析看板"])
 
 with t1:
     st.subheader("当前柜台库存分布")
@@ -98,33 +97,46 @@ with t1:
                     df_stock.drop(columns=['label']).to_csv(STOCK_FILE, index=False)
                     st.rerun()
     else:
-        st.info("未找到匹配的产品或尚未录入产品")
+        st.info("尚未录入产品或搜索无结果")
 
 with t2:
     st.subheader("销售记录管理")
-    filtered_sales = filter_df(df_sales, search_query)
     
     col_l, col_r = st.columns([1, 1])
     with col_l:
         st.write("### 1. 新增销售")
-        if df_stock.empty: st.info("请先添加 SKU")
+        if df_stock.empty:
+            st.info("请先添加 SKU")
         else:
+            # --- 核心改进：联动过滤下拉框选项 ---
             df_stock['label'] = df_stock['商品名称'] + " (" + df_stock['颜色'] + ")"
-            with st.form("sales_form"):
-                s_label = st.selectbox("售出商品", df_stock['label'])
-                c_qty, c_pr = st.columns(2)
-                s_qty = c_qty.number_input("数量", min_value=1, step=1)
-                idx_p = df_stock[df_stock['label'] == s_label].index[0]
-                s_price = c_pr.number_input("单价 (SGD)", min_value=0.0, value=float(df_stock.at[idx_p, '售卖价格']))
-                sel_date = st.date_input("销售日期", value=datetime.now())
-                if st.form_submit_button("确认提交记录"):
-                    total = s_qty * s_price
-                    new_sale = pd.DataFrame([[sel_date.strftime("%Y-%m-%d"), df_stock.at[idx_p, '商品名称'], df_stock.at[idx_p, '颜色'], s_qty, s_price, total]], columns=SALES_COLS)
-                    pd.concat([new_sale, df_sales], ignore_index=True).to_csv(SALES_FILE, index=False)
-                    df_stock.at[idx_p, '货柜数量'] -= s_qty
-                    df_stock.at[idx_p, '总库存'] = df_stock.iloc[idx_p][['展示数量', '货柜数量', '储物间数量']].sum()
-                    df_stock.drop(columns=['label']).to_csv(STOCK_FILE, index=False)
-                    st.rerun()
+            # 根据搜索框内容实时筛选下拉列表的候选项
+            filtered_options_df = filter_df(df_stock, search_query)
+            
+            if filtered_options_df.empty:
+                st.warning("⚠️ 搜索框内容匹配不到任何商品，请清空搜索框再录入。")
+            else:
+                with st.form("sales_form"):
+                    s_label = st.selectbox("售出商品 (受上方搜索框联动过滤)", filtered_options_df['label'])
+                    c_qty, c_pr = st.columns(2)
+                    s_qty = c_qty.number_input("数量", min_value=1, step=1)
+                    
+                    # 获取该商品的默认价格
+                    idx_p = df_stock[df_stock['label'] == s_label].index[0]
+                    s_price = c_pr.number_input("成交单价 (SGD)", min_value=0.0, value=float(df_stock.at[idx_p, '售卖价格']))
+                    
+                    sel_date = st.date_input("销售日期", value=datetime.now())
+                    if st.form_submit_button("确认提交记录"):
+                        total = s_qty * s_price
+                        new_sale = pd.DataFrame([[sel_date.strftime("%Y-%m-%d"), df_stock.at[idx_p, '商品名称'], df_stock.at[idx_p, '颜色'], s_qty, s_price, total]], columns=SALES_COLS)
+                        pd.concat([new_sale, df_sales], ignore_index=True).to_csv(SALES_FILE, index=False)
+                        # 扣减库存
+                        df_stock.at[idx_p, '货柜数量'] -= s_qty
+                        df_stock.at[idx_p, '总库存'] = df_stock.iloc[idx_p][['展示数量', '货柜数量', '储物间数量']].sum()
+                        df_stock.drop(columns=['label']).to_csv(STOCK_FILE, index=False)
+                        st.success(f"已录入 {s_label}")
+                        st.rerun()
+
     with col_r:
         st.write("### 2. 撤销/删除记录")
         if not df_sales.empty:
@@ -140,7 +152,9 @@ with t2:
                     df_stock.drop(columns=['label']).to_csv(STOCK_FILE, index=False)
                 df_sales.drop(df_sales.index[del_idx]).drop(columns=['cancel_label']).to_csv(SALES_FILE, index=False)
                 st.rerun()
+    
     st.divider()
+    filtered_sales = filter_df(df_sales, search_query)
     st.write("#### 筛选后的流水记录")
     st.dataframe(filtered_sales.drop(columns=['cancel_label']) if 'cancel_label' in filtered_sales.columns else filtered_sales, use_container_width=True)
 
@@ -161,8 +175,9 @@ with t3:
             analysis['销售数量'], analysis['累计毛利'] = 0, 0
             
         m1, m2, m3 = st.columns(3)
-        m1.metric("筛选部分-总营业额", f"${(filtered_analysis_stock['售卖价格'] * analysis['销售数量']).sum():.2f}")
-        m2.metric("筛选部分-累计利润", f"${analysis['累计毛利'].sum():.2f}")
-        m3.metric("筛选部分-平均毛利率", f"{analysis['毛利率 (%)'].mean():.1f}%")
+        # 注意：这里的统计指标也会随着搜索框实时变化
+        m1.metric("当前筛选-总营业额", f"${(analysis['售卖价格'] * analysis['销售数量']).sum():.2f}")
+        m2.metric("当前筛选-累计利润", f"${analysis['累计毛利'].sum():.2f}")
+        m3.metric("当前筛选-平均毛利率", f"{analysis['毛利率 (%)'].mean():.1f}%")
         
         st.dataframe(analysis[['商品名称', '颜色', '进价成本', '售卖价格', '单件利润', '毛利率 (%)', '累计毛利']].style.format({'毛利率 (%)': "{:.1f}%"}), use_container_width=True)
