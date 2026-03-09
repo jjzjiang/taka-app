@@ -3,12 +3,11 @@ import pandas as pd
 import os
 from datetime import datetime
 
-# --- 1. 核心配置与文件初始化 ---
+# --- 1. 基础配置 ---
 st.set_page_config(page_title="Taka 零售与利润管理", layout="wide")
-STOCK_FILE = "taka_stock_final.csv"
-SALES_FILE = "taka_sales_final.csv"
+STOCK_FILE = "taka_stock_v5.csv"  # 升级版本确保数据格式统一
+SALES_FILE = "taka_sales_v5.csv"
 
-# 严格定义的列名
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '展示数量', '货柜数量', '储物间数量', '总库存']
 SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 
@@ -17,7 +16,12 @@ def load_data(file, columns):
         df = pd.DataFrame(columns=columns)
         df.to_csv(file, index=False)
         return df
-    return pd.read_csv(file)
+    df = pd.read_csv(file)
+    # 确保列名匹配，防止旧文件导致闪退
+    for col in columns:
+        if col not in df.columns:
+            df[col] = 0
+    return df[columns]
 
 df_stock = load_data(STOCK_FILE, STOCK_COLS)
 df_sales = load_data(SALES_FILE, SALES_COLS)
@@ -58,35 +62,42 @@ t1, t2, t3 = st.tabs(["📊 实时库存看板", "💰 销售记账 (补录)", "
 
 with t1:
     st.subheader("当前柜台库存分布")
-    st.dataframe(df_stock.drop(columns=['label']) if 'label' in df_stock.columns else df_stock, use_container_width=True)
+    if not df_stock.empty:
+        # 在看板即时计算毛利率
+        view_df = df_stock.copy()
+        view_df['单件利润'] = view_df['售卖价格'] - view_df['进价成本']
+        view_df['毛利率'] = ((view_df['单件利润'] / view_df['售卖价格']) * 100).fillna(0).map("{:.1f}%".format)
+        # 重新排序显示，让关键信息更靠前
+        cols_to_show = ['商品名称', '颜色', '售卖价格', '毛利率', '展示数量', '货柜数量', '储物间数量', '总库存']
+        st.dataframe(view_df[cols_to_show], use_container_width=True)
+    else:
+        st.info("尚未录入产品")
 
 with t2:
     st.subheader("销售数据录入")
     if df_stock.empty:
         st.info("请先在左侧添加 SKU")
     else:
+        # 统一表单逻辑，修复之前的 StreamlitAPIException
         with st.form("sales_form"):
             c1, c2, c3 = st.columns([2, 1, 1])
             s_label = c1.selectbox("售出商品", df_stock['label'])
             s_qty = c2.number_input("数量", min_value=1, step=1)
-            # 自动带出价格
             idx_p = df_stock[df_stock['label'] == s_label].index[0]
-            s_price = c3.number_input("成交单价", min_value=0.0, value=float(df_stock.at[idx_p, '售卖价格']))
-            
+            s_price = c3.number_input("成交单价 (SGD)", min_value=0.0, value=float(df_stock.at[idx_p, '售卖价格']))
             sel_date = st.date_input("销售日期", value=datetime.now())
-            
-            if st.form_submit_button("确认提交"):
+            if st.form_submit_button("确认提交记录"):
                 name = df_stock.at[idx_p, '商品名称']
                 color = df_stock.at[idx_p, '颜色']
                 total = s_qty * s_price
                 # 写入销售日志
                 new_sale = pd.DataFrame([[sel_date.strftime("%Y-%m-%d"), name, color, s_qty, s_price, total]], columns=SALES_COLS)
                 pd.concat([new_sale, df_sales], ignore_index=True).to_csv(SALES_FILE, index=False)
-                # 扣减货柜库存
+                # 扣减库存
                 df_stock.at[idx_p, '货柜数量'] -= s_qty
                 df_stock.at[idx_p, '总库存'] = df_stock.iloc[idx_p][['展示数量', '货柜数量', '储物间数量']].sum()
                 df_stock.drop(columns=['label']).to_csv(STOCK_FILE, index=False)
-                st.success(f"已成功录入 {name} 的销售记录")
+                st.success(f"已录入 {name} 的销售记录")
                 st.rerun()
     st.dataframe(df_sales, use_container_width=True)
 
@@ -95,25 +106,26 @@ with t3:
     if df_stock.empty:
         st.write("暂无产品数据")
     else:
-        # 计算逻辑
+        # 修复 KeyError 的稳健计算逻辑
         analysis = df_stock.copy()
         analysis['单件利润'] = analysis['售卖价格'] - analysis['进价成本']
-        analysis['毛利率 (%)'] = (analysis['单件利润'] / analysis['售卖价格'] * 100).fillna(0)
+        analysis['毛利率 (%)'] = ((analysis['单件利润'] / analysis['售卖价格']) * 100).fillna(0)
         
-        # 统计销售
         if not df_sales.empty:
             summary = df_sales.groupby(['商品名称', '颜色'])['销售数量'].sum().reset_index()
             analysis = analysis.merge(summary, on=['商品名称', '颜色'], how='left').fillna(0)
-            analysis['累计毛利'] = analysis['销售数量'] * analysis['单件利润']
+            analysis['累计贡献利润'] = analysis['销售数量'] * analysis['单件利润']
         else:
             analysis['销售数量'] = 0
-            analysis['累计毛利'] = 0
+            analysis['累计贡献利润'] = 0
 
-        # 指标卡
+        # 数据指标卡
         m1, m2, m3 = st.columns(3)
-        m1.metric("总营业额", f"${df_sales['总营业额'].sum():.2f}")
-        m2.metric("累计利润", f"${analysis['累计毛利'].sum():.2f}")
-        m3.metric("平均毛利率", f"{analysis['毛利率 (%)'].mean():.1f}%")
+        m1.metric("总营业额 (Total Sales)", f"${df_sales['总营业额'].sum():.2f}")
+        m2.metric("累计利润 (Total Profit)", f"${analysis['累计贡献利润'].sum():.2f}")
+        m3.metric("平均毛利率 (Avg Margin)", f"{analysis['毛利率 (%)'].mean():.1f}%")
         
         st.write("### 各 SKU 盈利明细")
-        st.dataframe(analysis[['商品名称', '颜色', '进价成本', '售卖价格', '单件利润', '销售数量', '累计毛利']], use_container_width=True)
+        # 格式化显示
+        analysis_show = analysis[['商品名称', '颜色', '进价成本', '售卖价格', '单件利润', '毛利率 (%)', '累计贡献利润']]
+        st.dataframe(analysis_show.style.format({'毛利率 (%)': "{:.1f}%", '累计贡献利润': "${:.2f}"}), use_container_width=True)
