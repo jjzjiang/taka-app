@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 STOCK_FILE = "taka_stock_v11_final.csv" 
 SALES_FILE = "taka_sales_v11_final.csv"
-LOW_STOCK_THRESHOLD = 3
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
@@ -24,6 +23,18 @@ def load_data(file, columns):
 
 df_stock = load_data(STOCK_FILE, STOCK_COLS)
 df_sales = load_data(SALES_FILE, SALES_COLS)
+
+# --- 核心更新：初始化动态 Key 计数器 ---
+if "stock_reset_key" not in st.session_state:
+    st.session_state.stock_reset_key = 0
+if "sales_reset_key" not in st.session_state:
+    st.session_state.sales_reset_key = 0
+
+def clear_stock():
+    st.session_state.stock_reset_key += 1
+
+def clear_sales():
+    st.session_state.sales_reset_key += 1
 
 # --- 2. 侧边栏：核心管理与备份恢复 ---
 with st.sidebar:
@@ -55,22 +66,13 @@ with st.sidebar:
         if u_sl and st.button("覆盖流水"):
             pd.read_csv(u_sl).to_csv(SALES_FILE, index=False); st.rerun()
 
-# --- 3. 辅助功能与状态清除回调 ---
+# --- 3. 辅助功能 ---
 q = st.text_input("🔍 快速筛选 SKU 或颜色...", placeholder="搜索将同步联动所有标签页")
 
 def get_f(df, q):
     if q and not df.empty:
         return df[df['商品名称'].str.contains(q, case=False, na=False) | df['颜色'].str.contains(q, case=False, na=False)]
     return df
-
-# 核心更新：强制清除缓存的回调函数
-def clear_stock_state():
-    if "stock_editor" in st.session_state:
-        del st.session_state["stock_editor"]
-
-def clear_sales_state():
-    if "sales_editor" in st.session_state:
-        del st.session_state["sales_editor"]
 
 # --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统")
@@ -87,11 +89,13 @@ with t1:
         
         v_df.insert(0, "选择", False)
         
+        # 核心更新：使用动态 Key 绑定表格
         edited_stock = st.data_editor(
             v_df[['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']],
             column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
             disabled=[col for col in v_df.columns if col != "选择"],
-            use_container_width=True, hide_index=True, key="stock_editor"
+            use_container_width=True, hide_index=True, 
+            key=f"stock_editor_{st.session_state.stock_reset_key}" 
         )
         
         selected_stock = edited_stock[edited_stock["选择"] == True]
@@ -103,11 +107,11 @@ with t1:
                     for _, row in selected_stock.iterrows():
                         df_stock = df_stock[~((df_stock['商品名称'] == row['商品名称']) & (df_stock['颜色'] == row['颜色']))]
                     df_stock.to_csv(STOCK_FILE, index=False)
-                    clear_stock_state() # 删除后清空
+                    st.session_state.stock_reset_key += 1 # 删除后重置 Key
                     st.rerun()
             with col_btn2:
-                # 绑定回调函数：点击按钮前直接清空状态
-                st.button("🔄 取消所有选中", key="cancel_stock", on_click=clear_stock_state)
+                # 点击直接触发重置 Key
+                st.button("🔄 取消所有选中", key="btn_cancel_stock", on_click=clear_stock)
             
             if len(selected_stock) == 1:
                 st.divider()
@@ -121,13 +125,14 @@ with t1:
                     e_cost, e_price, e_sold = c1.number_input("进价", value=float(df_stock.at[orig_idx, '进价成本'])), c2.number_input("售价", value=float(df_stock.at[orig_idx, '售卖价格'])), c3.number_input("已售修正", value=int(df_stock.at[orig_idx, '已售出数量']))
                     i1, i2, i3, i4, i5 = st.columns(5)
                     e_exp, e_dis, e_sh, e_st, e_dm = i1.number_input("应收", value=int(df_stock.at[orig_idx, '应收到数量'])), i2.number_input("展示", value=int(df_stock.at[orig_idx, '展示数量'])), i3.number_input("货柜", value=int(df_stock.at[orig_idx, '货柜数量'])), i4.number_input("储物", value=int(df_stock.at[orig_idx, '储物间数量'])), i5.number_input("坏货", value=int(df_stock.at[orig_idx, '坏货数量']))
+                    
                     if st.form_submit_button("保存校准"):
                         df_stock.at[orig_idx, '商品名称'] = e_name
                         df_stock.at[orig_idx, '进价成本'], df_stock.at[orig_idx, '售卖价格'], df_stock.at[orig_idx, '已售出数量'] = e_cost, e_price, e_sold
                         df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
                         df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st + e_dm
                         df_stock.to_csv(STOCK_FILE, index=False)
-                        clear_stock_state() # 报错校准后清空勾选
+                        st.session_state.stock_reset_key += 1 # 保存后重置 Key
                         st.rerun()
         else:
             st.info("💡 勾选上方复选框可开启批量删除或单项编辑。")
@@ -166,7 +171,9 @@ with t2:
     if not f_sl.empty:
         f_sl_sel = f_sl.copy(); f_sl_sel.insert(0, "选择", False)
         
-        edt = st.data_editor(f_sl_sel, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True, key="sales_editor")
+        # 核心更新：使用动态 Key 绑定流水表
+        edt = st.data_editor(f_sl_sel, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True, 
+                             key=f"sales_editor_{st.session_state.sales_reset_key}")
         sel = edt[edt["选择"] == True]
         
         if not sel.empty:
@@ -181,11 +188,11 @@ with t2:
                     for _, r in sel.iterrows():
                         df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
                     df_stock.to_csv(STOCK_FILE, index=False); df_sales.to_csv(SALES_FILE, index=False)
-                    clear_sales_state() # 撤销流水后清空
+                    st.session_state.sales_reset_key += 1 # 撤销后重置 Key
                     st.rerun()
             with sc2:
-                # 绑定流水表的回调函数
-                st.button("🔄 取消所有选中", key="cancel_sales", on_click=clear_sales_state)
+                # 点击直接触发重置 Key
+                st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
 
 with t3:
     st.subheader("📊 财务日历报表")
