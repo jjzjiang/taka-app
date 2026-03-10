@@ -71,15 +71,13 @@ with t1:
     f_stock = get_f(df_stock, q)
     
     if not f_stock.empty:
-        # --- 核心更新：带复选框的库存表格 ---
         v_df = f_stock.copy()
-        # 强制转整数
         int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量']
         for col in int_cols: v_df[col] = v_df[col].fillna(0).astype(int)
         
         v_df.insert(0, "选择", False)
         
-        # 使用 data_editor
+        # 使用 data_editor 并绑定 key
         edited_stock = st.data_editor(
             v_df[['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']],
             column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
@@ -91,13 +89,20 @@ with t1:
         
         # 批量操作按钮
         if not selected_stock.empty:
-            col_btn1, col_btn2 = st.columns([1, 4])
+            col_btn1, col_btn2, col_btn3 = st.columns([1.5, 1.5, 4]) # 调整列宽容纳新按钮
             with col_btn1:
-                if st.button("🗑️ 批量删除选中 SKU", type="primary"):
-                    # 联动删除：根据名称和颜色匹配
+                if st.button("🗑️ 批量删除选中", type="primary"):
                     for _, row in selected_stock.iterrows():
                         df_stock = df_stock[~((df_stock['商品名称'] == row['商品名称']) & (df_stock['颜色'] == row['颜色']))]
-                    df_stock.to_csv(STOCK_FILE, index=False); st.rerun()
+                    df_stock.to_csv(STOCK_FILE, index=False)
+                    if "stock_editor" in st.session_state: del st.session_state["stock_editor"] # 删除后清空选中状态
+                    st.rerun()
+            with col_btn2:
+                # 新增：取消选中按钮
+                if st.button("🔄 取消所有选中", key="cancel_stock"):
+                    if "stock_editor" in st.session_state:
+                        del st.session_state["stock_editor"]
+                    st.rerun()
             
             # 如果只选了一个，开启编辑模式
             if len(selected_stock) == 1:
@@ -117,7 +122,9 @@ with t1:
                         df_stock.at[orig_idx, '进价成本'], df_stock.at[orig_idx, '售卖价格'], df_stock.at[orig_idx, '已售出数量'] = e_cost, e_price, e_sold
                         df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
                         df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st + e_dm
-                        df_stock.to_csv(STOCK_FILE, index=False); st.rerun()
+                        df_stock.to_csv(STOCK_FILE, index=False)
+                        if "stock_editor" in st.session_state: del st.session_state["stock_editor"] # 保存后清空选中状态
+                        st.rerun()
         else:
             st.info("💡 勾选上方复选框可开启批量删除或单项编辑。")
     else:
@@ -126,13 +133,11 @@ with t1:
 with t2:
     st.subheader("销售记账与流水管理")
     with st.expander("➕ 新增销售", expanded=True):
-        f_opts = get_f(df_stock, q).copy() # 【修改1：使用 copy 避免污染源数据】
+        f_opts = get_f(df_stock, q).copy() 
         if not f_opts.empty:
-            f_opts['label'] = f_opts['商品名称'] + " (" + f_opts['颜色'] + ")" # 【修改2：在独立 DataFrame 中生成 label】
+            f_opts['label'] = f_opts['商品名称'] + " (" + f_opts['颜色'] + ")" 
             with st.form("add_sale"):
                 s_l = st.selectbox("商品", f_opts['label'])
-                
-                # 获取选中商品的原始售卖价格
                 selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
                 default_price = float(selected_row['售卖价格'])
                 
@@ -141,18 +146,14 @@ with t2:
                 s_d = st.date_input("日期", value=datetime.now())
                 
                 if st.form_submit_button("确认"):
-                    # 根据商品名称和颜色找回原数据中的 index
                     idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
-                    
                     new_s = pd.DataFrame([[s_d.strftime("%Y-%m-%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
                     pd.concat([new_s, df_sales], ignore_index=True).to_csv(SALES_FILE, index=False)
                     
-                    # 更新库存数量
                     df_stock.at[idx_p, '货柜数量'] -= s_q
                     df_stock.at[idx_p, '已售出数量'] += s_q
                     df_stock.at[idx_p, '总库存'] = df_stock.iloc[idx_p][['展示数量', '货柜数量', '储物间数量', '坏货数量']].sum()
                     
-                    # 【修改3：直接存 df_stock，不需要再 drop label 列，因为根本没加进源数据里】
                     df_stock.to_csv(STOCK_FILE, index=False) 
                     st.rerun()
 
@@ -160,17 +161,30 @@ with t2:
     f_sl = get_f(df_sales, q)
     if not f_sl.empty:
         f_sl_sel = f_sl.copy(); f_sl_sel.insert(0, "选择", False)
-        edt = st.data_editor(f_sl_sel, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True)
+        # 为流水表的 editor 也加上 key
+        edt = st.data_editor(f_sl_sel, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True, key="sales_editor")
         sel = edt[edt["选择"] == True]
-        if not sel.empty and st.button("🔴 批量撤销", type="primary"):
-            for _, r in sel.iterrows():
-                m = df_stock[(df_stock['商品名称']==r['商品名称']) & (df_stock['颜色']==r['颜色'])].index
-                if not m.empty:
-                    df_stock.at[m[0], '货柜数量'] += r['销售数量']; df_stock.at[m[0], '已售出数量'] -= r['销售数量']
-                    df_stock.at[m[0], '总库存'] = df_stock.iloc[m[0]][['展示数量', '货柜数量', '储物间数量', '坏货数量']].sum()
-            for _, r in sel.iterrows():
-                df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
-            df_stock.to_csv(STOCK_FILE, index=False); df_sales.to_csv(SALES_FILE, index=False); st.rerun()
+        
+        if not sel.empty:
+            sc1, sc2, sc3 = st.columns([1.5, 1.5, 4])
+            with sc1:
+                if st.button("🔴 批量撤销流水", type="primary"):
+                    for _, r in sel.iterrows():
+                        m = df_stock[(df_stock['商品名称']==r['商品名称']) & (df_stock['颜色']==r['颜色'])].index
+                        if not m.empty:
+                            df_stock.at[m[0], '货柜数量'] += r['销售数量']; df_stock.at[m[0], '已售出数量'] -= r['销售数量']
+                            df_stock.at[m[0], '总库存'] = df_stock.iloc[m[0]][['展示数量', '货柜数量', '储物间数量', '坏货数量']].sum()
+                    for _, r in sel.iterrows():
+                        df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
+                    df_stock.to_csv(STOCK_FILE, index=False); df_sales.to_csv(SALES_FILE, index=False)
+                    if "sales_editor" in st.session_state: del st.session_state["sales_editor"] # 撤销后清空选中状态
+                    st.rerun()
+            with sc2:
+                # 新增：取消流水选中按钮
+                if st.button("🔄 取消所有选中", key="cancel_sales"):
+                    if "sales_editor" in st.session_state:
+                        del st.session_state["sales_editor"]
+                    st.rerun()
 
 with t3:
     st.subheader("📊 财务日历报表")
