@@ -7,10 +7,12 @@ import gspread # 新增：用于连接谷歌表格的官方库
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 
 # ⚠️ 核心配置：连接 Google Sheets
+import json
+
 try:
-    # 这一步会自动寻找同一文件夹下的 google_key.json 作为钥匙
-    gc = gspread.service_account(filename='google_key.json')
-    # 你的谷歌表格的名字，必须完全一致
+    # 从 Streamlit 的云端保险箱读取密钥
+    key_dict = json.loads(st.secrets["google_key"])
+    gc = gspread.service_account_from_dict(key_dict)
     sh = gc.open('Taka_Retail_DB')
 except Exception as e:
     st.error(f"🔴 连接云端数据库失败！请检查：1. google_key.json 是否放在了代码同一个文件夹。2. 你的电脑现在有网吗？详细错误: {e}")
