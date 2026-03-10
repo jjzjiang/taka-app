@@ -89,7 +89,6 @@ with t1:
         
         v_df.insert(0, "选择", False)
         
-        # 核心更新：使用动态 Key 绑定表格
         edited_stock = st.data_editor(
             v_df[['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']],
             column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
@@ -107,10 +106,9 @@ with t1:
                     for _, row in selected_stock.iterrows():
                         df_stock = df_stock[~((df_stock['商品名称'] == row['商品名称']) & (df_stock['颜色'] == row['颜色']))]
                     df_stock.to_csv(STOCK_FILE, index=False)
-                    st.session_state.stock_reset_key += 1 # 删除后重置 Key
+                    st.session_state.stock_reset_key += 1 
                     st.rerun()
             with col_btn2:
-                # 点击直接触发重置 Key
                 st.button("🔄 取消所有选中", key="btn_cancel_stock", on_click=clear_stock)
             
             if len(selected_stock) == 1:
@@ -132,7 +130,7 @@ with t1:
                         df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
                         df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st + e_dm
                         df_stock.to_csv(STOCK_FILE, index=False)
-                        st.session_state.stock_reset_key += 1 # 保存后重置 Key
+                        st.session_state.stock_reset_key += 1 
                         st.rerun()
         else:
             st.info("💡 勾选上方复选框可开启批量删除或单项编辑。")
@@ -171,7 +169,6 @@ with t2:
     if not f_sl.empty:
         f_sl_sel = f_sl.copy(); f_sl_sel.insert(0, "选择", False)
         
-        # 核心更新：使用动态 Key 绑定流水表
         edt = st.data_editor(f_sl_sel, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True, 
                              key=f"sales_editor_{st.session_state.sales_reset_key}")
         sel = edt[edt["选择"] == True]
@@ -188,10 +185,9 @@ with t2:
                     for _, r in sel.iterrows():
                         df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
                     df_stock.to_csv(STOCK_FILE, index=False); df_sales.to_csv(SALES_FILE, index=False)
-                    st.session_state.sales_reset_key += 1 # 撤销后重置 Key
+                    st.session_state.sales_reset_key += 1
                     st.rerun()
             with sc2:
-                # 点击直接触发重置 Key
                 st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
 
 with t3:
@@ -211,11 +207,16 @@ with t3:
             summ = summ.merge(df_stock[['商品名称', '颜色', '进价成本']], on=['商品名称', '颜色'], how='left')
             summ['具体毛利'] = summ['总营业额'] - (summ['销售数量'] * summ['进价成本'])
             
+            # --- 核心更新：先过滤数据，再基于过滤后的数据计算指标 ---
+            filtered_summ = get_f(summ, q) 
+            
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("总营业额", f"${summ['总营业额'].sum():.2f}")
-            c2.metric("具体毛利", f"${summ['具体毛利'].sum():.2f}")
-            c3.metric("总售出件数", f"{int(summ['销售数量'].sum())} 件")
-            avg_m = summ['具体毛利'].sum()/summ['总营业额'].sum()*100 if summ['总营业额'].sum()>0 else 0
+            # 使用 filtered_summ 来计算 metric
+            c1.metric("总营业额", f"${filtered_summ['总营业额'].sum():.2f}")
+            c2.metric("具体毛利", f"${filtered_summ['具体毛利'].sum():.2f}")
+            c3.metric("总售出件数", f"{int(filtered_summ['销售数量'].sum())} 件")
+            avg_m = filtered_summ['具体毛利'].sum() / filtered_summ['总营业额'].sum() * 100 if filtered_summ['总营业额'].sum() > 0 else 0
             c4.metric("平均毛利率", f"{avg_m:.1f}%")
             
-            st.dataframe(get_f(summ.sort_values('周期', ascending=False), q).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+            # 渲染数据表格
+            st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
