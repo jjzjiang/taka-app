@@ -8,12 +8,12 @@ st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 STOCK_FILE = "taka_stock_v11_final.csv" 
 SALES_FILE = "taka_sales_v11_final.csv"
 EMPLOYEE_FILE = "taka_employees_v1.csv"
-ATTENDANCE_FILE = "taka_attendance_v1.csv" # 新增：考勤数据文件
+ATTENDANCE_FILE = "taka_attendance_v1.csv" 
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
-ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资'] # 新增：考勤表头
+ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资'] 
 
 def load_data(file, columns):
     if not os.path.exists(file):
@@ -28,13 +28,13 @@ def load_data(file, columns):
 df_stock = load_data(STOCK_FILE, STOCK_COLS)
 df_sales = load_data(SALES_FILE, SALES_COLS)
 df_employee = load_data(EMPLOYEE_FILE, EMP_COLS)
-df_attendance = load_data(ATTENDANCE_FILE, ATT_COLS) # 加载考勤数据
+df_attendance = load_data(ATTENDANCE_FILE, ATT_COLS) 
 
 # --- 核心更新：初始化动态 Key 计数器 ---
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
 if "emp_reset_key" not in st.session_state: st.session_state.emp_reset_key = 0
-if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0 # 考勤重置Key
+if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0 
 
 def clear_stock(): st.session_state.stock_reset_key += 1
 def clear_sales(): st.session_state.sales_reset_key += 1
@@ -64,13 +64,21 @@ with st.sidebar:
     st.download_button("📥 备份库存", df_stock.to_csv(index=False).encode('utf-8-sig'), "stock.csv", "text/csv")
     st.download_button("📥 备份流水", df_sales.to_csv(index=False).encode('utf-8-sig'), "sales.csv", "text/csv")
     st.download_button("📥 备份员工", df_employee.to_csv(index=False).encode('utf-8-sig'), "employees.csv", "text/csv")
-    st.download_button("📥 备份考勤", df_attendance.to_csv(index=False).encode('utf-8-sig'), "attendance.csv", "text/csv") # 新增考勤备份
+    st.download_button("📥 备份考勤", df_attendance.to_csv(index=False).encode('utf-8-sig'), "attendance.csv", "text/csv") 
     
     with st.expander("📂 恢复备份 (CSV)"):
         u_st = st.file_uploader("恢复库存", type="csv")
         if u_st and st.button("覆盖库存"): pd.read_csv(u_st).to_csv(STOCK_FILE, index=False); st.rerun()
+        
         u_sl = st.file_uploader("恢复流水", type="csv")
         if u_sl and st.button("覆盖流水"): pd.read_csv(u_sl).to_csv(SALES_FILE, index=False); st.rerun()
+        
+        # --- 新增：恢复员工和考勤数据 ---
+        u_emp = st.file_uploader("恢复员工档案", type="csv")
+        if u_emp and st.button("覆盖员工"): pd.read_csv(u_emp).to_csv(EMPLOYEE_FILE, index=False); st.rerun()
+        
+        u_att = st.file_uploader("恢复考勤记录", type="csv")
+        if u_att and st.button("覆盖考勤"): pd.read_csv(u_att).to_csv(ATTENDANCE_FILE, index=False); st.rerun()
 
 # --- 3. 辅助功能 ---
 q = st.text_input("🔍 快速筛选 (SKU / 颜色 / 员工姓名)...", placeholder="搜索将同步联动所有标签页")
@@ -80,7 +88,6 @@ def get_f(df, q):
         if '商品名称' in df.columns and '颜色' in df.columns:
             return df[df['商品名称'].str.contains(q, case=False, na=False) | df['颜色'].str.contains(q, case=False, na=False)]
         elif '员工姓名' in df.columns:
-            # 员工表和考勤表都有'员工姓名'，可以通用此搜索
             return df[df['员工姓名'].str.contains(q, case=False, na=False)]
     return df
 
@@ -212,7 +219,6 @@ with t3:
             st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
 
 with t4:
-    # 拆分为左右两列，或者上下两块。这里用上下两块更清晰。
     st.subheader("👥 员工档案管理")
     with st.expander("➕ 新增员工档案", expanded=False):
         with st.form("add_employee"):
@@ -289,21 +295,15 @@ with t4:
                 att_date = c2.date_input("工作日期", value=datetime.now())
                 
                 c3, c4 = st.columns(2)
-                # 默认排班时间 10:00 到 18:00
                 att_start = c3.time_input("上班时间", value=time(10, 0))
                 att_end = c4.time_input("下班时间", value=time(18, 0))
                 
                 if st.form_submit_button("确认记录考勤"):
                     dt_start = datetime.combine(att_date, att_start)
                     dt_end = datetime.combine(att_date, att_end)
-                    
-                    # 处理跨天情况（比如下班时间早于上班时间，认定为跨到了第二天）
-                    if dt_end < dt_start:
-                        dt_end += timedelta(days=1)
+                    if dt_end < dt_start: dt_end += timedelta(days=1)
                         
                     duration_hours = (dt_end - dt_start).total_seconds() / 3600.0
-                    
-                    # 获取该员工的当前时薪
                     hourly_wage = float(df_employee[df_employee['员工姓名'] == att_name]['时薪'].iloc[0])
                     total_wage = duration_hours * hourly_wage
                     
@@ -313,11 +313,11 @@ with t4:
                         round(duration_hours, 2), round(total_wage, 2)
                     ]], columns=ATT_COLS)
                     
+                    # 修复：确保新打卡的记录排在最前面
                     pd.concat([new_att, df_attendance], ignore_index=True).to_csv(ATTENDANCE_FILE, index=False)
                     st.success(f"已记录 {att_name} 的工时: {round(duration_hours, 1)} 小时，核算薪资: ${round(total_wage, 2)}")
                     st.rerun()
 
-        # 展示考勤记录 (同样支持多选与删除)
         f_att = get_f(df_attendance, q)
         if not f_att.empty:
             v_att = f_att.copy()
@@ -336,10 +336,19 @@ with t4:
                 col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
                 with col_btn1:
                     if st.button("🗑️ 删除选中打卡记录", type="primary", key="del_att"):
-                        # 由于考勤记录可能存在同名同天，严格匹配整行数据进行删除
                         for _, row in selected_att.iterrows():
                             df_attendance = df_attendance[~((df_attendance['员工姓名'] == row['员工姓名']) & (df_attendance['日期'] == row['日期']) & (df_attendance['开始时间'] == row['开始时间']))]
                         df_attendance.to_csv(ATTENDANCE_FILE, index=False)
                         st.session_state.att_reset_key += 1 
                         st.rerun()
                 with col_btn2: st.button("🔄 取消所有选中", key="btn_cancel_att", on_click=clear_att)
+            
+            # --- 新增：汇总统计 ---
+            st.divider()
+            total_hours = f_att['工作时长'].astype(float).sum()
+            total_wage = f_att['核算薪资'].astype(float).sum()
+            
+            c_t1, c_t2, c_t3 = st.columns([2, 1, 1])
+            c_t1.markdown(f"**🧾 列表总计** (共 {len(f_att)} 条记录)")
+            c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
+            c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
