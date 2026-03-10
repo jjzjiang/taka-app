@@ -3,10 +3,10 @@ import pandas as pd
 import os
 from datetime import datetime, timedelta
 
-# --- 1. 配置与初始化 ---
-st.set_page_config(page_title="Taka 零售财务终极版", layout="wide")
-STOCK_FILE = "taka_stock_v11.csv" 
-SALES_FILE = "taka_sales_v11.csv"
+# --- 1. 配置与文件初始化 ---
+st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
+STOCK_FILE = "taka_stock_v11_final.csv" 
+SALES_FILE = "taka_sales_v11_final.csv"
 LOW_STOCK_THRESHOLD = 3
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
@@ -28,7 +28,7 @@ df_sales = load_data(SALES_FILE, SALES_COLS)
 # --- 2. 侧边栏：核心管理与备份恢复 ---
 with st.sidebar:
     st.header("🛠️ 核心管理")
-    with st.expander("➕ 新增产品 (Add SKU)", expanded=False):
+    with st.expander("➕ 新增产品 (Add SKU)"):
         with st.form("new_sku"):
             n_name = st.text_input("产品名称")
             n_color = st.text_input("颜色")
@@ -40,72 +40,90 @@ with st.sidebar:
                 if n_name and n_color:
                     total = n_disp + n_shelf + n_stor + n_dmg
                     new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
-                    pd.concat([df_stock, new_r], ignore_index=True).to_csv(STOCK_FILE, index=False)
-                    st.rerun()
+                    pd.concat([df_stock, new_r], ignore_index=True).to_csv(STOCK_FILE, index=False); st.rerun()
 
     st.divider()
     st.write("### 💾 数据中心")
     st.download_button("📥 备份库存", df_stock.to_csv(index=False).encode('utf-8-sig'), "stock.csv", "text/csv")
     st.download_button("📥 备份流水", df_sales.to_csv(index=False).encode('utf-8-sig'), "sales.csv", "text/csv")
-    with st.expander("📂 恢复备份 (CSV)", expanded=True):
+    with st.expander("📂 恢复备份 (CSV)"):
         u_st = st.file_uploader("恢复库存", type="csv")
-        if u_st and st.button("确认覆盖库存"):
+        if u_st and st.button("覆盖库存"):
             pd.read_csv(u_st).to_csv(STOCK_FILE, index=False); st.rerun()
         u_sl = st.file_uploader("恢复流水", type="csv")
-        if u_sl and st.button("确认覆盖流水"):
+        if u_sl and st.button("覆盖流水"):
             pd.read_csv(u_sl).to_csv(SALES_FILE, index=False); st.rerun()
 
 # --- 3. 辅助功能 ---
-q = st.text_input("🔍 快速筛选 SKU 或颜色...")
+q = st.text_input("🔍 快速筛选 SKU 或颜色...", placeholder="搜索将同步联动所有标签页")
 def get_f(df, q):
     if q and not df.empty:
         return df[df['商品名称'].str.contains(q, case=False, na=False) | df['颜色'].str.contains(q, case=False, na=False)]
     return df
 
 # --- 4. 主界面布局 ---
-t1, t2, t3 = st.tabs(["📊 库存看板与编辑", "💰 批量记账管理", "📈 财务多维分析"])
+st.title("🏙️ Takashimaya 零售管理系统")
+t1, t2, t3 = st.tabs(["📊 库存看板与批量管理", "💰 销售记账 (批量撤销)", "📈 财务多维分析"])
 
 with t1:
+    st.subheader("库存实物分布 (勾选以进行批量删除或编辑)")
     f_stock = get_f(df_stock, q)
-    st.subheader("当前柜台实物分布 (低库存报警)")
-    v_df = f_stock.copy()
     
-    # 强制转为整数：解决截图中的小数点问题
-    int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量']
-    for col in int_cols:
-        v_df[col] = v_df[col].fillna(0).astype(int)
+    if not f_stock.empty:
+        # --- 核心更新：带复选框的库存表格 ---
+        v_df = f_stock.copy()
+        # 强制转整数
+        int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量']
+        for col in int_cols: v_df[col] = v_df[col].fillna(0).astype(int)
         
-    v_df['单件利润'] = v_df['售卖价格'] - v_df['进价成本']
-    v_df['毛利率'] = ((v_df['单件利润'] / v_df['售卖价格']) * 100).fillna(0).map("{:.1f}%".format)
-    
-    st.dataframe(
-        v_df[['商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '毛利率']]
-        .style.apply(lambda r: ['background-color: #ffcccc' if r['总库存'] <= LOW_STOCK_THRESHOLD else '' for _ in r], axis=1),
-        use_container_width=True
-    )
-    
-    # --- 关键加回：修改工具栏 ---
-    if not df_stock.empty:
-        st.divider()
-        st.write("### ⚙️ 信息/坏货快速校准 (Edit SKU)")
-        df_stock['label'] = df_stock['商品名称'] + " (" + df_stock['颜色'] + ")"
-        target = st.selectbox("选择商品", df_stock['label'], key="t1_edit")
-        idx = df_stock[df_stock['label'] == target].index[0]
-        with st.form("edit_stock"):
-            e_name = st.text_input("产品名称", value=df_stock.at[idx, '商品名称'])
-            c1, c2, c3 = st.columns(3)
-            e_cost, e_price, e_sold = c1.number_input("进价", value=float(df_stock.at[idx, '进价成本'])), c2.number_input("售价", value=float(df_stock.at[idx, '售卖价格'])), c3.number_input("已售修正", value=int(df_stock.at[idx, '已售出数量']))
-            i1, i2, i3, i4, i5 = st.columns(5)
-            e_exp, e_dis, e_sh, e_st, e_dm = i1.number_input("应收", value=int(df_stock.at[idx, '应收到数量'])), i2.number_input("展示", value=int(df_stock.at[idx, '展示数量'])), i3.number_input("货柜", value=int(df_stock.at[idx, '货柜数量'])), i4.number_input("储物", value=int(df_stock.at[idx, '储物间数量'])), i5.number_input("坏货", value=int(df_stock.at[idx, '坏货数量']))
-            if st.form_submit_button("保存校准"):
-                df_stock.at[idx, '商品名称'] = e_name
-                df_stock.at[idx, '进价成本'], df_stock.at[idx, '售卖价格'], df_stock.at[idx, '已售出数量'] = e_cost, e_price, e_sold
-                df_stock.at[idx, '应收到数量'], df_stock.at[idx, '展示数量'], df_stock.at[idx, '货柜数量'], df_stock.at[idx, '储物间数量'], df_stock.at[idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
-                df_stock.at[idx, '总库存'] = e_dis + e_sh + e_st + e_dm
-                df_stock.drop(columns=['label']).to_csv(STOCK_FILE, index=False); st.rerun()
+        v_df.insert(0, "选择", False)
+        
+        # 使用 data_editor
+        edited_stock = st.data_editor(
+            v_df[['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']],
+            column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
+            disabled=[col for col in v_df.columns if col != "选择"],
+            use_container_width=True, hide_index=True, key="stock_editor"
+        )
+        
+        selected_stock = edited_stock[edited_stock["选择"] == True]
+        
+        # 批量操作按钮
+        if not selected_stock.empty:
+            col_btn1, col_btn2 = st.columns([1, 4])
+            with col_btn1:
+                if st.button("🗑️ 批量删除选中 SKU", type="primary"):
+                    # 联动删除：根据名称和颜色匹配
+                    for _, row in selected_stock.iterrows():
+                        df_stock = df_stock[~((df_stock['商品名称'] == row['商品名称']) & (df_stock['颜色'] == row['颜色']))]
+                    df_stock.to_csv(STOCK_FILE, index=False); st.rerun()
+            
+            # 如果只选了一个，开启编辑模式
+            if len(selected_stock) == 1:
+                st.divider()
+                st.write("### ⚙️ 编辑选中商品信息")
+                row = selected_stock.iloc[0]
+                orig_idx = df_stock[(df_stock['商品名称'] == row['商品名称']) & (df_stock['颜色'] == row['颜色'])].index[0]
+                
+                with st.form("edit_selected_stock"):
+                    e_name = st.text_input("产品名称", value=df_stock.at[orig_idx, '商品名称'])
+                    c1, c2, c3 = st.columns(3)
+                    e_cost, e_price, e_sold = c1.number_input("进价", value=float(df_stock.at[orig_idx, '进价成本'])), c2.number_input("售价", value=float(df_stock.at[orig_idx, '售卖价格'])), c3.number_input("已售修正", value=int(df_stock.at[orig_idx, '已售出数量']))
+                    i1, i2, i3, i4, i5 = st.columns(5)
+                    e_exp, e_dis, e_sh, e_st, e_dm = i1.number_input("应收", value=int(df_stock.at[orig_idx, '应收到数量'])), i2.number_input("展示", value=int(df_stock.at[orig_idx, '展示数量'])), i3.number_input("货柜", value=int(df_stock.at[orig_idx, '货柜数量'])), i4.number_input("储物", value=int(df_stock.at[orig_idx, '储物间数量'])), i5.number_input("坏货", value=int(df_stock.at[orig_idx, '坏货数量']))
+                    if st.form_submit_button("保存校准"):
+                        df_stock.at[orig_idx, '商品名称'] = e_name
+                        df_stock.at[orig_idx, '进价成本'], df_stock.at[orig_idx, '售卖价格'], df_stock.at[orig_idx, '已售出数量'] = e_cost, e_price, e_sold
+                        df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
+                        df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st + e_dm
+                        df_stock.to_csv(STOCK_FILE, index=False); st.rerun()
+        else:
+            st.info("💡 勾选上方复选框可开启批量删除或单项编辑。")
+    else:
+        st.info("暂无库存数据，请先通过侧边栏添加。")
 
 with t2:
-    st.subheader("销售记账与流水操作")
+    st.subheader("销售记账与流水管理")
     with st.expander("➕ 新增销售", expanded=True):
         f_opts = get_f(df_stock, q)
         if not f_opts.empty:
@@ -113,7 +131,7 @@ with t2:
             with st.form("add_sale"):
                 s_l = st.selectbox("商品", f_opts['label'])
                 c1, c2 = st.columns(2)
-                s_q, s_p = c1.number_input("数量", 1), c2.number_input("成交单价", value=float(df_stock[df_stock['label']==s_l]['售卖价格'].iloc[0]))
+                s_q, s_p = c1.number_input("数量", 1), c2.number_input("单价", value=float(df_stock[df_stock['label']==s_l]['售卖价格'].iloc[0]))
                 s_d = st.date_input("日期", value=datetime.now())
                 if st.form_submit_button("确认"):
                     idx_p = df_stock[df_stock['label'] == s_l].index[0]
@@ -134,26 +152,21 @@ with t2:
             for _, r in sel.iterrows():
                 m = df_stock[(df_stock['商品名称']==r['商品名称']) & (df_stock['颜色']==r['颜色'])].index
                 if not m.empty:
-                    df_stock.at[m[0], '货柜数量'] += r['销售数量']
-                    df_stock.at[m[0], '已售出数量'] -= r['销售数量']
+                    df_stock.at[m[0], '货柜数量'] += r['销售数量']; df_stock.at[m[0], '已售出数量'] -= r['销售数量']
                     df_stock.at[m[0], '总库存'] = df_stock.iloc[m[0]][['展示数量', '货柜数量', '储物间数量', '坏货数量']].sum()
             for _, r in sel.iterrows():
                 df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
             df_stock.to_csv(STOCK_FILE, index=False); df_sales.to_csv(SALES_FILE, index=False); st.rerun()
 
 with t3:
-    st.subheader("📊 财务日历透视报表")
+    st.subheader("📊 财务日历报表")
     if not df_sales.empty:
-        # --- 日历范围筛选器 ---
         df_sales['日期_dt'] = pd.to_datetime(df_sales['日期'])
-        st.write("### 📅 自定义时间筛选")
         sel_range = st.date_input("选择查看时间段", value=[df_sales['日期_dt'].min(), df_sales['日期_dt'].max()])
-        
         if len(sel_range) == 2:
             start, end = sel_range
             f_sales_range = df_sales[(df_sales['日期_dt'] >= pd.Timestamp(start)) & (df_sales['日期_dt'] <= pd.Timestamp(end))].copy()
-            
-            period = st.radio("统计维度", ["Daily", "Weekly Summary", "Monthly"], horizontal=True)
+            period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
             if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m-%d')
             elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
             else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m')
@@ -161,15 +174,12 @@ with t3:
             summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
             summ = summ.merge(df_stock[['商品名称', '颜色', '进价成本']], on=['商品名称', '颜色'], how='left')
             summ['具体毛利'] = summ['总营业额'] - (summ['销售数量'] * summ['进价成本'])
-            summ = summ.sort_values('周期', ascending=False)
             
-            st.markdown("---")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("总营业额", f"${summ['总营业额'].sum():.2f}")
             c2.metric("具体毛利", f"${summ['具体毛利'].sum():.2f}")
             c3.metric("总售出件数", f"{int(summ['销售数量'].sum())} 件")
             avg_m = summ['具体毛利'].sum()/summ['总营业额'].sum()*100 if summ['总营业额'].sum()>0 else 0
             c4.metric("平均毛利率", f"{avg_m:.1f}%")
-            st.markdown("---")
             
-            st.dataframe(get_f(summ, q).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+            st.dataframe(get_f(summ.sort_values('周期', ascending=False), q).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
