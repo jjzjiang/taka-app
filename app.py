@@ -1,24 +1,21 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, time
-import gspread # 新增：用于连接谷歌表格的官方库
+import gspread 
+import json
 
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 
-# ⚠️ 核心配置：连接 Google Sheets
-import json
-
 try:
-    # 从 Streamlit 的云端保险箱读取密钥
+    # 🌟 终极进化：钥匙和网址全都从云端保险箱拿，代码里不留任何隐私！
     key_dict = json.loads(st.secrets["google_key"])
     gc = gspread.service_account_from_dict(key_dict)
-    sh = gc.open('Taka_Retail_DB')
+    sh = gc.open_by_url(st.secrets["sheet_url"]) # 自动去保险箱拿网址
 except Exception as e:
-    st.error(f"🔴 连接云端数据库失败！请检查：1. google_key.json 是否放在了代码同一个文件夹。2. 你的电脑现在有网吗？详细错误: {e}")
+    st.error(f"🔴 连接云端数据库失败！详细错误: {e}")
     st.stop()
 
-# 设定四个工作表的名字（必须和你在谷歌表格底部建的 Tab 名字一模一样）
 STOCK_SHEET = "Stock"
 SALES_SHEET = "Sales"
 EMP_SHEET = "Employee"
@@ -38,7 +35,6 @@ def load_data(sheet_name, columns):
             df = pd.DataFrame(columns=columns)
         else:
             df = pd.DataFrame(records)
-        # 确保所有列都在，防止数据错位
         for col in columns:
             if col not in df.columns: df[col] = 0
         return df[columns]
@@ -49,10 +45,8 @@ def load_data(sheet_name, columns):
 # --- 云端保存函数 ---
 def save_data(df, sheet_name):
     worksheet = sh.worksheet(sheet_name)
-    worksheet.clear() # 先清空旧数据
-    # 谷歌表格要求数据不能包含特殊空白字符，我们处理一下
+    worksheet.clear() 
     df_safe = df.fillna("").astype(str)
-    # 把数据打包成谷歌喜欢的格式上传
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
     worksheet.update(values=data_to_upload, range_name='A1')
 
@@ -73,7 +67,7 @@ def clear_sales(): st.session_state.sales_reset_key += 1
 def clear_emp(): st.session_state.emp_reset_key += 1
 def clear_att(): st.session_state.att_reset_key += 1
 
-# --- 2. 侧边栏：核心管理与备份恢复 ---
+# --- 2. 侧边栏：核心管理 ---
 with st.sidebar:
     st.header("🛠️ 核心管理")
     with st.expander("➕ 新增产品 (Add SKU)"):
@@ -89,13 +83,13 @@ with st.sidebar:
                     total = n_disp + n_shelf + n_stor + n_dmg
                     new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
                     df_stock = pd.concat([df_stock, new_r], ignore_index=True)
-                    save_data(df_stock, STOCK_SHEET) # 云端保存
+                    save_data(df_stock, STOCK_SHEET) 
                     st.success("✅ 云端录入成功！")
                     st.rerun()
 
     st.divider()
     st.write("### ☁️ 云端数据中心")
-    st.info("💡 你的数据现在已实时同步至 Google Sheets，不再需要手动下载 CSV 备份了。如果需要查看原始数据，可直接在手机或电脑打开你的谷歌表格。")
+    st.info("💡 数据实时同步至 Google Sheets。")
 
 # --- 3. 辅助功能 ---
 q = st.text_input("🔍 快速筛选 (SKU / 颜色 / 员工姓名)...", placeholder="搜索将同步联动所有标签页")
@@ -103,9 +97,9 @@ q = st.text_input("🔍 快速筛选 (SKU / 颜色 / 员工姓名)...", placehol
 def get_f(df, q):
     if q and not df.empty:
         if '商品名称' in df.columns and '颜色' in df.columns:
-            return df[df['商品名称'].str.contains(q, case=False, na=False) | df['颜色'].str.contains(q, case=False, na=False)]
+            return df[df['商品名称'].astype(str).str.contains(q, case=False, na=False) | df['颜色'].astype(str).str.contains(q, case=False, na=False)]
         elif '员工姓名' in df.columns:
-            return df[df['员工姓名'].str.contains(q, case=False, na=False)]
+            return df[df['员工姓名'].astype(str).str.contains(q, case=False, na=False)]
     return df
 
 # --- 4. 主界面布局 ---
@@ -113,7 +107,7 @@ st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
 t1, t2, t3, t4 = st.tabs(["📊 库存看板与批量管理", "💰 销售记账", "📈 财务多维分析", "👥 员工与考勤管理"])
 
 with t1:
-    st.subheader("库存实物分布")
+    st.subheader("库存实物分布 (低库存自动标红预警)")
     f_stock = get_f(df_stock, q)
     if not f_stock.empty:
         v_df = f_stock.copy()
@@ -122,13 +116,28 @@ with t1:
             v_df[col] = pd.to_numeric(v_df[col], errors='coerce').fillna(0).astype(int)
         v_df.insert(0, "选择", False)
         
+        display_cols = ['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']
+        display_df = v_df[display_cols]
+
+        def highlight_low_stock(row):
+            try:
+                stock_val = int(row['总库存'])
+                if stock_val <= 2:
+                    return ['background-color: #ffe6e6; color: #cc0000; font-weight: bold;'] * len(row)
+            except:
+                pass
+            return [''] * len(row)
+
+        styled_df = display_df.style.apply(highlight_low_stock, axis=1)
+        
         edited_stock = st.data_editor(
-            v_df[['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']],
+            styled_df,
             column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
-            disabled=[col for col in v_df.columns if col != "选择"],
+            disabled=[col for col in display_cols if col != "选择"],
             use_container_width=True, hide_index=True, 
             key=f"stock_editor_{st.session_state.stock_reset_key}" 
         )
+        
         selected_stock = edited_stock[edited_stock["选择"] == True]
         
         if not selected_stock.empty:
@@ -137,7 +146,7 @@ with t1:
                 if st.button("🗑️ 批量删除选中", type="primary", key="del_stock"):
                     for _, row in selected_stock.iterrows():
                         df_stock = df_stock[~((df_stock['商品名称'] == row['商品名称']) & (df_stock['颜色'] == row['颜色']))]
-                    save_data(df_stock, STOCK_SHEET) # 云端保存
+                    save_data(df_stock, STOCK_SHEET) 
                     st.session_state.stock_reset_key += 1 
                     st.rerun()
             with col_btn2: st.button("🔄 取消所有选中", key="btn_cancel_stock", on_click=clear_stock)
@@ -149,23 +158,23 @@ with t1:
                 with st.form("edit_selected_stock"):
                     e_name = st.text_input("产品名称", value=str(df_stock.at[orig_idx, '商品名称']))
                     c1, c2, c3 = st.columns(3)
-                    e_cost = c1.number_input("进价", value=float(df_stock.at[orig_idx, '进价成本'] or 0))
-                    e_price = c2.number_input("售价", value=float(df_stock.at[orig_idx, '售卖价格'] or 0))
-                    e_sold = c3.number_input("已售修正", value=int(df_stock.at[orig_idx, '已售出数量'] or 0))
+                    e_cost = c1.number_input("进价", value=float(pd.to_numeric(df_stock.at[orig_idx, '进价成本'], errors='coerce') or 0))
+                    e_price = c2.number_input("售价", value=float(pd.to_numeric(df_stock.at[orig_idx, '售卖价格'], errors='coerce') or 0))
+                    e_sold = c3.number_input("已售修正", value=int(pd.to_numeric(df_stock.at[orig_idx, '已售出数量'], errors='coerce') or 0))
                     
                     i1, i2, i3, i4, i5 = st.columns(5)
-                    e_exp = i1.number_input("应收", value=int(df_stock.at[orig_idx, '应收到数量'] or 0))
-                    e_dis = i2.number_input("展示", value=int(df_stock.at[orig_idx, '展示数量'] or 0))
-                    e_sh = i3.number_input("货柜", value=int(df_stock.at[orig_idx, '货柜数量'] or 0))
-                    e_st = i4.number_input("储物", value=int(df_stock.at[orig_idx, '储物间数量'] or 0))
-                    e_dm = i5.number_input("坏货", value=int(df_stock.at[orig_idx, '坏货数量'] or 0))
+                    e_exp = i1.number_input("应收", value=int(pd.to_numeric(df_stock.at[orig_idx, '应收到数量'], errors='coerce') or 0))
+                    e_dis = i2.number_input("展示", value=int(pd.to_numeric(df_stock.at[orig_idx, '展示数量'], errors='coerce') or 0))
+                    e_sh = i3.number_input("货柜", value=int(pd.to_numeric(df_stock.at[orig_idx, '货柜数量'], errors='coerce') or 0))
+                    e_st = i4.number_input("储物", value=int(pd.to_numeric(df_stock.at[orig_idx, '储物间数量'], errors='coerce') or 0))
+                    e_dm = i5.number_input("坏货", value=int(pd.to_numeric(df_stock.at[orig_idx, '坏货数量'], errors='coerce') or 0))
                     
                     if st.form_submit_button("保存校准"):
                         df_stock.at[orig_idx, '商品名称'] = e_name
                         df_stock.at[orig_idx, '进价成本'], df_stock.at[orig_idx, '售卖价格'], df_stock.at[orig_idx, '已售出数量'] = e_cost, e_price, e_sold
                         df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
                         df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st + e_dm
-                        save_data(df_stock, STOCK_SHEET) # 云端保存
+                        save_data(df_stock, STOCK_SHEET) 
                         st.session_state.stock_reset_key += 1 
                         st.rerun()
 
@@ -178,7 +187,7 @@ with t2:
             with st.form("add_sale"):
                 s_l = st.selectbox("商品", f_opts['label'])
                 selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
-                default_price = float(selected_row['售卖价格'] or 0)
+                default_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
                 c1, c2 = st.columns(2)
                 s_q, s_p = c1.number_input("数量", 1), c2.number_input("单价", value=default_price)
                 s_d = st.date_input("日期", value=datetime.now())
@@ -188,13 +197,12 @@ with t2:
                     new_s = pd.DataFrame([[s_d.strftime("%Y-%m-%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
                     df_sales = pd.concat([new_s, df_sales], ignore_index=True)
                     
-                    # 同步扣减库存
-                    df_stock.at[idx_p, '货柜数量'] = int(df_stock.at[idx_p, '货柜数量'] or 0) - s_q
-                    df_stock.at[idx_p, '已售出数量'] = int(df_stock.at[idx_p, '已售出数量'] or 0) + s_q
-                    df_stock.at[idx_p, '总库存'] = sum([int(df_stock.at[idx_p, col] or 0) for col in ['展示数量', '货柜数量', '储物间数量', '坏货数量']])
+                    df_stock.at[idx_p, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_p, '货柜数量'], errors='coerce') or 0) - s_q
+                    df_stock.at[idx_p, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_p, '已售出数量'], errors='coerce') or 0) + s_q
+                    df_stock.at[idx_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量', '坏货数量']])
                     
-                    save_data(df_sales, SALES_SHEET) # 存流水
-                    save_data(df_stock, STOCK_SHEET) # 存库存
+                    save_data(df_sales, SALES_SHEET) 
+                    save_data(df_stock, STOCK_SHEET) 
                     st.rerun()
 
     st.divider()
@@ -211,9 +219,9 @@ with t2:
                     for _, r in sel.iterrows():
                         m = df_stock[(df_stock['商品名称']==r['商品名称']) & (df_stock['颜色']==r['颜色'])].index
                         if not m.empty:
-                            df_stock.at[m[0], '货柜数量'] = int(df_stock.at[m[0], '货柜数量'] or 0) + int(r['销售数量'] or 0)
-                            df_stock.at[m[0], '已售出数量'] = int(df_stock.at[m[0], '已售出数量'] or 0) - int(r['销售数量'] or 0)
-                            df_stock.at[m[0], '总库存'] = sum([int(df_stock.at[m[0], col] or 0) for col in ['展示数量', '货柜数量', '储物间数量', '坏货数量']])
+                            df_stock.at[m[0], '货柜数量'] = int(pd.to_numeric(df_stock.at[m[0], '货柜数量'], errors='coerce') or 0) + int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
+                            df_stock.at[m[0], '已售出数量'] = int(pd.to_numeric(df_stock.at[m[0], '已售出数量'], errors='coerce') or 0) - int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
+                            df_stock.at[m[0], '总库存'] = sum([int(pd.to_numeric(df_stock.at[m[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量', '坏货数量']])
                     for _, r in sel.iterrows():
                         df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
                     save_data(df_stock, STOCK_SHEET); save_data(df_sales, SALES_SHEET)
@@ -230,7 +238,6 @@ with t3:
             start, end = sel_range
             f_sales_range = df_sales[(df_sales['日期_dt'] >= pd.Timestamp(start)) & (df_sales['日期_dt'] <= pd.Timestamp(end))].copy()
             
-            # 确保计算列是数值型
             f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
             f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0)
             
@@ -241,7 +248,6 @@ with t3:
             
             summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
             
-            # 确保进价成本是数值型用于计算
             df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
             df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0)
             
@@ -275,7 +281,7 @@ with t4:
                 else:
                     new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y-%m-%d")]], columns=EMP_COLS)
                     df_employee = pd.concat([df_employee, new_emp], ignore_index=True)
-                    save_data(df_employee, EMP_SHEET) # 云端保存
+                    save_data(df_employee, EMP_SHEET) 
                     st.session_state.emp_reset_key += 1
                     st.rerun()
 
@@ -308,7 +314,6 @@ with t4:
                     edit_role = c2.selectbox("职位", roles, index=roles.index(current_role) if current_role in roles else 0)
                     c3, c4, c5 = st.columns(3)
                     
-                    # 确保时薪是数字
                     current_wage = pd.to_numeric(df_employee.at[orig_idx, '时薪'], errors='coerce')
                     if pd.isna(current_wage): current_wage = 0.0
                     
@@ -350,7 +355,6 @@ with t4:
                         
                     duration_hours = (dt_end - dt_start).total_seconds() / 3600.0
                     
-                    # 获取该员工的当前时薪，并处理可能为空的情况
                     wage_val = df_employee[df_employee['员工姓名'] == att_name]['时薪'].iloc[0]
                     hourly_wage = float(pd.to_numeric(wage_val, errors='coerce') or 0.0)
                     total_wage = duration_hours * hourly_wage
@@ -362,7 +366,7 @@ with t4:
                     ]], columns=ATT_COLS)
                     
                     df_attendance = pd.concat([new_att, df_attendance], ignore_index=True)
-                    save_data(df_attendance, ATT_SHEET) # 云端保存
+                    save_data(df_attendance, ATT_SHEET) 
                     
                     st.success(f"已记录 {att_name} 的工时: {round(duration_hours, 1)} 小时，核算薪资: ${round(total_wage, 2)}")
                     st.rerun()
