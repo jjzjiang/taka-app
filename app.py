@@ -55,12 +55,22 @@ with st.sidebar:
         if u_sl and st.button("覆盖流水"):
             pd.read_csv(u_sl).to_csv(SALES_FILE, index=False); st.rerun()
 
-# --- 3. 辅助功能 ---
+# --- 3. 辅助功能与状态清除回调 ---
 q = st.text_input("🔍 快速筛选 SKU 或颜色...", placeholder="搜索将同步联动所有标签页")
+
 def get_f(df, q):
     if q and not df.empty:
         return df[df['商品名称'].str.contains(q, case=False, na=False) | df['颜色'].str.contains(q, case=False, na=False)]
     return df
+
+# 核心更新：强制清除缓存的回调函数
+def clear_stock_state():
+    if "stock_editor" in st.session_state:
+        del st.session_state["stock_editor"]
+
+def clear_sales_state():
+    if "sales_editor" in st.session_state:
+        del st.session_state["sales_editor"]
 
 # --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统")
@@ -77,7 +87,6 @@ with t1:
         
         v_df.insert(0, "选择", False)
         
-        # 使用 data_editor 并绑定 key
         edited_stock = st.data_editor(
             v_df[['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']],
             column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
@@ -87,24 +96,19 @@ with t1:
         
         selected_stock = edited_stock[edited_stock["选择"] == True]
         
-        # 批量操作按钮
         if not selected_stock.empty:
-            col_btn1, col_btn2, col_btn3 = st.columns([1.5, 1.5, 4]) # 调整列宽容纳新按钮
+            col_btn1, col_btn2, col_btn3 = st.columns([1.5, 1.5, 4])
             with col_btn1:
                 if st.button("🗑️ 批量删除选中", type="primary"):
                     for _, row in selected_stock.iterrows():
                         df_stock = df_stock[~((df_stock['商品名称'] == row['商品名称']) & (df_stock['颜色'] == row['颜色']))]
                     df_stock.to_csv(STOCK_FILE, index=False)
-                    if "stock_editor" in st.session_state: del st.session_state["stock_editor"] # 删除后清空选中状态
+                    clear_stock_state() # 删除后清空
                     st.rerun()
             with col_btn2:
-                # 新增：取消选中按钮
-                if st.button("🔄 取消所有选中", key="cancel_stock"):
-                    if "stock_editor" in st.session_state:
-                        del st.session_state["stock_editor"]
-                    st.rerun()
+                # 绑定回调函数：点击按钮前直接清空状态
+                st.button("🔄 取消所有选中", key="cancel_stock", on_click=clear_stock_state)
             
-            # 如果只选了一个，开启编辑模式
             if len(selected_stock) == 1:
                 st.divider()
                 st.write("### ⚙️ 编辑选中商品信息")
@@ -123,7 +127,7 @@ with t1:
                         df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
                         df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st + e_dm
                         df_stock.to_csv(STOCK_FILE, index=False)
-                        if "stock_editor" in st.session_state: del st.session_state["stock_editor"] # 保存后清空选中状态
+                        clear_stock_state() # 报错校准后清空勾选
                         st.rerun()
         else:
             st.info("💡 勾选上方复选框可开启批量删除或单项编辑。")
@@ -161,7 +165,7 @@ with t2:
     f_sl = get_f(df_sales, q)
     if not f_sl.empty:
         f_sl_sel = f_sl.copy(); f_sl_sel.insert(0, "选择", False)
-        # 为流水表的 editor 也加上 key
+        
         edt = st.data_editor(f_sl_sel, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True, key="sales_editor")
         sel = edt[edt["选择"] == True]
         
@@ -177,14 +181,11 @@ with t2:
                     for _, r in sel.iterrows():
                         df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
                     df_stock.to_csv(STOCK_FILE, index=False); df_sales.to_csv(SALES_FILE, index=False)
-                    if "sales_editor" in st.session_state: del st.session_state["sales_editor"] # 撤销后清空选中状态
+                    clear_sales_state() # 撤销流水后清空
                     st.rerun()
             with sc2:
-                # 新增：取消流水选中按钮
-                if st.button("🔄 取消所有选中", key="cancel_sales"):
-                    if "sales_editor" in st.session_state:
-                        del st.session_state["sales_editor"]
-                    st.rerun()
+                # 绑定流水表的回调函数
+                st.button("🔄 取消所有选中", key="cancel_sales", on_click=clear_sales_state)
 
 with t3:
     st.subheader("📊 财务日历报表")
