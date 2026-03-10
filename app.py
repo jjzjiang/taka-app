@@ -40,7 +40,8 @@ with st.sidebar:
                 if n_name and n_color:
                     total = n_disp + n_shelf + n_stor + n_dmg
                     new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
-                    pd.concat([df_stock, new_r], ignore_index=True).to_csv(STOCK_FILE, index=False); st.rerun()
+                    pd.concat([df_stock, new_r], ignore_index=True).to_csv(STOCK_FILE, index=False)
+                    st.rerun()
 
     st.divider()
     st.write("### 💾 数据中心")
@@ -125,22 +126,35 @@ with t1:
 with t2:
     st.subheader("销售记账与流水管理")
     with st.expander("➕ 新增销售", expanded=True):
-        f_opts = get_f(df_stock, q)
+        f_opts = get_f(df_stock, q).copy() # 【修改1：使用 copy 避免污染源数据】
         if not f_opts.empty:
-            df_stock['label'] = df_stock['商品名称'] + " (" + df_stock['颜色'] + ")"
+            f_opts['label'] = f_opts['商品名称'] + " (" + f_opts['颜色'] + ")" # 【修改2：在独立 DataFrame 中生成 label】
             with st.form("add_sale"):
                 s_l = st.selectbox("商品", f_opts['label'])
+                
+                # 获取选中商品的原始售卖价格
+                selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
+                default_price = float(selected_row['售卖价格'])
+                
                 c1, c2 = st.columns(2)
-                s_q, s_p = c1.number_input("数量", 1), c2.number_input("单价", value=float(df_stock[df_stock['label']==s_l]['售卖价格'].iloc[0]))
+                s_q, s_p = c1.number_input("数量", 1), c2.number_input("单价", value=default_price)
                 s_d = st.date_input("日期", value=datetime.now())
+                
                 if st.form_submit_button("确认"):
-                    idx_p = df_stock[df_stock['label'] == s_l].index[0]
+                    # 根据商品名称和颜色找回原数据中的 index
+                    idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
+                    
                     new_s = pd.DataFrame([[s_d.strftime("%Y-%m-%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
                     pd.concat([new_s, df_sales], ignore_index=True).to_csv(SALES_FILE, index=False)
+                    
+                    # 更新库存数量
                     df_stock.at[idx_p, '货柜数量'] -= s_q
                     df_stock.at[idx_p, '已售出数量'] += s_q
                     df_stock.at[idx_p, '总库存'] = df_stock.iloc[idx_p][['展示数量', '货柜数量', '储物间数量', '坏货数量']].sum()
-                    df_stock.drop(columns=['label']).to_csv(STOCK_FILE, index=False); st.rerun()
+                    
+                    # 【修改3：直接存 df_stock，不需要再 drop label 列，因为根本没加进源数据里】
+                    df_stock.to_csv(STOCK_FILE, index=False) 
+                    st.rerun()
 
     st.divider()
     f_sl = get_f(df_sales, q)
