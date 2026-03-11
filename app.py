@@ -30,8 +30,16 @@ ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
 
+# 🚀 核心升级：为每张表分配独立的“记忆版本号”
+if "sheet_versions" not in st.session_state:
+    st.session_state.sheet_versions = {
+        STOCK_SHEET: 0, SALES_SHEET: 0, EMP_SHEET: 0,
+        ATT_SHEET: 0, B2B_SHEET: 0, FEEDBACK_SHEET: 0
+    }
+
+# 读取数据时，带上这张表专属的版本号
 @st.cache_data(ttl=300, show_spinner=False)
-def load_raw_data(sheet_name):
+def load_raw_data(sheet_name, version):
     try:
         worksheet = sh.worksheet(sheet_name)
         records = worksheet.get_all_records()
@@ -42,7 +50,9 @@ def load_raw_data(sheet_name):
         return pd.DataFrame()
 
 def load_data(sheet_name, columns):
-    df = load_raw_data(sheet_name)
+    # 获取这张表当前的版本号
+    ver = st.session_state.sheet_versions.get(sheet_name, 0)
+    df = load_raw_data(sheet_name, ver)
     if df.empty:
         df = pd.DataFrame(columns=columns)
     for col in columns:
@@ -59,7 +69,10 @@ def save_data(df, sheet_name):
     df_safe = df.fillna("").astype(str)
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
     worksheet.update(values=data_to_upload, range_name='A1')
-    st.cache_data.clear()
+    
+    # 🚀 精准刷新：我只让当前被修改的这张表的版本号 +1
+    # 这样下次读取时，只有这张表会去谷歌拉新数据，其他表继续用缓存！彻底告别爆表！
+    st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
 
 def clean_date_col(df, col_name):
     if not df.empty and col_name in df.columns:
@@ -718,9 +731,8 @@ with t7:
     st.subheader("🗣️ 新加坡本地客户产品反馈池")
     st.info("💡 收集一线真实声音：不论是产品性能还是非产品的本土化优化，都是下一步行动的数据支撑！")
 
-    # 🚀 统一定义选项池，方便菜单和表格复用
     fb_type_options = [
-        "产品功能性", "产品优化", # <-- 新增选项
+        "产品功能性", "产品优化", 
         "保温保冷效能", "外观颜值 / 颜色", "材质手感 / 重量", 
         "清洗 / 异味问题", "杯盖 / 密封性", "价格因素", 
         "🌏 本土化优化 (非产品)", "夸奖 / 好评", "其他建议"
@@ -776,7 +788,6 @@ with t7:
         v_fb = f_fb.copy()
         v_fb.insert(0, "选择", False)
 
-        # 🚀 核心升级：解除所有限制，表格内所有字段均可直接双击编辑！
         edited_fb = st.data_editor(
             v_fb,
             column_config={
@@ -785,15 +796,13 @@ with t7:
                 "反馈类型": st.column_config.SelectboxColumn("反馈类型", options=fb_type_options),
                 "客户画像": st.column_config.SelectboxColumn("客户画像", options=fb_customer_options)
             },
-            disabled=[], # <-- 彻底放开，空列表代表什么都不锁
+            disabled=[], 
             use_container_width=True, hide_index=True,
             key=f"fb_editor_{st.session_state.fb_reset_key}"
         )
 
-        # 🚀 全量更新的精准保存逻辑
         if not edited_fb.drop(columns=['选择']).equals(v_fb.drop(columns=['选择'])):
             for idx, row in edited_fb.iterrows():
-                # 判断这一行是否有任何改动，如果有，就覆盖原表里的对应位置
                 if not row.drop('选择').equals(v_fb.loc[idx].drop('选择')):
                     for col in FEEDBACK_COLS:
                         df_feedback.at[idx, col] = row[col]
