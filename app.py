@@ -58,7 +58,6 @@ def clean_date_col(df, col_name):
         df[col_name] = formatted.fillna(df[col_name])
     return df
 
-# 🚀 核心升级：CSV 文件转换器 (使用 utf-8-sig 完美解决 Excel 中文乱码)
 @st.cache_data(show_spinner=False)
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8-sig')
@@ -305,7 +304,14 @@ with t3:
                 c4.metric("平均毛利率", f"{avg_m:.1f}%")
                 
                 st.divider()
-                # 🚀 增加导出按钮
+
+                # 🚀 核心升级：增加营收与毛利双柱状走势图
+                st.markdown("### 📈 营收与毛利走势")
+                # 为图表单独聚合数据，并强制按时间正序排列 (从左到右)
+                chart_data_t3 = filtered_summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
+                st.bar_chart(chart_data_t3, use_container_width=True)
+
+                # 🚀 保留导出按钮
                 dl_c1, dl_c2 = st.columns([1, 4])
                 with dl_c1:
                     csv_t3 = convert_df_to_csv(filtered_summ)
@@ -549,7 +555,14 @@ with t5:
 
                 st.divider()
                 
-                # 🚀 增加导出按钮
+                # 🚀 核心升级：增加营收与净利润对比走势图
+                st.markdown("### 📈 每日营收 vs 净利润趋势")
+                # 提取绘图数据并强制正序
+                chart_data_t5 = daily_np.set_index('日期_str')[['总营业额', '真实净利润']].sort_index(ascending=True)
+                # 使用原生 Bar Chart 渲染，兼容极好，且负数净利润会向下延伸，非常直观
+                st.bar_chart(chart_data_t5, use_container_width=True)
+
+                st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
                 dl_c3, dl_c4 = st.columns([1.5, 4])
                 with dl_c3:
                     csv_t5 = convert_df_to_csv(daily_np)
@@ -560,8 +573,6 @@ with t5:
                         mime="text/csv",
                         type="primary"
                     )
-                
-                st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
 
                 show_np = daily_np.rename(columns={'日期_str': '日期'})
                 
