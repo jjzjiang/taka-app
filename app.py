@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, time
 import gspread 
+from gspread.exceptions import WorksheetNotFound # 🚀 引入找不到表的专属盾牌
 import json
 
 # --- 1. 配置与云端数据库初始化 ---
@@ -19,13 +20,12 @@ STOCK_SHEET = "Stock"
 SALES_SHEET = "Sales"
 EMP_SHEET = "Employee"
 ATT_SHEET = "Attendance"
-B2B_SHEET = "B2B_Orders" # 🚀 新增 B2B 专属表
+B2B_SHEET = "B2B_Orders" 
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
-# 🚀 B2B 专属字段
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -47,8 +47,14 @@ def load_data(sheet_name, columns):
         if col not in df.columns: df[col] = 0
     return df[columns]
 
+# 🚀 核心升级：自动建表功能
 def save_data(df, sheet_name):
-    worksheet = sh.worksheet(sheet_name)
+    try:
+        worksheet = sh.worksheet(sheet_name)
+    except WorksheetNotFound:
+        # 如果找不到表，就自动在谷歌表格里新建一个！
+        worksheet = sh.add_worksheet(title=sheet_name, rows="1000", cols="20")
+        
     worksheet.clear() 
     df_safe = df.fillna("").astype(str)
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
@@ -69,7 +75,6 @@ df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期') 
 df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
 df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期') 
-# 🚀 载入 B2B 数据
 df_b2b = load_data(B2B_SHEET, B2B_COLS)
 df_b2b = clean_date_col(df_b2b, '创建日期')
 df_b2b = clean_date_col(df_b2b, '约定交期')
@@ -78,7 +83,7 @@ if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key =
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
 if "emp_reset_key" not in st.session_state: st.session_state.emp_reset_key = 0
 if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0 
-if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 # B2B 刷新钥匙
+if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 
 
 def clear_stock(): st.session_state.stock_reset_key += 1
 def clear_sales(): st.session_state.sales_reset_key += 1
@@ -119,13 +124,12 @@ def get_f(df, q):
             return df[df['商品名称'].astype(str).str.contains(q, case=False, na=False) | df['颜色'].astype(str).str.contains(q, case=False, na=False)]
         elif '员工姓名' in df.columns:
             return df[df['员工姓名'].astype(str).str.contains(q, case=False, na=False)]
-        elif '客户名称' in df.columns: # 支持搜客户
+        elif '客户名称' in df.columns: 
             return df[df['客户名称'].astype(str).str.contains(q, case=False, na=False)]
     return df
 
 # --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
-# 🚀 新增 Tab 6
 t1, t2, t3, t4, t5, t6 = st.tabs(["📊 库存", "💰 销售", "📈 财务(毛利)", "👥 考勤", "💎 净利润", "🤝 B2B大客户"])
 
 with t1:
@@ -576,12 +580,10 @@ with t5:
     else:
         st.info("💡 目前没有流水记录，无法计算利润。")
 
-# 🚀 终极大招：Tab 6 B2B 大客户/企采专属看板
 with t6:
     st.subheader("🤝 B2B 大客户与企采订单管理")
     st.info("💡 B2B订单独立核算，免收快闪店抽成！在这里记录订金、尾款和交付状态。")
 
-    # 顶部数据汇总卡片
     if not df_b2b.empty:
         df_b2b['总计应收'] = pd.to_numeric(df_b2b['总计应收'], errors='coerce').fillna(0.0)
         df_b2b['已收定金'] = pd.to_numeric(df_b2b['已收定金'], errors='coerce').fillna(0.0)
@@ -642,7 +644,6 @@ with t6:
     
     f_b2b = get_f(df_b2b, q)
     if not f_b2b.empty:
-        # 在展示前重新计算一次尾款，确保准确
         f_b2b['总计应收'] = pd.to_numeric(f_b2b['总计应收'], errors='coerce').fillna(0.0)
         f_b2b['已收定金'] = pd.to_numeric(f_b2b['已收定金'], errors='coerce').fillna(0.0)
         f_b2b['待收尾款'] = f_b2b['总计应收'] - f_b2b['已收定金']
@@ -650,7 +651,6 @@ with t6:
         v_b2b = f_b2b.copy()
         v_b2b.insert(0, "选择", False)
         
-        # 让这些列可以直接在表格里快速编辑
         editable_cols = ['已收定金', '订单状态', '约定交期', '备注']
         disabled_cols = [c for c in v_b2b.columns if c not in editable_cols and c != "选择"]
         
@@ -669,7 +669,6 @@ with t6:
             key=f"b2b_editor_{st.session_state.b2b_reset_key}"
         )
         
-        # 捕捉修改并保存
         if not edited_b2b.equals(v_b2b):
             for idx, row in edited_b2b.iterrows():
                 if row['客户名称'] == v_b2b.at[idx, '客户名称'] and row['商品名称'] == v_b2b.at[idx, '商品名称']:
