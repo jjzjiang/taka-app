@@ -108,7 +108,7 @@ def get_f(df, q):
             return df[df['员工姓名'].astype(str).str.contains(q, case=False, na=False)]
     return df
 
-# --- 4. 主界面布局 (新增 Tab 5) ---
+# --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
 t1, t2, t3, t4, t5 = st.tabs(["📊 库存看板", "💰 销售记账", "📈 财务(毛利)分析", "👥 员工与考勤", "💎 真实净利润核算"])
 
@@ -442,18 +442,16 @@ with t4:
             c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
             c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
-# 🚀 全新重磅功能：Tab 5 真实净利润核算中心
+# 🚀 纯净版 Tab 5：手写高亮逻辑，告别报错
 with t5:
     st.subheader("💎 真实净利润核算 (Net Profit)")
     st.info("💡 这里的【净利润】 = 总营业额 - 商品进价成本 - 员工打卡工资成本。")
 
     if not df_sales.empty:
-        # 提取并清理销售数据日期
         df_s_np = df_sales.copy()
         df_s_np['日期_dt'] = pd.to_datetime(df_s_np['日期'], errors='coerce')
         df_s_np = df_s_np.dropna(subset=['日期_dt'])
 
-        # 提取并清理考勤数据日期
         df_a_np = df_attendance.copy()
         if not df_a_np.empty:
             df_a_np['日期_dt'] = pd.to_datetime(df_a_np['日期'], errors='coerce')
@@ -462,7 +460,6 @@ with t5:
             df_a_np['日期_dt'] = pd.Series(dtype='datetime64[ns]')
 
         if not df_s_np.empty:
-            # 找到业务发生的最早和最晚日期，设定日历选择器的默认范围
             min_date = df_s_np['日期_dt'].min().date()
             max_date = df_s_np['日期_dt'].max().date()
             if not df_a_np.empty:
@@ -474,25 +471,20 @@ with t5:
             if len(np_range) == 2:
                 start_d, end_d = np_range
                 
-                # 按时间段过滤数据
                 fs = df_s_np[(df_s_np['日期_dt'] >= pd.Timestamp(start_d)) & (df_s_np['日期_dt'] <= pd.Timestamp(end_d))].copy()
                 fa = df_a_np[(df_a_np['日期_dt'] >= pd.Timestamp(start_d)) & (df_a_np['日期_dt'] <= pd.Timestamp(end_d))].copy()
 
-                # --- 1. 计算销售端的营业额和成本 ---
                 fs['销售数量'] = pd.to_numeric(fs['销售数量'], errors='coerce').fillna(0)
                 fs['总营业额'] = pd.to_numeric(fs['总营业额'], errors='coerce').fillna(0.0)
 
-                # 关联进价
                 df_stock_cost = df_stock[['商品名称', '颜色', '进价成本']].copy()
                 df_stock_cost['进价成本'] = pd.to_numeric(df_stock_cost['进价成本'], errors='coerce').fillna(0.0)
                 fs = fs.merge(df_stock_cost, on=['商品名称', '颜色'], how='left')
                 fs['总进价成本'] = fs['销售数量'] * fs['进价成本']
 
-                # 按天汇总营业额和商品成本
                 fs['日期_str'] = fs['日期_dt'].dt.strftime('%Y/%m/%d')
                 daily_sales = fs.groupby('日期_str').agg({'总营业额': 'sum', '总进价成本': 'sum'}).reset_index()
 
-                # --- 2. 计算考勤端的人工成本 ---
                 if not fa.empty:
                     fa['核算薪资'] = pd.to_numeric(fa['核算薪资'], errors='coerce').fillna(0.0)
                     fa['日期_str'] = fa['日期_dt'].dt.strftime('%Y/%m/%d')
@@ -501,15 +493,12 @@ with t5:
                 else:
                     daily_att = pd.DataFrame(columns=['日期_str', '人工成本'])
 
-                # --- 3. 跨表融合 (Outer Merge) ---
                 daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0)
                 daily_np = daily_np.sort_values('日期_str', ascending=False)
 
-                # --- 4. 算账！---
                 daily_np['毛利润'] = daily_np['总营业额'] - daily_np['总进价成本']
                 daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
 
-                # 顶层看板指标计算
                 tot_rev = daily_np['总营业额'].sum()
                 tot_cogs = daily_np['总进价成本'].sum()
                 tot_wage = daily_np['人工成本'].sum()
@@ -521,28 +510,35 @@ with t5:
                 m1.metric("💰 总营业额 (Revenue)", f"${tot_rev:.2f}")
                 m2.metric("📦 总商品成本 (COGS)", f"${tot_cogs:.2f}")
                 m3.metric("👥 总人工成本 (Wages)", f"${tot_wage:.2f}")
-
-                # 净利润带颜色提示
                 m4.metric("💎 真实净利润 (Net Profit)", f"${tot_net:.2f}", delta=f"对比毛利: ${tot_gross:.2f}", delta_color="normal")
 
                 st.divider()
                 st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
 
-                # 表格美化展示，赚钱背景变绿，亏钱背景变红
                 show_np = daily_np.rename(columns={'日期_str': '日期'})
                 
-                # 构建带有颜色渲染的数据框
-                st.dataframe(
-                    show_np.style.format({
-                        '总营业额': '${:.2f}',
-                        '总进价成本': '${:.2f}',
-                        '人工成本': '${:.2f}',
-                        '毛利润': '${:.2f}',
-                        '真实净利润': '${:.2f}'
-                    }).background_gradient(subset=['真实净利润'], cmap='RdYlGn'),
-                    use_container_width=True,
-                    hide_index=True
-                )
+                # 手写高亮逻辑，避开第三方依赖
+                def color_net_profit(val):
+                    try:
+                        val = float(val)
+                        if val > 0: return 'background-color: #e6ffe6; color: #006600; font-weight: bold;'
+                        elif val < 0: return 'background-color: #ffe6e6; color: #cc0000; font-weight: bold;'
+                    except: pass
+                    return ''
+                
+                # 使用最兼容的 applymap 渲染表格
+                try:
+                    styled_np = show_np.style.format({
+                        '总营业额': '${:.2f}', '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
+                        '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
+                    }).map(color_net_profit, subset=['真实净利润'])
+                except AttributeError:
+                    styled_np = show_np.style.format({
+                        '总营业额': '${:.2f}', '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
+                        '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
+                    }).applymap(color_net_profit, subset=['真实净利润'])
+
+                st.dataframe(styled_np, use_container_width=True, hide_index=True)
         else:
             st.info("暂无有效销售数据进行核算。")
     else:
