@@ -8,10 +8,9 @@ import json
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 
 try:
-    # 🌟 终极进化：钥匙和网址全都从云端保险箱拿，代码里不留任何隐私！
     key_dict = json.loads(st.secrets["google_key"])
     gc = gspread.service_account_from_dict(key_dict)
-    sh = gc.open_by_url(st.secrets["sheet_url"]) # 自动去保险箱拿网址
+    sh = gc.open_by_url(st.secrets["sheet_url"]) 
 except Exception as e:
     st.error(f"🔴 连接云端数据库失败！详细错误: {e}")
     st.stop()
@@ -26,7 +25,6 @@ SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价'
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
 
-# --- 云端读取函数 ---
 def load_data(sheet_name, columns):
     try:
         worksheet = sh.worksheet(sheet_name)
@@ -42,7 +40,6 @@ def load_data(sheet_name, columns):
         st.warning(f"无法读取工作表 {sheet_name}，将创建一个空表。")
         return pd.DataFrame(columns=columns)
 
-# --- 云端保存函数 ---
 def save_data(df, sheet_name):
     worksheet = sh.worksheet(sheet_name)
     worksheet.clear() 
@@ -50,13 +47,11 @@ def save_data(df, sheet_name):
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
     worksheet.update(values=data_to_upload, range_name='A1')
 
-# 每次打开网页时，从云端拉取最新数据
 df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = load_data(SALES_SHEET, SALES_COLS)
 df_employee = load_data(EMP_SHEET, EMP_COLS)
 df_attendance = load_data(ATT_SHEET, ATT_COLS) 
 
-# --- 状态 Key 计数器 ---
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
 if "emp_reset_key" not in st.session_state: st.session_state.emp_reset_key = 0
@@ -80,7 +75,8 @@ with st.sidebar:
             n_disp, n_shelf, n_stor, n_dmg = i1.number_input("展示"), i2.number_input("货柜"), i3.number_input("储物"), i4.number_input("坏货")
             if st.form_submit_button("确认录入"):
                 if n_name and n_color:
-                    total = n_disp + n_shelf + n_stor + n_dmg
+                    # 🚀 修正 1：新增商品时，总库存不再包含坏货 (n_dmg)
+                    total = n_disp + n_shelf + n_stor 
                     new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
                     df_stock = pd.concat([df_stock, new_r], ignore_index=True)
                     save_data(df_stock, STOCK_SHEET) 
@@ -173,7 +169,8 @@ with t1:
                         df_stock.at[orig_idx, '商品名称'] = e_name
                         df_stock.at[orig_idx, '进价成本'], df_stock.at[orig_idx, '售卖价格'], df_stock.at[orig_idx, '已售出数量'] = e_cost, e_price, e_sold
                         df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
-                        df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st + e_dm
+                        # 🚀 修正 2：编辑校准时，总库存不再包含坏货 (e_dm)
+                        df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st 
                         save_data(df_stock, STOCK_SHEET) 
                         st.session_state.stock_reset_key += 1 
                         st.rerun()
@@ -199,7 +196,8 @@ with t2:
                     
                     df_stock.at[idx_p, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_p, '货柜数量'], errors='coerce') or 0) - s_q
                     df_stock.at[idx_p, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_p, '已售出数量'], errors='coerce') or 0) + s_q
-                    df_stock.at[idx_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量', '坏货数量']])
+                    # 🚀 修正 3：新增销售扣减库存时，重新计算总库存时不包含坏货数量
+                    df_stock.at[idx_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                     
                     save_data(df_sales, SALES_SHEET) 
                     save_data(df_stock, STOCK_SHEET) 
@@ -221,7 +219,8 @@ with t2:
                         if not m.empty:
                             df_stock.at[m[0], '货柜数量'] = int(pd.to_numeric(df_stock.at[m[0], '货柜数量'], errors='coerce') or 0) + int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
                             df_stock.at[m[0], '已售出数量'] = int(pd.to_numeric(df_stock.at[m[0], '已售出数量'], errors='coerce') or 0) - int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
-                            df_stock.at[m[0], '总库存'] = sum([int(pd.to_numeric(df_stock.at[m[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量', '坏货数量']])
+                            # 🚀 修正 4：撤销流水退回库存时，重新计算总库存时不包含坏货数量
+                            df_stock.at[m[0], '总库存'] = sum([int(pd.to_numeric(df_stock.at[m[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                     for _, r in sel.iterrows():
                         df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
                     save_data(df_stock, STOCK_SHEET); save_data(df_sales, SALES_SHEET)
