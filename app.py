@@ -58,6 +58,11 @@ def clean_date_col(df, col_name):
         df[col_name] = formatted.fillna(df[col_name])
     return df
 
+# 🚀 核心升级：CSV 文件转换器 (使用 utf-8-sig 完美解决 Excel 中文乱码)
+@st.cache_data(show_spinner=False)
+def convert_df_to_csv(df):
+    return df.to_csv(index=False).encode('utf-8-sig')
+
 df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期') 
 df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
@@ -204,7 +209,6 @@ with t2:
         if not f_opts.empty:
             f_opts['label'] = f_opts['商品名称'].astype(str) + " (" + f_opts['颜色'].astype(str) + ")" 
             
-            # 🚀 核心改造：打破 st.form，实现选项实时联动
             s_l = st.selectbox("1. 选中售出商品", f_opts['label'])
             selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
             base_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
@@ -212,18 +216,15 @@ with t2:
             c1, c2 = st.columns(2)
             s_q = c1.number_input("2. 销售数量", min_value=1, value=1, step=1)
             
-            # 🚀 快捷折扣字典
             discount_opts = {"无折扣 (原价)": 1.0, "95折": 0.95, "9折": 0.90, "85折": 0.85, "8折": 0.80, "75折": 0.75, "7折": 0.70, "5折 (半价)": 0.50}
             s_discount = c2.selectbox("3. 快捷折扣", list(discount_opts.keys()))
             
-            # 系统自动算出折后价
             auto_calc_price = base_price * discount_opts[s_discount]
             
             c3, c4 = st.columns(2)
             s_p = c3.number_input("4. 最终成交单价 ($)", value=float(auto_calc_price), format="%.2f", help="已按折扣自动计算，你也可以直接手动涂改抹零")
             s_d = c4.date_input("5. 交易日期", value=datetime.now())
             
-            # 普通按钮提交，告别表单延迟
             if st.button("✅ 确认记录销售", type="primary", use_container_width=True):
                 idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
                 new_s = pd.DataFrame([[s_d.strftime("%Y/%m/%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
@@ -302,6 +303,19 @@ with t3:
                 c3.metric("总售出件数", f"{int(filtered_summ['销售数量'].sum())} 件")
                 avg_m = filtered_summ['具体毛利'].sum() / filtered_summ['总营业额'].sum() * 100 if filtered_summ['总营业额'].sum() > 0 else 0
                 c4.metric("平均毛利率", f"{avg_m:.1f}%")
+                
+                st.divider()
+                # 🚀 增加导出按钮
+                dl_c1, dl_c2 = st.columns([1, 4])
+                with dl_c1:
+                    csv_t3 = convert_df_to_csv(filtered_summ)
+                    st.download_button(
+                        label="⬇️ 一键导出毛利报表 (CSV)",
+                        data=csv_t3,
+                        file_name=f"Takashimaya_毛利报表_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        type="primary"
+                    )
                 
                 st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
         else:
@@ -456,7 +470,6 @@ with t4:
             c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
             c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
-# 🚀 极致真实体验：Tab 5 加入百分比核算逻辑
 with t5:
     st.subheader("💎 真实净利润核算 (Net Profit)")
     st.info("💡 净利润 = 总营业额 - 高岛屋抽成(36%) - 进价成本 - 打卡工资。真实数据，拒绝自嗨！")
@@ -535,6 +548,19 @@ with t5:
                 m5.metric("💎 真实净利润", f"${tot_net:.2f}", delta=f"净利率: {pct_net:.1f}%", delta_color="off")
 
                 st.divider()
+                
+                # 🚀 增加导出按钮
+                dl_c3, dl_c4 = st.columns([1.5, 4])
+                with dl_c3:
+                    csv_t5 = convert_df_to_csv(daily_np)
+                    st.download_button(
+                        label="⬇️ 一键导出净利润明细 (CSV)",
+                        data=csv_t5,
+                        file_name=f"Takashimaya_净利明细_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        type="primary"
+                    )
+                
                 st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
 
                 show_np = daily_np.rename(columns={'日期_str': '日期'})
