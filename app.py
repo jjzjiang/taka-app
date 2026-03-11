@@ -714,10 +714,19 @@ with t6:
                     st.rerun()
             with bc2: st.button("🔄 取消选中", key="btn_cancel_b2b", on_click=clear_b2b)
 
-# 🚀 客户反馈池：新增了本土化优化选项
 with t7:
     st.subheader("🗣️ 新加坡本地客户产品反馈池")
-    st.info("💡 收集一线真实声音：除了产品硬实力，更要关注包装、支付等本土化软体验，为下一步提需求做数据支撑！")
+    st.info("💡 收集一线真实声音：不论是产品性能还是非产品的本土化优化，都是下一步行动的数据支撑！")
+
+    # 🚀 统一定义选项池，方便菜单和表格复用
+    fb_type_options = [
+        "产品功能性", "产品优化", # <-- 新增选项
+        "保温保冷效能", "外观颜值 / 颜色", "材质手感 / 重量", 
+        "清洗 / 异味问题", "杯盖 / 密封性", "价格因素", 
+        "🌏 本土化优化 (非产品)", "夸奖 / 好评", "其他建议"
+    ]
+    fb_customer_options = ["本地散客", "VIP / 老客复购", "送礼需求", "游客", "B2B企业客户"]
+    fb_status_options = ["🚨 待处理 / 待评估", "📝 已记录 / 待反馈工厂", "✅ 已解决 / 已采纳"]
 
     with st.expander("➕ 快速录入新反馈", expanded=True):
         f_opts_fb = get_f(df_stock, q).copy()
@@ -730,18 +739,12 @@ with t7:
                 fb_prod = c2.text_input("提及的商品", "全系产品 / 通用")
 
             c3, c4 = st.columns(2)
-            # 🚀 核心升级：新增 "🌏 本土化优化 (非产品)" 选项
-            fb_type_options = [
-                "保温保冷效能", "外观颜值 / 颜色", "材质手感 / 重量", 
-                "清洗 / 异味问题", "杯盖 / 密封性", "价格因素", 
-                "🌏 本土化优化 (非产品)", "夸奖 / 好评", "其他建议"
-            ]
             fb_type = c3.selectbox("反馈痛点 / 类型", fb_type_options)
-            fb_customer = c4.selectbox("客户画像", ["本地散客", "VIP / 老客复购", "送礼需求", "游客", "B2B企业客户"])
+            fb_customer = c4.selectbox("客户画像", fb_customer_options)
 
-            fb_detail = st.text_area("🗣️ 客户原话或详细描述 (越具体越好)", placeholder="例如：客人觉得杯盖拧起来有点紧，或者希望包装袋能换成本地人更喜欢的材质，或者建议支持 PayNow 支付...")
+            fb_detail = st.text_area("🗣️ 客户原话或详细描述 (越具体越好)", placeholder="例如：客人觉得杯盖拧起来有点紧，或者希望包装袋能换成本地人更喜欢的材质...")
 
-            fb_status = st.selectbox("当前跟进状态", ["🚨 待处理 / 待评估", "📝 已记录 / 待反馈工厂", "✅ 已解决 / 已采纳"])
+            fb_status = st.selectbox("当前跟进状态", fb_status_options)
 
             if st.form_submit_button("保存客户反馈", type="primary", use_container_width=True):
                 if fb_detail.strip() == "":
@@ -769,32 +772,33 @@ with t7:
             prod_counts = f_fb['商品名称'].value_counts()
             st.bar_chart(prod_counts)
 
-        st.markdown("### 📋 客户反馈追踪处理台 (可直接修改状态)")
+        st.markdown("### 📋 客户反馈追踪处理台 (可直接涂改所有项目)")
         v_fb = f_fb.copy()
         v_fb.insert(0, "选择", False)
 
-        editable_fb_cols = ['跟进状态', '反馈类型']
-        disabled_fb_cols = [c for c in v_fb.columns if c not in editable_fb_cols and c != "选择"]
-
+        # 🚀 核心升级：解除所有限制，表格内所有字段均可直接双击编辑！
         edited_fb = st.data_editor(
             v_fb,
             column_config={
                 "选择": st.column_config.CheckboxColumn("选择", default=False),
-                "跟进状态": st.column_config.SelectboxColumn("跟进状态", options=["🚨 待处理 / 待评估", "📝 已记录 / 待反馈工厂", "✅ 已解决 / 已采纳"]),
-                "反馈类型": st.column_config.SelectboxColumn("反馈类型", options=fb_type_options) # 🚀 列表同步新增选项
+                "跟进状态": st.column_config.SelectboxColumn("跟进状态", options=fb_status_options),
+                "反馈类型": st.column_config.SelectboxColumn("反馈类型", options=fb_type_options),
+                "客户画像": st.column_config.SelectboxColumn("客户画像", options=fb_customer_options)
             },
-            disabled=disabled_fb_cols,
+            disabled=[], # <-- 彻底放开，空列表代表什么都不锁
             use_container_width=True, hide_index=True,
             key=f"fb_editor_{st.session_state.fb_reset_key}"
         )
 
+        # 🚀 全量更新的精准保存逻辑
         if not edited_fb.drop(columns=['选择']).equals(v_fb.drop(columns=['选择'])):
             for idx, row in edited_fb.iterrows():
-                if row['详细原话'] == v_fb.at[idx, '详细原话']:
-                    df_feedback.at[idx, '跟进状态'] = row['跟进状态']
-                    df_feedback.at[idx, '反馈类型'] = row['反馈类型']
+                # 判断这一行是否有任何改动，如果有，就覆盖原表里的对应位置
+                if not row.drop('选择').equals(v_fb.loc[idx].drop('选择')):
+                    for col in FEEDBACK_COLS:
+                        df_feedback.at[idx, col] = row[col]
             save_data(df_feedback, FEEDBACK_SHEET)
-            st.success("✅ 状态更新已自动保存！")
+            st.success("✅ 客户反馈修改已全量精准保存！")
             st.session_state.fb_reset_key += 1
             st.rerun()
 
@@ -804,7 +808,7 @@ with t7:
             with fbc1:
                 if st.button("🗑️ 删除选中反馈", type="primary", key="del_fb"):
                     for _, row in selected_fb.iterrows():
-                        df_feedback = df_feedback[~((df_feedback['详细原话'] == row['详细原话']) & (df_feedback['反馈日期'] == row['反馈日期']))]
+                        df_feedback = df_feedback[~((df_feedback['详细原话'] == row['详细原话']) & (df_feedback['反馈日期'] == row['反馈日期']) & (df_feedback['商品名称'] == row['商品名称']))]
                     save_data(df_feedback, FEEDBACK_SHEET)
                     st.session_state.fb_reset_key += 1
                     st.rerun()
