@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, time
 import gspread 
-from gspread.exceptions import WorksheetNotFound # 🚀 引入找不到表的专属盾牌
+from gspread.exceptions import WorksheetNotFound
 import json
 
 # --- 1. 配置与云端数据库初始化 ---
@@ -47,12 +47,10 @@ def load_data(sheet_name, columns):
         if col not in df.columns: df[col] = 0
     return df[columns]
 
-# 🚀 核心升级：自动建表功能
 def save_data(df, sheet_name):
     try:
         worksheet = sh.worksheet(sheet_name)
     except WorksheetNotFound:
-        # 如果找不到表，就自动在谷歌表格里新建一个！
         worksheet = sh.add_worksheet(title=sheet_name, rows="1000", cols="20")
         
     worksheet.clear() 
@@ -669,7 +667,8 @@ with t6:
             key=f"b2b_editor_{st.session_state.b2b_reset_key}"
         )
         
-        if not edited_b2b.equals(v_b2b):
+        # 🚀 核心修复点：使用 .drop(columns=['选择']) 排除勾选框的干扰
+        if not edited_b2b.drop(columns=['选择']).equals(v_b2b.drop(columns=['选择'])):
             for idx, row in edited_b2b.iterrows():
                 if row['客户名称'] == v_b2b.at[idx, '客户名称'] and row['商品名称'] == v_b2b.at[idx, '商品名称']:
                     df_b2b.at[idx, '已收定金'] = row['已收定金']
