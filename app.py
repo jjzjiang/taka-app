@@ -115,7 +115,6 @@ with t1:
         v_df['进价成本'] = pd.to_numeric(v_df['进价成本'], errors='coerce').fillna(0.0)
         v_df['售卖价格'] = pd.to_numeric(v_df['售卖价格'], errors='coerce').fillna(0.0)
         
-        # 🚀 核心升级：计算单品毛利率
         def calc_margin(row):
             price = row['售卖价格']
             cost = row['进价成本']
@@ -124,10 +123,8 @@ with t1:
             return "0.0%"
             
         v_df['单品毛利率'] = v_df.apply(calc_margin, axis=1)
-        
         v_df.insert(0, "选择", False)
         
-        # 🚀 调整展示顺序：把售价、进价成本、单品毛利率统一挪到最后
         display_cols = ['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '单品毛利率']
         display_df = v_df[display_cols]
 
@@ -222,7 +219,6 @@ with t2:
     if not f_sl.empty:
         f_sl_sel = f_sl.copy(); f_sl_sel.insert(0, "选择", False)
         
-        # 格式化流水表格的金额
         f_sl_sel['成交单价'] = pd.to_numeric(f_sl_sel['成交单价'], errors='coerce').fillna(0.0)
         f_sl_sel['总营业额'] = pd.to_numeric(f_sl_sel['总营业额'], errors='coerce').fillna(0.0)
         styled_sl = f_sl_sel.style.format({'成交单价': '${:.2f}', '总营业额': '${:.2f}'})
@@ -250,37 +246,43 @@ with t2:
 with t3:
     st.subheader("📊 财务日历报表")
     if not df_sales.empty:
-        df_sales['日期_dt'] = pd.to_datetime(df_sales['日期'])
-        sel_range = st.date_input("选择查看时间段", value=[df_sales['日期_dt'].min(), df_sales['日期_dt'].max()])
-        if len(sel_range) == 2:
-            start, end = sel_range
-            f_sales_range = df_sales[(df_sales['日期_dt'] >= pd.Timestamp(start)) & (df_sales['日期_dt'] <= pd.Timestamp(end))].copy()
-            
-            f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
-            f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
-            
-            period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
-            if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m-%d')
-            elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
-            else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m')
-            
-            summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
-            
-            df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
-            df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
-            
-            summ = summ.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
-            summ['具体毛利'] = summ['总营业额'] - (summ['销售数量'] * summ['进价成本'])
-            
-            filtered_summ = get_f(summ, q) 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("总营业额", f"${filtered_summ['总营业额'].sum():.2f}")
-            c2.metric("具体毛利", f"${filtered_summ['具体毛利'].sum():.2f}")
-            c3.metric("总售出件数", f"{int(filtered_summ['销售数量'].sum())} 件")
-            avg_m = filtered_summ['具体毛利'].sum() / filtered_summ['总营业额'].sum() * 100 if filtered_summ['总营业额'].sum() > 0 else 0
-            c4.metric("平均毛利率", f"{avg_m:.1f}%")
-            
-            st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+        # 🚀 核心升级：增加容错处理，跳过错误的日期格式和空白行
+        df_sales['日期_dt'] = pd.to_datetime(df_sales['日期'], errors='coerce')
+        df_sales_clean = df_sales.dropna(subset=['日期_dt']).copy()
+        
+        if not df_sales_clean.empty:
+            sel_range = st.date_input("选择查看时间段", value=[df_sales_clean['日期_dt'].min().date(), df_sales_clean['日期_dt'].max().date()])
+            if len(sel_range) == 2:
+                start, end = sel_range
+                f_sales_range = df_sales_clean[(df_sales_clean['日期_dt'] >= pd.Timestamp(start)) & (df_sales_clean['日期_dt'] <= pd.Timestamp(end))].copy()
+                
+                f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
+                f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
+                
+                period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
+                if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m-%d')
+                elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
+                else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m')
+                
+                summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
+                
+                df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
+                df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
+                
+                summ = summ.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
+                summ['具体毛利'] = summ['总营业额'] - (summ['销售数量'] * summ['进价成本'])
+                
+                filtered_summ = get_f(summ, q) 
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("总营业额", f"${filtered_summ['总营业额'].sum():.2f}")
+                c2.metric("具体毛利", f"${filtered_summ['具体毛利'].sum():.2f}")
+                c3.metric("总售出件数", f"{int(filtered_summ['销售数量'].sum())} 件")
+                avg_m = filtered_summ['具体毛利'].sum() / filtered_summ['总营业额'].sum() * 100 if filtered_summ['总营业额'].sum() > 0 else 0
+                c4.metric("平均毛利率", f"{avg_m:.1f}%")
+                
+                st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+        else:
+            st.info("流水表中没有有效的日期数据。")
 
 with t4:
     st.subheader("👥 员工档案管理")
@@ -308,7 +310,6 @@ with t4:
         v_emp = f_employee.copy()
         v_emp.insert(0, "选择", False)
         
-        # 格式化时薪显示
         v_emp['时薪'] = pd.to_numeric(v_emp['时薪'], errors='coerce').fillna(0.0)
         styled_emp = v_emp.style.format({'时薪': '${:.2f}'})
         
@@ -399,7 +400,6 @@ with t4:
             v_att = f_att.copy()
             v_att.insert(0, "选择", False)
             
-            # 格式化考勤表金额
             v_att['核算薪资'] = pd.to_numeric(v_att['核算薪资'], errors='coerce').fillna(0.0)
             styled_att = v_att.style.format({'核算薪资': '${:.2f}'})
             
