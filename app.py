@@ -21,12 +21,15 @@ SALES_SHEET = "Sales"
 EMP_SHEET = "Employee"
 ATT_SHEET = "Attendance"
 B2B_SHEET = "B2B_Orders" 
+FEEDBACK_SHEET = "Feedback" # 🚀 新增客户反馈金库
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
+# 🚀 客户反馈专属字段
+FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_raw_data(sheet_name):
@@ -73,21 +76,22 @@ df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期') 
 df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
 df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期') 
-df_b2b = load_data(B2B_SHEET, B2B_COLS)
-df_b2b = clean_date_col(df_b2b, '创建日期')
-df_b2b = clean_date_col(df_b2b, '约定交期')
+df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
+df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期') # 🚀 载入反馈数据
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
 if "emp_reset_key" not in st.session_state: st.session_state.emp_reset_key = 0
 if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0 
 if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 
+if "fb_reset_key" not in st.session_state: st.session_state.fb_reset_key = 0 
 
 def clear_stock(): st.session_state.stock_reset_key += 1
 def clear_sales(): st.session_state.sales_reset_key += 1
 def clear_emp(): st.session_state.emp_reset_key += 1
 def clear_att(): st.session_state.att_reset_key += 1
 def clear_b2b(): st.session_state.b2b_reset_key += 1
+def clear_fb(): st.session_state.fb_reset_key += 1
 
 # --- 2. 侧边栏：核心管理 ---
 with st.sidebar:
@@ -114,7 +118,7 @@ with st.sidebar:
     st.info("💡 数据实时同步至 Google Sheets。")
 
 # --- 3. 辅助功能 ---
-q = st.text_input("🔍 快速筛选 (SKU / 颜色 / 姓名)...", placeholder="搜索将同步联动所有标签页")
+q = st.text_input("🔍 快速筛选 (全局搜索)...", placeholder="搜商品/姓名/客户/反馈内容...")
 
 def get_f(df, q):
     if q and not df.empty:
@@ -124,11 +128,14 @@ def get_f(df, q):
             return df[df['员工姓名'].astype(str).str.contains(q, case=False, na=False)]
         elif '客户名称' in df.columns: 
             return df[df['客户名称'].astype(str).str.contains(q, case=False, na=False)]
+        elif '详细原话' in df.columns: # 🚀 赋予反馈表搜索能力
+            return df[df['详细原话'].astype(str).str.contains(q, case=False, na=False) | df['商品名称'].astype(str).str.contains(q, case=False, na=False)]
     return df
 
 # --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
-t1, t2, t3, t4, t5, t6 = st.tabs(["📊 库存", "💰 销售", "📈 财务(毛利)", "👥 考勤", "💎 净利润", "🤝 B2B大客户"])
+# 🚀 展开第7个 Tab
+t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈"])
 
 with t1:
     st.subheader("库存实物分布 (低库存自动标红预警)")
@@ -589,7 +596,6 @@ with t6:
         df_b2b['待收尾款'] = df_b2b['总计应收'] - df_b2b['已收定金']
         df_b2b['B2B净利润'] = df_b2b['总计应收'] - df_b2b['货物成本'] - df_b2b['物流成本'] - df_b2b['关税']
         
-        # 🚀 核心升级：计算单笔订单的利润率，以便在表格中展示
         df_b2b['预估净利率'] = df_b2b.apply(lambda r: f"{(r['B2B净利润'] / r['总计应收'] * 100):.1f}%" if r['总计应收'] > 0 else "0.0%", axis=1)
         
         tot_b2b_val = df_b2b['总计应收'].sum()
@@ -597,7 +603,6 @@ with t6:
         tot_b2b_pending = df_b2b['待收尾款'].sum()
         tot_b2b_profit = df_b2b['B2B净利润'].sum()
         
-        # 🚀 核心升级：计算全局 B2B 净利率
         pct_b2b_profit = (tot_b2b_profit / tot_b2b_val * 100) if tot_b2b_val > 0 else 0.0
         
         c1, c2, c3, c4 = st.columns(4)
@@ -658,14 +663,12 @@ with t6:
     
     f_b2b = get_f(df_b2b, q)
     if not f_b2b.empty:
-        # 给展示用的表格副本准备数据
         v_b2b = f_b2b.copy()
         v_b2b.insert(0, "选择", False)
         
         editable_cols = ['货物成本', '物流成本', '关税', '已收定金', '订单状态', '约定交期', '备注']
         disabled_cols = [c for c in v_b2b.columns if c not in editable_cols and c != "选择"]
         
-        # 🚀 在展示时加入新列，让老板清楚看到每单的利润和占比
         styled_b2b = v_b2b.style.format({
             'B2B单价': '${:.2f}', '总计应收': '${:.2f}', 
             '货物成本': '${:.2f}', '物流成本': '${:.2f}', '关税': '${:.2f}',
@@ -696,7 +699,6 @@ with t6:
                     df_b2b.at[idx, '约定交期'] = row['约定交期']
                     df_b2b.at[idx, '备注'] = row['备注']
             
-            # 保存时剔除我们动态算出来的利润列，保持底层数据纯净
             save_data(df_b2b.drop(columns=['B2B净利润', '预估净利率']), B2B_SHEET)
             st.success("✅ B2B 订单各项修改已自动保存！")
             st.session_state.b2b_reset_key += 1
@@ -713,3 +715,97 @@ with t6:
                     st.session_state.b2b_reset_key += 1 
                     st.rerun()
             with bc2: st.button("🔄 取消选中", key="btn_cancel_b2b", on_click=clear_b2b)
+
+# 🚀 极致体验：新增 Tab 7 客户产品体验反馈池
+with t7:
+    st.subheader("🗣️ 新加坡本地客户产品反馈池")
+    st.info("💡 收集一线真实声音：保温效果、重量手感、设计痛点等，为下一步提需求和改良选品做数据支撑！")
+
+    with st.expander("➕ 快速录入新反馈", expanded=True):
+        f_opts_fb = get_f(df_stock, q).copy()
+        with st.form("add_feedback"):
+            c1, c2 = st.columns(2)
+            fb_date = c1.date_input("反馈日期", value=datetime.now())
+            if not f_opts_fb.empty:
+                fb_prod = c2.selectbox("提及的商品", f_opts_fb['商品名称'].unique().tolist() + ["全系产品 / 通用"])
+            else:
+                fb_prod = c2.text_input("提及的商品", "全系产品 / 通用")
+
+            c3, c4 = st.columns(2)
+            fb_type = c3.selectbox("反馈痛点 / 类型", ["保温保冷效能", "外观颜值 / 颜色", "材质手感 / 重量", "清洗 / 异味问题", "杯盖 / 密封性", "价格因素", "夸奖 / 好评", "其他建议"])
+            fb_customer = c4.selectbox("客户画像", ["本地散客", "VIP / 老客复购", "送礼需求", "游客", "B2B企业客户"])
+
+            fb_detail = st.text_area("🗣️ 客户原话或详细描述 (越具体越好)", placeholder="例如：客人觉得杯盖拧起来有点紧，或者希望出带吸管的版本...")
+
+            fb_status = st.selectbox("当前跟进状态", ["🚨 待处理 / 待评估", "📝 已记录 / 待反馈工厂", "✅ 已解决 / 已采纳"])
+
+            if st.form_submit_button("保存客户反馈", type="primary", use_container_width=True):
+                if fb_detail.strip() == "":
+                    st.warning("⚠️ 详细反馈内容不能为空！")
+                else:
+                    new_fb = pd.DataFrame([[
+                        fb_date.strftime("%Y/%m/%d"), fb_prod, fb_customer, fb_type, fb_detail, fb_status
+                    ]], columns=FEEDBACK_COLS)
+                    df_feedback = pd.concat([new_fb, df_feedback], ignore_index=True)
+                    save_data(df_feedback, FEEDBACK_SHEET)
+                    st.success("✅ 宝贵的一线反馈已入库！系统会自动在谷歌表格创建专属记录表。")
+                    st.rerun()
+
+    st.divider()
+    
+    f_fb = get_f(df_feedback, q)
+    if not f_fb.empty:
+        # 🚀 自动化分析图表
+        fb_c1, fb_c2 = st.columns(2)
+        with fb_c1:
+            st.markdown("**📌 哪些痛点被疯狂吐槽？(分类雷达)**")
+            type_counts = f_fb['反馈类型'].value_counts()
+            st.bar_chart(type_counts)
+        with fb_c2:
+            st.markdown("**📌 哪款产品话题度最高？(商品雷达)**")
+            prod_counts = f_fb['商品名称'].value_counts()
+            st.bar_chart(prod_counts)
+
+        st.markdown("### 📋 客户反馈追踪处理台 (可直接修改状态)")
+        v_fb = f_fb.copy()
+        v_fb.insert(0, "选择", False)
+
+        editable_fb_cols = ['跟进状态', '反馈类型']
+        disabled_fb_cols = [c for c in v_fb.columns if c not in editable_fb_cols and c != "选择"]
+
+        edited_fb = st.data_editor(
+            v_fb,
+            column_config={
+                "选择": st.column_config.CheckboxColumn("选择", default=False),
+                "跟进状态": st.column_config.SelectboxColumn("跟进状态", options=["🚨 待处理 / 待评估", "📝 已记录 / 待反馈工厂", "✅ 已解决 / 已采纳"]),
+                "反馈类型": st.column_config.SelectboxColumn("反馈类型", options=["保温保冷效能", "外观颜值 / 颜色", "材质手感 / 重量", "清洗 / 异味问题", "杯盖 / 密封性", "价格因素", "夸奖 / 好评", "其他建议"])
+            },
+            disabled=disabled_fb_cols,
+            use_container_width=True, hide_index=True,
+            key=f"fb_editor_{st.session_state.fb_reset_key}"
+        )
+
+        if not edited_fb.drop(columns=['选择']).equals(v_fb.drop(columns=['选择'])):
+            for idx, row in edited_fb.iterrows():
+                # 使用详细原话作为唯一标识来定位修改哪行（更安全）
+                if row['详细原话'] == v_fb.at[idx, '详细原话']:
+                    df_feedback.at[idx, '跟进状态'] = row['跟进状态']
+                    df_feedback.at[idx, '反馈类型'] = row['反馈类型']
+            save_data(df_feedback, FEEDBACK_SHEET)
+            st.success("✅ 状态更新已自动保存！")
+            st.session_state.fb_reset_key += 1
+            st.rerun()
+
+        selected_fb = edited_fb[edited_fb["选择"] == True]
+        if not selected_fb.empty:
+            fbc1, fbc2, _ = st.columns([1.5, 1.5, 4])
+            with fbc1:
+                if st.button("🗑️ 删除选中反馈", type="primary", key="del_fb"):
+                    for _, row in selected_fb.iterrows():
+                        df_feedback = df_feedback[~((df_feedback['详细原话'] == row['详细原话']) & (df_feedback['反馈日期'] == row['反馈日期']))]
+                    save_data(df_feedback, FEEDBACK_SHEET)
+                    st.session_state.fb_reset_key += 1
+                    st.rerun()
+            with fbc2: st.button("🔄 取消选中", key="btn_cancel_fb", on_click=clear_fb)
+    else:
+        st.info("💡 暂时没有客户反馈记录。")
