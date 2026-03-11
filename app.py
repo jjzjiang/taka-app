@@ -442,7 +442,7 @@ with t4:
             c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
             c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
-# 🚀 极致真实体验：Tab 5 加入高岛屋 36% 抽成镰刀
+# 🚀 极致真实体验：Tab 5 加入百分比核算逻辑
 with t5:
     st.subheader("💎 真实净利润核算 (Net Profit)")
     st.info("💡 净利润 = 总营业额 - 高岛屋抽成(36%) - 进价成本 - 打卡工资。真实数据，拒绝自嗨！")
@@ -496,33 +496,38 @@ with t5:
                 daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0)
                 daily_np = daily_np.sort_values('日期_str', ascending=False)
 
-                # 🚀 新增 36% 抽成计算逻辑
                 daily_np['商场抽成(36%)'] = daily_np['总营业额'] * 0.36
                 daily_np['扣点后营收'] = daily_np['总营业额'] - daily_np['商场抽成(36%)']
                 daily_np['毛利润'] = daily_np['扣点后营收'] - daily_np['总进价成本']
                 daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
 
-                # 提取总计供上方指标卡使用
+                # 提取总计指标
                 tot_rev = daily_np['总营业额'].sum()
                 tot_comm = daily_np['商场抽成(36%)'].sum()
                 tot_cogs = daily_np['总进价成本'].sum()
                 tot_wage = daily_np['人工成本'].sum()
                 tot_net = daily_np['真实净利润'].sum()
 
+                # 🚀 新增计算各项百分比占比 (防 0 报错处理)
+                pct_comm = (tot_comm / tot_rev * 100) if tot_rev > 0 else 0
+                pct_cogs = (tot_cogs / tot_rev * 100) if tot_rev > 0 else 0
+                pct_wage = (tot_wage / tot_rev * 100) if tot_rev > 0 else 0
+                pct_net = (tot_net / tot_rev * 100) if tot_rev > 0 else 0
+
                 st.markdown("### 📊 阶段性核心指标")
                 m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("💰 总营业额", f"${tot_rev:.2f}")
-                m2.metric("🏢 商场抽成 (36%)", f"${tot_comm:.2f}")
-                m3.metric("📦 商品成本", f"${tot_cogs:.2f}")
-                m4.metric("👥 人工成本", f"${tot_wage:.2f}")
-                m5.metric("💎 真实净利润", f"${tot_net:.2f}")
+                # 使用 delta_color="off" 渲染干净的灰色副标题
+                m1.metric("💰 总营业额", f"${tot_rev:.2f}", delta="100.0% (营收基准)", delta_color="off")
+                m2.metric("🏢 商场抽成 (36%)", f"${tot_comm:.2f}", delta=f"占比: {pct_comm:.1f}%", delta_color="off")
+                m3.metric("📦 商品成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
+                m4.metric("👥 人工成本", f"${tot_wage:.2f}", delta=f"占比: {pct_wage:.1f}%", delta_color="off")
+                m5.metric("💎 真实净利润", f"${tot_net:.2f}", delta=f"净利率: {pct_net:.1f}%", delta_color="off")
 
                 st.divider()
                 st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
 
                 show_np = daily_np.rename(columns={'日期_str': '日期'})
                 
-                # 保留涨红跌绿
                 def color_net_profit(val):
                     try:
                         val = float(val)
