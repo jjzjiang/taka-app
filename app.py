@@ -19,11 +19,14 @@ STOCK_SHEET = "Stock"
 SALES_SHEET = "Sales"
 EMP_SHEET = "Employee"
 ATT_SHEET = "Attendance"
+B2B_SHEET = "B2B_Orders" # 🚀 新增 B2B 专属表
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
+# 🚀 B2B 专属字段
+B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_raw_data(sheet_name):
@@ -66,16 +69,22 @@ df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期') 
 df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
 df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期') 
+# 🚀 载入 B2B 数据
+df_b2b = load_data(B2B_SHEET, B2B_COLS)
+df_b2b = clean_date_col(df_b2b, '创建日期')
+df_b2b = clean_date_col(df_b2b, '约定交期')
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
 if "emp_reset_key" not in st.session_state: st.session_state.emp_reset_key = 0
 if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0 
+if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 # B2B 刷新钥匙
 
 def clear_stock(): st.session_state.stock_reset_key += 1
 def clear_sales(): st.session_state.sales_reset_key += 1
 def clear_emp(): st.session_state.emp_reset_key += 1
 def clear_att(): st.session_state.att_reset_key += 1
+def clear_b2b(): st.session_state.b2b_reset_key += 1
 
 # --- 2. 侧边栏：核心管理 ---
 with st.sidebar:
@@ -102,7 +111,7 @@ with st.sidebar:
     st.info("💡 数据实时同步至 Google Sheets。")
 
 # --- 3. 辅助功能 ---
-q = st.text_input("🔍 快速筛选 (SKU / 颜色 / 员工姓名)...", placeholder="搜索将同步联动所有标签页")
+q = st.text_input("🔍 快速筛选 (SKU / 颜色 / 姓名)...", placeholder="搜索将同步联动所有标签页")
 
 def get_f(df, q):
     if q and not df.empty:
@@ -110,11 +119,14 @@ def get_f(df, q):
             return df[df['商品名称'].astype(str).str.contains(q, case=False, na=False) | df['颜色'].astype(str).str.contains(q, case=False, na=False)]
         elif '员工姓名' in df.columns:
             return df[df['员工姓名'].astype(str).str.contains(q, case=False, na=False)]
+        elif '客户名称' in df.columns: # 支持搜客户
+            return df[df['客户名称'].astype(str).str.contains(q, case=False, na=False)]
     return df
 
 # --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
-t1, t2, t3, t4, t5 = st.tabs(["📊 库存看板", "💰 销售记账", "📈 财务(毛利)分析", "👥 员工与考勤", "💎 真实净利润核算"])
+# 🚀 新增 Tab 6
+t1, t2, t3, t4, t5, t6 = st.tabs(["📊 库存", "💰 销售", "📈 财务(毛利)", "👥 考勤", "💎 净利润", "🤝 B2B大客户"])
 
 with t1:
     st.subheader("库存实物分布 (低库存自动标红预警)")
@@ -221,7 +233,7 @@ with t2:
             auto_calc_price = base_price * discount_opts[s_discount]
             
             c3, c4 = st.columns(2)
-            s_p = c3.number_input("4. 最终成交单价 ($)", value=float(auto_calc_price), format="%.2f", help="已按折扣自动计算，你也可以直接手动涂改抹零")
+            s_p = c3.number_input("4. 最终成交单价 ($)", value=float(auto_calc_price), format="%.2f")
             s_d = c4.date_input("5. 交易日期", value=datetime.now())
             
             if st.button("✅ 确认记录销售", type="primary", use_container_width=True):
@@ -304,14 +316,10 @@ with t3:
                 c4.metric("平均毛利率", f"{avg_m:.1f}%")
                 
                 st.divider()
-
-                # 🚀 核心升级：增加营收与毛利双柱状走势图
                 st.markdown("### 📈 营收与毛利走势")
-                # 为图表单独聚合数据，并强制按时间正序排列 (从左到右)
                 chart_data_t3 = filtered_summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
                 st.bar_chart(chart_data_t3, use_container_width=True)
 
-                # 🚀 保留导出按钮
                 dl_c1, dl_c2 = st.columns([1, 4])
                 with dl_c1:
                     csv_t3 = convert_df_to_csv(filtered_summ)
@@ -368,37 +376,6 @@ with t4:
                     save_data(df_employee, EMP_SHEET)
                     st.session_state.emp_reset_key += 1; st.rerun()
             with col_btn2: st.button("🔄 取消所有选中", key="btn_cancel_emp", on_click=clear_emp)
-            
-            if len(selected_emp) == 1:
-                st.write("### ⚙️ 编辑员工信息")
-                row = selected_emp.iloc[0]
-                orig_idx = df_employee[df_employee['员工姓名'] == row['员工姓名']].index[0]
-                with st.form("edit_selected_emp"):
-                    c1, c2 = st.columns(2)
-                    edit_name = c1.text_input("员工姓名", value=str(df_employee.at[orig_idx, '员工姓名']))
-                    roles = ["店长", "全职店员", "兼职店员", "实习生", "其他"]
-                    current_role = str(df_employee.at[orig_idx, '职位'])
-                    edit_role = c2.selectbox("职位", roles, index=roles.index(current_role) if current_role in roles else 0)
-                    c3, c4, c5 = st.columns(3)
-                    
-                    current_wage = pd.to_numeric(df_employee.at[orig_idx, '时薪'], errors='coerce')
-                    if pd.isna(current_wage): current_wage = 0.0
-                    
-                    edit_wage = c3.number_input("时薪 ($/小时)", min_value=0.0, step=0.5, value=float(current_wage), format="%.2f")
-                    current_phone = str(df_employee.at[orig_idx, '联系方式'])
-                    edit_phone = c4.text_input("联系方式 (选填)", value="" if current_phone=="nan" else current_phone)
-                    
-                    try: parsed_date = pd.to_datetime(str(df_employee.at[orig_idx, '入职日期'])).date()
-                    except: parsed_date = datetime.now().date()
-                    edit_date = c5.date_input("入职日期", value=parsed_date)
-                    
-                    if st.form_submit_button("保存修改"):
-                        if edit_name != row['员工姓名'] and edit_name in df_employee['员工姓名'].values: st.error(f"⚠️ 无法修改：员工 {edit_name} 已存在。")
-                        else:
-                            df_employee.at[orig_idx, '员工姓名'], df_employee.at[orig_idx, '职位'], df_employee.at[orig_idx, '时薪'] = edit_name, edit_role, edit_wage
-                            df_employee.at[orig_idx, '联系方式'], df_employee.at[orig_idx, '入职日期'] = edit_phone, edit_date.strftime("%Y/%m/%d")
-                            save_data(df_employee, EMP_SHEET)
-                            st.session_state.emp_reset_key += 1; st.rerun()
 
     st.divider()
     st.subheader("⏰ 排班与打卡记录")
@@ -478,7 +455,7 @@ with t4:
 
 with t5:
     st.subheader("💎 真实净利润核算 (Net Profit)")
-    st.info("💡 净利润 = 总营业额 - 高岛屋抽成(36%) - 进价成本 - 打卡工资。真实数据，拒绝自嗨！")
+    st.info("💡 此页仅核算高岛屋【零售流水】。净利润 = 总营业额 - 高岛屋抽成(36%) - 进价成本 - 打卡工资。")
 
     if not df_sales.empty:
         df_s_np = df_sales.copy()
@@ -554,12 +531,8 @@ with t5:
                 m5.metric("💎 真实净利润", f"${tot_net:.2f}", delta=f"净利率: {pct_net:.1f}%", delta_color="off")
 
                 st.divider()
-                
-                # 🚀 核心升级：增加营收与净利润对比走势图
                 st.markdown("### 📈 每日营收 vs 净利润趋势")
-                # 提取绘图数据并强制正序
                 chart_data_t5 = daily_np.set_index('日期_str')[['总营业额', '真实净利润']].sort_index(ascending=True)
-                # 使用原生 Bar Chart 渲染，兼容极好，且负数净利润会向下延伸，非常直观
                 st.bar_chart(chart_data_t5, use_container_width=True)
 
                 st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
@@ -602,3 +575,122 @@ with t5:
             st.info("暂无有效销售数据进行核算。")
     else:
         st.info("💡 目前没有流水记录，无法计算利润。")
+
+# 🚀 终极大招：Tab 6 B2B 大客户/企采专属看板
+with t6:
+    st.subheader("🤝 B2B 大客户与企采订单管理")
+    st.info("💡 B2B订单独立核算，免收快闪店抽成！在这里记录订金、尾款和交付状态。")
+
+    # 顶部数据汇总卡片
+    if not df_b2b.empty:
+        df_b2b['总计应收'] = pd.to_numeric(df_b2b['总计应收'], errors='coerce').fillna(0.0)
+        df_b2b['已收定金'] = pd.to_numeric(df_b2b['已收定金'], errors='coerce').fillna(0.0)
+        df_b2b['待收尾款'] = df_b2b['总计应收'] - df_b2b['已收定金']
+        
+        tot_b2b_val = df_b2b['总计应收'].sum()
+        tot_b2b_collected = df_b2b['已收定金'].sum()
+        tot_b2b_pending = df_b2b['待收尾款'].sum()
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("💼 B2B 总合同额", f"${tot_b2b_val:.2f}")
+        c2.metric("💰 已回款金额", f"${tot_b2b_collected:.2f}")
+        c3.metric("⏳ 待结清尾款", f"${tot_b2b_pending:.2f}")
+
+    with st.expander("➕ 录入全新 B2B 订单", expanded=False):
+        f_opts_b2b = get_f(df_stock, q).copy() 
+        if not f_opts_b2b.empty:
+            f_opts_b2b['label'] = f_opts_b2b['商品名称'].astype(str) + " (" + f_opts_b2b['颜色'].astype(str) + ")" 
+            with st.form("add_b2b"):
+                col1, col2 = st.columns(2)
+                b2b_client = col1.text_input("客户/企业名称 (如: NGS)", placeholder="必填")
+                b2b_date = col2.date_input("建单日期", value=datetime.now())
+                
+                col3, col4 = st.columns(2)
+                b2b_prod = col3.selectbox("采购商品", f_opts_b2b['label'])
+                b2b_qty = col4.number_input("采购数量", min_value=1, value=100, step=10)
+                
+                col5, col6, col7 = st.columns(3)
+                b2b_price = col5.number_input("B2B 批发单价 ($)", format="%.2f", min_value=0.0)
+                b2b_deposit = col6.number_input("已收定金/首款 ($)", format="%.2f", min_value=0.0)
+                b2b_deadline = col7.date_input("约定交货日期", value=datetime.now() + timedelta(days=30))
+                
+                col8, col9 = st.columns([1, 2])
+                b2b_status = col8.selectbox("当前状态", ["意向/沟通中", "已付定金/备货中", "已发货/待结尾款", "✅ 订单已完成"])
+                b2b_notes = col9.text_input("备注信息", placeholder="发货地址、定制要求等...")
+                
+                if st.form_submit_button("确认创建 B2B 订单", type="primary"):
+                    if b2b_client.strip() == "":
+                        st.warning("⚠️ 请填写客户名称！")
+                    else:
+                        sel_row = f_opts_b2b[f_opts_b2b['label'] == b2b_prod].iloc[0]
+                        total_val = b2b_qty * b2b_price
+                        balance = total_val - b2b_deposit
+                        
+                        new_b2b = pd.DataFrame([[
+                            b2b_date.strftime("%Y/%m/%d"), b2b_client, sel_row['商品名称'], sel_row['颜色'], 
+                            b2b_qty, b2b_price, total_val, b2b_deposit, balance, 
+                            b2b_deadline.strftime("%Y/%m/%d"), b2b_status, b2b_notes
+                        ]], columns=B2B_COLS)
+                        
+                        df_b2b = pd.concat([new_b2b, df_b2b], ignore_index=True)
+                        save_data(df_b2b, B2B_SHEET)
+                        st.success(f"✅ B2B 订单创建成功！客户：{b2b_client}")
+                        st.rerun()
+
+    st.divider()
+    st.markdown("### 📋 B2B 订单管理台 (可直接修改状态和定金)")
+    
+    f_b2b = get_f(df_b2b, q)
+    if not f_b2b.empty:
+        # 在展示前重新计算一次尾款，确保准确
+        f_b2b['总计应收'] = pd.to_numeric(f_b2b['总计应收'], errors='coerce').fillna(0.0)
+        f_b2b['已收定金'] = pd.to_numeric(f_b2b['已收定金'], errors='coerce').fillna(0.0)
+        f_b2b['待收尾款'] = f_b2b['总计应收'] - f_b2b['已收定金']
+        
+        v_b2b = f_b2b.copy()
+        v_b2b.insert(0, "选择", False)
+        
+        # 让这些列可以直接在表格里快速编辑
+        editable_cols = ['已收定金', '订单状态', '约定交期', '备注']
+        disabled_cols = [c for c in v_b2b.columns if c not in editable_cols and c != "选择"]
+        
+        styled_b2b = v_b2b.style.format({
+            'B2B单价': '${:.2f}', '总计应收': '${:.2f}', '已收定金': '${:.2f}', '待收尾款': '${:.2f}'
+        })
+        
+        edited_b2b = st.data_editor(
+            styled_b2b, 
+            column_config={
+                "选择": st.column_config.CheckboxColumn("选择", default=False),
+                "订单状态": st.column_config.SelectboxColumn("订单状态", options=["意向/沟通中", "已付定金/备货中", "已发货/待结尾款", "✅ 订单已完成"])
+            }, 
+            disabled=disabled_cols, 
+            use_container_width=True, hide_index=True, 
+            key=f"b2b_editor_{st.session_state.b2b_reset_key}"
+        )
+        
+        # 捕捉修改并保存
+        if not edited_b2b.equals(v_b2b):
+            for idx, row in edited_b2b.iterrows():
+                if row['客户名称'] == v_b2b.at[idx, '客户名称'] and row['商品名称'] == v_b2b.at[idx, '商品名称']:
+                    df_b2b.at[idx, '已收定金'] = row['已收定金']
+                    df_b2b.at[idx, '待收尾款'] = float(row['总计应收']) - float(row['已收定金'])
+                    df_b2b.at[idx, '订单状态'] = row['订单状态']
+                    df_b2b.at[idx, '约定交期'] = row['约定交期']
+                    df_b2b.at[idx, '备注'] = row['备注']
+            save_data(df_b2b, B2B_SHEET)
+            st.success("✅ B2B 订单更新已保存！")
+            st.session_state.b2b_reset_key += 1
+            st.rerun()
+
+        selected_b2b = edited_b2b[edited_b2b["选择"] == True]
+        if not selected_b2b.empty:
+            bc1, bc2, _ = st.columns([1.5, 1.5, 4])
+            with bc1:
+                if st.button("🗑️ 删除选中订单", type="primary", key="del_b2b"):
+                    for _, row in selected_b2b.iterrows():
+                        df_b2b = df_b2b[~((df_b2b['客户名称'] == row['客户名称']) & (df_b2b['商品名称'] == row['商品名称']) & (df_b2b['创建日期'] == row['创建日期']))]
+                    save_data(df_b2b, B2B_SHEET)
+                    st.session_state.b2b_reset_key += 1 
+                    st.rerun()
+            with bc2: st.button("🔄 取消选中", key="btn_cancel_b2b", on_click=clear_b2b)
