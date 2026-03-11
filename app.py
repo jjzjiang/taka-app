@@ -70,12 +70,11 @@ with st.sidebar:
             n_name = st.text_input("产品名称")
             n_color = st.text_input("颜色")
             c1, c2, c3 = st.columns(3)
-            n_cost, n_price, n_expect = c1.number_input("进价"), c2.number_input("售价"), c3.number_input("应收")
+            n_cost, n_price, n_expect = c1.number_input("进价", format="%.2f"), c2.number_input("售价", format="%.2f"), c3.number_input("应收")
             i1, i2, i3, i4 = st.columns(4)
             n_disp, n_shelf, n_stor, n_dmg = i1.number_input("展示"), i2.number_input("货柜"), i3.number_input("储物"), i4.number_input("坏货")
             if st.form_submit_button("确认录入"):
                 if n_name and n_color:
-                    # 🚀 修正 1：新增商品时，总库存不再包含坏货 (n_dmg)
                     total = n_disp + n_shelf + n_stor 
                     new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
                     df_stock = pd.concat([df_stock, new_r], ignore_index=True)
@@ -107,12 +106,29 @@ with t1:
     f_stock = get_f(df_stock, q)
     if not f_stock.empty:
         v_df = f_stock.copy()
+        
+        # 格式化数字列
         int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量']
         for col in int_cols: 
             v_df[col] = pd.to_numeric(v_df[col], errors='coerce').fillna(0).astype(int)
+            
+        v_df['进价成本'] = pd.to_numeric(v_df['进价成本'], errors='coerce').fillna(0.0)
+        v_df['售卖价格'] = pd.to_numeric(v_df['售卖价格'], errors='coerce').fillna(0.0)
+        
+        # 🚀 核心升级：计算单品毛利率
+        def calc_margin(row):
+            price = row['售卖价格']
+            cost = row['进价成本']
+            if price > 0:
+                return f"{((price - cost) / price * 100):.1f}%"
+            return "0.0%"
+            
+        v_df['单品毛利率'] = v_df.apply(calc_margin, axis=1)
+        
         v_df.insert(0, "选择", False)
         
-        display_cols = ['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']
+        # 🚀 核心升级：调整展示列，把进价、售价和毛利率放在显眼的位置
+        display_cols = ['选择', '商品名称', '颜色', '进价成本', '售卖价格', '单品毛利率', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量']
         display_df = v_df[display_cols]
 
         def highlight_low_stock(row):
@@ -124,7 +140,7 @@ with t1:
                 pass
             return [''] * len(row)
 
-        styled_df = display_df.style.apply(highlight_low_stock, axis=1)
+        styled_df = display_df.style.format({'进价成本': '${:.2f}', '售卖价格': '${:.2f}'}).apply(highlight_low_stock, axis=1)
         
         edited_stock = st.data_editor(
             styled_df,
@@ -154,8 +170,8 @@ with t1:
                 with st.form("edit_selected_stock"):
                     e_name = st.text_input("产品名称", value=str(df_stock.at[orig_idx, '商品名称']))
                     c1, c2, c3 = st.columns(3)
-                    e_cost = c1.number_input("进价", value=float(pd.to_numeric(df_stock.at[orig_idx, '进价成本'], errors='coerce') or 0))
-                    e_price = c2.number_input("售价", value=float(pd.to_numeric(df_stock.at[orig_idx, '售卖价格'], errors='coerce') or 0))
+                    e_cost = c1.number_input("进价", value=float(pd.to_numeric(df_stock.at[orig_idx, '进价成本'], errors='coerce') or 0), format="%.2f")
+                    e_price = c2.number_input("售价", value=float(pd.to_numeric(df_stock.at[orig_idx, '售卖价格'], errors='coerce') or 0), format="%.2f")
                     e_sold = c3.number_input("已售修正", value=int(pd.to_numeric(df_stock.at[orig_idx, '已售出数量'], errors='coerce') or 0))
                     
                     i1, i2, i3, i4, i5 = st.columns(5)
@@ -169,7 +185,6 @@ with t1:
                         df_stock.at[orig_idx, '商品名称'] = e_name
                         df_stock.at[orig_idx, '进价成本'], df_stock.at[orig_idx, '售卖价格'], df_stock.at[orig_idx, '已售出数量'] = e_cost, e_price, e_sold
                         df_stock.at[orig_idx, '应收到数量'], df_stock.at[orig_idx, '展示数量'], df_stock.at[orig_idx, '货柜数量'], df_stock.at[orig_idx, '储物间数量'], df_stock.at[orig_idx, '坏货数量'] = e_exp, e_dis, e_sh, e_st, e_dm
-                        # 🚀 修正 2：编辑校准时，总库存不再包含坏货 (e_dm)
                         df_stock.at[orig_idx, '总库存'] = e_dis + e_sh + e_st 
                         save_data(df_stock, STOCK_SHEET) 
                         st.session_state.stock_reset_key += 1 
@@ -186,7 +201,7 @@ with t2:
                 selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
                 default_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
                 c1, c2 = st.columns(2)
-                s_q, s_p = c1.number_input("数量", 1), c2.number_input("单价", value=default_price)
+                s_q, s_p = c1.number_input("数量", 1), c2.number_input("单价", value=default_price, format="%.2f")
                 s_d = st.date_input("日期", value=datetime.now())
                 
                 if st.form_submit_button("确认"):
@@ -196,7 +211,6 @@ with t2:
                     
                     df_stock.at[idx_p, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_p, '货柜数量'], errors='coerce') or 0) - s_q
                     df_stock.at[idx_p, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_p, '已售出数量'], errors='coerce') or 0) + s_q
-                    # 🚀 修正 3：新增销售扣减库存时，重新计算总库存时不包含坏货数量
                     df_stock.at[idx_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                     
                     save_data(df_sales, SALES_SHEET) 
@@ -207,7 +221,13 @@ with t2:
     f_sl = get_f(df_sales, q)
     if not f_sl.empty:
         f_sl_sel = f_sl.copy(); f_sl_sel.insert(0, "选择", False)
-        edt = st.data_editor(f_sl_sel, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True, key=f"sales_editor_{st.session_state.sales_reset_key}")
+        
+        # 格式化流水表格的金额
+        f_sl_sel['成交单价'] = pd.to_numeric(f_sl_sel['成交单价'], errors='coerce').fillna(0.0)
+        f_sl_sel['总营业额'] = pd.to_numeric(f_sl_sel['总营业额'], errors='coerce').fillna(0.0)
+        styled_sl = f_sl_sel.style.format({'成交单价': '${:.2f}', '总营业额': '${:.2f}'})
+        
+        edt = st.data_editor(styled_sl, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_sl.columns, use_container_width=True, hide_index=True, key=f"sales_editor_{st.session_state.sales_reset_key}")
         sel = edt[edt["选择"] == True]
         
         if not sel.empty:
@@ -219,7 +239,6 @@ with t2:
                         if not m.empty:
                             df_stock.at[m[0], '货柜数量'] = int(pd.to_numeric(df_stock.at[m[0], '货柜数量'], errors='coerce') or 0) + int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
                             df_stock.at[m[0], '已售出数量'] = int(pd.to_numeric(df_stock.at[m[0], '已售出数量'], errors='coerce') or 0) - int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
-                            # 🚀 修正 4：撤销流水退回库存时，重新计算总库存时不包含坏货数量
                             df_stock.at[m[0], '总库存'] = sum([int(pd.to_numeric(df_stock.at[m[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                     for _, r in sel.iterrows():
                         df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
@@ -238,7 +257,7 @@ with t3:
             f_sales_range = df_sales[(df_sales['日期_dt'] >= pd.Timestamp(start)) & (df_sales['日期_dt'] <= pd.Timestamp(end))].copy()
             
             f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
-            f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0)
+            f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
             
             period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
             if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m-%d')
@@ -248,7 +267,7 @@ with t3:
             summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
             
             df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
-            df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0)
+            df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
             
             summ = summ.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
             summ['具体毛利'] = summ['总营业额'] - (summ['销售数量'] * summ['进价成本'])
@@ -271,7 +290,7 @@ with t4:
             e_name = c1.text_input("员工姓名")
             e_role = c2.selectbox("职位", ["店长", "全职店员", "兼职店员", "实习生", "其他"])
             c3, c4, c5 = st.columns(3)
-            e_wage = c3.number_input("时薪 ($/小时)", min_value=0.0, step=0.5, value=12.0)
+            e_wage = c3.number_input("时薪 ($/小时)", min_value=0.0, step=0.5, value=12.0, format="%.2f")
             e_phone = c4.text_input("联系方式 (选填)")
             e_date = c5.date_input("入职日期", value=datetime.now())
             if st.form_submit_button("保存员工信息"):
@@ -288,7 +307,12 @@ with t4:
     if not f_employee.empty:
         v_emp = f_employee.copy()
         v_emp.insert(0, "选择", False)
-        edited_emp = st.data_editor(v_emp, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_employee.columns.tolist(), use_container_width=True, hide_index=True, key=f"emp_editor_{st.session_state.emp_reset_key}")
+        
+        # 格式化时薪显示
+        v_emp['时薪'] = pd.to_numeric(v_emp['时薪'], errors='coerce').fillna(0.0)
+        styled_emp = v_emp.style.format({'时薪': '${:.2f}'})
+        
+        edited_emp = st.data_editor(styled_emp, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_employee.columns.tolist(), use_container_width=True, hide_index=True, key=f"emp_editor_{st.session_state.emp_reset_key}")
         selected_emp = edited_emp[edited_emp["选择"] == True]
         
         if not selected_emp.empty:
@@ -316,7 +340,7 @@ with t4:
                     current_wage = pd.to_numeric(df_employee.at[orig_idx, '时薪'], errors='coerce')
                     if pd.isna(current_wage): current_wage = 0.0
                     
-                    edit_wage = c3.number_input("时薪 ($/小时)", min_value=0.0, step=0.5, value=float(current_wage))
+                    edit_wage = c3.number_input("时薪 ($/小时)", min_value=0.0, step=0.5, value=float(current_wage), format="%.2f")
                     current_phone = str(df_employee.at[orig_idx, '联系方式'])
                     edit_phone = c4.text_input("联系方式 (选填)", value="" if current_phone=="nan" else current_phone)
                     try: parsed_date = datetime.strptime(str(df_employee.at[orig_idx, '入职日期']), "%Y-%m-%d").date()
@@ -375,8 +399,12 @@ with t4:
             v_att = f_att.copy()
             v_att.insert(0, "选择", False)
             
+            # 格式化考勤表金额
+            v_att['核算薪资'] = pd.to_numeric(v_att['核算薪资'], errors='coerce').fillna(0.0)
+            styled_att = v_att.style.format({'核算薪资': '${:.2f}'})
+            
             edited_att = st.data_editor(
-                v_att, 
+                styled_att, 
                 column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, 
                 disabled=f_att.columns.tolist(), 
                 use_container_width=True, hide_index=True, 
