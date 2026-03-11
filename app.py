@@ -442,10 +442,10 @@ with t4:
             c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
             c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
-# 🚀 纯净版 Tab 5：手写高亮逻辑，告别报错
+# 🚀 极致真实体验：Tab 5 加入高岛屋 36% 抽成镰刀
 with t5:
     st.subheader("💎 真实净利润核算 (Net Profit)")
-    st.info("💡 这里的【净利润】 = 总营业额 - 商品进价成本 - 员工打卡工资成本。")
+    st.info("💡 净利润 = 总营业额 - 高岛屋抽成(36%) - 进价成本 - 打卡工资。真实数据，拒绝自嗨！")
 
     if not df_sales.empty:
         df_s_np = df_sales.copy()
@@ -496,28 +496,33 @@ with t5:
                 daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0)
                 daily_np = daily_np.sort_values('日期_str', ascending=False)
 
-                daily_np['毛利润'] = daily_np['总营业额'] - daily_np['总进价成本']
+                # 🚀 新增 36% 抽成计算逻辑
+                daily_np['商场抽成(36%)'] = daily_np['总营业额'] * 0.36
+                daily_np['扣点后营收'] = daily_np['总营业额'] - daily_np['商场抽成(36%)']
+                daily_np['毛利润'] = daily_np['扣点后营收'] - daily_np['总进价成本']
                 daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
 
+                # 提取总计供上方指标卡使用
                 tot_rev = daily_np['总营业额'].sum()
+                tot_comm = daily_np['商场抽成(36%)'].sum()
                 tot_cogs = daily_np['总进价成本'].sum()
                 tot_wage = daily_np['人工成本'].sum()
-                tot_gross = daily_np['毛利润'].sum()
                 tot_net = daily_np['真实净利润'].sum()
 
                 st.markdown("### 📊 阶段性核心指标")
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("💰 总营业额 (Revenue)", f"${tot_rev:.2f}")
-                m2.metric("📦 总商品成本 (COGS)", f"${tot_cogs:.2f}")
-                m3.metric("👥 总人工成本 (Wages)", f"${tot_wage:.2f}")
-                m4.metric("💎 真实净利润 (Net Profit)", f"${tot_net:.2f}", delta=f"对比毛利: ${tot_gross:.2f}", delta_color="normal")
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("💰 总营业额", f"${tot_rev:.2f}")
+                m2.metric("🏢 商场抽成 (36%)", f"${tot_comm:.2f}")
+                m3.metric("📦 商品成本", f"${tot_cogs:.2f}")
+                m4.metric("👥 人工成本", f"${tot_wage:.2f}")
+                m5.metric("💎 真实净利润", f"${tot_net:.2f}")
 
                 st.divider()
                 st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
 
                 show_np = daily_np.rename(columns={'日期_str': '日期'})
                 
-                # 手写高亮逻辑，避开第三方依赖
+                # 保留涨红跌绿
                 def color_net_profit(val):
                     try:
                         val = float(val)
@@ -526,15 +531,16 @@ with t5:
                     except: pass
                     return ''
                 
-                # 使用最兼容的 applymap 渲染表格
                 try:
                     styled_np = show_np.style.format({
-                        '总营业额': '${:.2f}', '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
+                        '总营业额': '${:.2f}', '商场抽成(36%)': '${:.2f}', '扣点后营收': '${:.2f}',
+                        '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
                         '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
                     }).map(color_net_profit, subset=['真实净利润'])
                 except AttributeError:
                     styled_np = show_np.style.format({
-                        '总营业额': '${:.2f}', '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
+                        '总营业额': '${:.2f}', '商场抽成(36%)': '${:.2f}', '扣点后营收': '${:.2f}',
+                        '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
                         '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
                     }).applymap(color_net_profit, subset=['真实净利润'])
 
