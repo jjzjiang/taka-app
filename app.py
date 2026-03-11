@@ -25,20 +25,25 @@ SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价'
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
 
-def load_data(sheet_name, columns):
+# 🚀 核心大升级：加入 Streamlit 缓存机制，防爆谷歌 API (只缓存 5 分钟，或者直到数据被修改)
+@st.cache_data(ttl=300, show_spinner=False)
+def load_raw_data(sheet_name):
     try:
         worksheet = sh.worksheet(sheet_name)
         records = worksheet.get_all_records()
         if not records:
-            df = pd.DataFrame(columns=columns)
-        else:
-            df = pd.DataFrame(records)
-        for col in columns:
-            if col not in df.columns: df[col] = 0
-        return df[columns]
+            return pd.DataFrame()
+        return pd.DataFrame(records)
     except Exception as e:
-        st.warning(f"无法读取工作表 {sheet_name}，将创建一个空表。")
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame()
+
+def load_data(sheet_name, columns):
+    df = load_raw_data(sheet_name)
+    if df.empty:
+        df = pd.DataFrame(columns=columns)
+    for col in columns:
+        if col not in df.columns: df[col] = 0
+    return df[columns]
 
 def save_data(df, sheet_name):
     worksheet = sh.worksheet(sheet_name)
@@ -46,25 +51,21 @@ def save_data(df, sheet_name):
     df_safe = df.fillna("").astype(str)
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
     worksheet.update(values=data_to_upload, range_name='A1')
+    # 🚀 只要执行了保存操作，立刻清除脑子里的记忆，强制下一次去谷歌拉取最新数据！
+    st.cache_data.clear()
 
-# 🚀 核心升级：日期格式自动清洗器
+# 🚀 自动清洗日期列
 def clean_date_col(df, col_name):
     if not df.empty and col_name in df.columns:
-        # 将所有乱七八糟的日期统一转换为 YYYY/MM/DD
         formatted = pd.to_datetime(df[col_name], errors='coerce').dt.strftime('%Y/%m/%d')
         df[col_name] = formatted.fillna(df[col_name])
     return df
 
+# 读取数据（现在会优先从缓存拿了，速度飞起且不会报错！）
 df_stock = load_data(STOCK_SHEET, STOCK_COLS)
-
-df_sales = load_data(SALES_SHEET, SALES_COLS)
-df_sales = clean_date_col(df_sales, '日期') # 自动清洗流水记录的日期
-
-df_employee = load_data(EMP_SHEET, EMP_COLS)
-df_employee = clean_date_col(df_employee, '入职日期') # 自动清洗员工入职日期
-
-df_attendance = load_data(ATT_SHEET, ATT_COLS) 
-df_attendance = clean_date_col(df_attendance, '日期') # 自动清洗打卡日期
+df_sales = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期') 
+df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
+df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期') 
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -216,7 +217,6 @@ with t2:
                 
                 if st.form_submit_button("确认"):
                     idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
-                    # 🚀 统一强制写入带 / 的日期格式
                     new_s = pd.DataFrame([[s_d.strftime("%Y/%m/%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
                     df_sales = pd.concat([new_s, df_sales], ignore_index=True)
                     
@@ -273,7 +273,6 @@ with t3:
                 f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
                 
                 period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
-                # 🚀 统一财务报表的输出格式也带 /
                 if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m/%d')
                 elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
                 else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m')
@@ -313,7 +312,6 @@ with t4:
                 if e_name.strip() == "": st.warning("⚠️ 员工姓名不能为空！")
                 elif e_name in df_employee['员工姓名'].values: st.warning(f"⚠️ 员工 {e_name} 已经存在！")
                 else:
-                    # 🚀 员工入职记录写入 /
                     new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d")]], columns=EMP_COLS)
                     df_employee = pd.concat([df_employee, new_emp], ignore_index=True)
                     save_data(df_employee, EMP_SHEET) 
@@ -360,7 +358,6 @@ with t4:
                     current_phone = str(df_employee.at[orig_idx, '联系方式'])
                     edit_phone = c4.text_input("联系方式 (选填)", value="" if current_phone=="nan" else current_phone)
                     
-                    # 🚀 更健壮的日期读取，无视之前的分隔符乱码
                     try: parsed_date = pd.to_datetime(str(df_employee.at[orig_idx, '入职日期'])).date()
                     except: parsed_date = datetime.now().date()
                     edit_date = c5.date_input("入职日期", value=parsed_date)
@@ -369,7 +366,6 @@ with t4:
                         if edit_name != row['员工姓名'] and edit_name in df_employee['员工姓名'].values: st.error(f"⚠️ 无法修改：员工 {edit_name} 已存在。")
                         else:
                             df_employee.at[orig_idx, '员工姓名'], df_employee.at[orig_idx, '职位'], df_employee.at[orig_idx, '时薪'] = edit_name, edit_role, edit_wage
-                            # 🚀 保存时强制用 /
                             df_employee.at[orig_idx, '联系方式'], df_employee.at[orig_idx, '入职日期'] = edit_phone, edit_date.strftime("%Y/%m/%d")
                             save_data(df_employee, EMP_SHEET)
                             st.session_state.emp_reset_key += 1; st.rerun()
@@ -401,7 +397,6 @@ with t4:
                     hourly_wage = float(pd.to_numeric(wage_val, errors='coerce') or 0.0)
                     total_wage = duration_hours * hourly_wage
                     
-                    # 🚀 打卡记录写入 /
                     new_att = pd.DataFrame([[
                         att_name, att_date.strftime("%Y/%m/%d"), 
                         att_start.strftime("%H:%M"), att_end.strftime("%H:%M"), 
