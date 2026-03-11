@@ -47,10 +47,24 @@ def save_data(df, sheet_name):
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
     worksheet.update(values=data_to_upload, range_name='A1')
 
+# 🚀 核心升级：日期格式自动清洗器
+def clean_date_col(df, col_name):
+    if not df.empty and col_name in df.columns:
+        # 将所有乱七八糟的日期统一转换为 YYYY/MM/DD
+        formatted = pd.to_datetime(df[col_name], errors='coerce').dt.strftime('%Y/%m/%d')
+        df[col_name] = formatted.fillna(df[col_name])
+    return df
+
 df_stock = load_data(STOCK_SHEET, STOCK_COLS)
+
 df_sales = load_data(SALES_SHEET, SALES_COLS)
+df_sales = clean_date_col(df_sales, '日期') # 自动清洗流水记录的日期
+
 df_employee = load_data(EMP_SHEET, EMP_COLS)
+df_employee = clean_date_col(df_employee, '入职日期') # 自动清洗员工入职日期
+
 df_attendance = load_data(ATT_SHEET, ATT_COLS) 
+df_attendance = clean_date_col(df_attendance, '日期') # 自动清洗打卡日期
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -107,7 +121,6 @@ with t1:
     if not f_stock.empty:
         v_df = f_stock.copy()
         
-        # 格式化数字列
         int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量']
         for col in int_cols: 
             v_df[col] = pd.to_numeric(v_df[col], errors='coerce').fillna(0).astype(int)
@@ -203,7 +216,8 @@ with t2:
                 
                 if st.form_submit_button("确认"):
                     idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
-                    new_s = pd.DataFrame([[s_d.strftime("%Y-%m-%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
+                    # 🚀 统一强制写入带 / 的日期格式
+                    new_s = pd.DataFrame([[s_d.strftime("%Y/%m/%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
                     df_sales = pd.concat([new_s, df_sales], ignore_index=True)
                     
                     df_stock.at[idx_p, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_p, '货柜数量'], errors='coerce') or 0) - s_q
@@ -246,7 +260,6 @@ with t2:
 with t3:
     st.subheader("📊 财务日历报表")
     if not df_sales.empty:
-        # 🚀 核心升级：增加容错处理，跳过错误的日期格式和空白行
         df_sales['日期_dt'] = pd.to_datetime(df_sales['日期'], errors='coerce')
         df_sales_clean = df_sales.dropna(subset=['日期_dt']).copy()
         
@@ -260,9 +273,10 @@ with t3:
                 f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
                 
                 period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
-                if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m-%d')
+                # 🚀 统一财务报表的输出格式也带 /
+                if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m/%d')
                 elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
-                else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y-%m')
+                else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m')
                 
                 summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
                 
@@ -299,7 +313,8 @@ with t4:
                 if e_name.strip() == "": st.warning("⚠️ 员工姓名不能为空！")
                 elif e_name in df_employee['员工姓名'].values: st.warning(f"⚠️ 员工 {e_name} 已经存在！")
                 else:
-                    new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y-%m-%d")]], columns=EMP_COLS)
+                    # 🚀 员工入职记录写入 /
+                    new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d")]], columns=EMP_COLS)
                     df_employee = pd.concat([df_employee, new_emp], ignore_index=True)
                     save_data(df_employee, EMP_SHEET) 
                     st.session_state.emp_reset_key += 1
@@ -344,7 +359,9 @@ with t4:
                     edit_wage = c3.number_input("时薪 ($/小时)", min_value=0.0, step=0.5, value=float(current_wage), format="%.2f")
                     current_phone = str(df_employee.at[orig_idx, '联系方式'])
                     edit_phone = c4.text_input("联系方式 (选填)", value="" if current_phone=="nan" else current_phone)
-                    try: parsed_date = datetime.strptime(str(df_employee.at[orig_idx, '入职日期']), "%Y-%m-%d").date()
+                    
+                    # 🚀 更健壮的日期读取，无视之前的分隔符乱码
+                    try: parsed_date = pd.to_datetime(str(df_employee.at[orig_idx, '入职日期'])).date()
                     except: parsed_date = datetime.now().date()
                     edit_date = c5.date_input("入职日期", value=parsed_date)
                     
@@ -352,7 +369,8 @@ with t4:
                         if edit_name != row['员工姓名'] and edit_name in df_employee['员工姓名'].values: st.error(f"⚠️ 无法修改：员工 {edit_name} 已存在。")
                         else:
                             df_employee.at[orig_idx, '员工姓名'], df_employee.at[orig_idx, '职位'], df_employee.at[orig_idx, '时薪'] = edit_name, edit_role, edit_wage
-                            df_employee.at[orig_idx, '联系方式'], df_employee.at[orig_idx, '入职日期'] = edit_phone, edit_date.strftime("%Y-%m-%d")
+                            # 🚀 保存时强制用 /
+                            df_employee.at[orig_idx, '联系方式'], df_employee.at[orig_idx, '入职日期'] = edit_phone, edit_date.strftime("%Y/%m/%d")
                             save_data(df_employee, EMP_SHEET)
                             st.session_state.emp_reset_key += 1; st.rerun()
 
@@ -383,8 +401,9 @@ with t4:
                     hourly_wage = float(pd.to_numeric(wage_val, errors='coerce') or 0.0)
                     total_wage = duration_hours * hourly_wage
                     
+                    # 🚀 打卡记录写入 /
                     new_att = pd.DataFrame([[
-                        att_name, att_date.strftime("%Y-%m-%d"), 
+                        att_name, att_date.strftime("%Y/%m/%d"), 
                         att_start.strftime("%H:%M"), att_end.strftime("%H:%M"), 
                         round(duration_hours, 2), round(total_wage, 2)
                     ]], columns=ATT_COLS)
