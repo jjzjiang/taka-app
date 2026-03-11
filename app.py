@@ -199,30 +199,44 @@ with t1:
 
 with t2:
     st.subheader("销售记账与流水管理")
-    with st.expander("➕ 新增销售", expanded=True):
+    with st.expander("➕ 新增销售 (支持动态折扣)", expanded=True):
         f_opts = get_f(df_stock, q).copy() 
         if not f_opts.empty:
             f_opts['label'] = f_opts['商品名称'].astype(str) + " (" + f_opts['颜色'].astype(str) + ")" 
-            with st.form("add_sale"):
-                s_l = st.selectbox("商品", f_opts['label'])
-                selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
-                default_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
-                c1, c2 = st.columns(2)
-                s_q, s_p = c1.number_input("数量", 1), c2.number_input("单价", value=default_price, format="%.2f")
-                s_d = st.date_input("日期", value=datetime.now())
+            
+            # 🚀 核心改造：打破 st.form，实现选项实时联动
+            s_l = st.selectbox("1. 选中售出商品", f_opts['label'])
+            selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
+            base_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
+            
+            c1, c2 = st.columns(2)
+            s_q = c1.number_input("2. 销售数量", min_value=1, value=1, step=1)
+            
+            # 🚀 快捷折扣字典
+            discount_opts = {"无折扣 (原价)": 1.0, "95折": 0.95, "9折": 0.90, "85折": 0.85, "8折": 0.80, "75折": 0.75, "7折": 0.70, "5折 (半价)": 0.50}
+            s_discount = c2.selectbox("3. 快捷折扣", list(discount_opts.keys()))
+            
+            # 系统自动算出折后价
+            auto_calc_price = base_price * discount_opts[s_discount]
+            
+            c3, c4 = st.columns(2)
+            s_p = c3.number_input("4. 最终成交单价 ($)", value=float(auto_calc_price), format="%.2f", help="已按折扣自动计算，你也可以直接手动涂改抹零")
+            s_d = c4.date_input("5. 交易日期", value=datetime.now())
+            
+            # 普通按钮提交，告别表单延迟
+            if st.button("✅ 确认记录销售", type="primary", use_container_width=True):
+                idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
+                new_s = pd.DataFrame([[s_d.strftime("%Y/%m/%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
+                df_sales = pd.concat([new_s, df_sales], ignore_index=True)
                 
-                if st.form_submit_button("确认"):
-                    idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
-                    new_s = pd.DataFrame([[s_d.strftime("%Y/%m/%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
-                    df_sales = pd.concat([new_s, df_sales], ignore_index=True)
-                    
-                    df_stock.at[idx_p, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_p, '货柜数量'], errors='coerce') or 0) - s_q
-                    df_stock.at[idx_p, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_p, '已售出数量'], errors='coerce') or 0) + s_q
-                    df_stock.at[idx_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
-                    
-                    save_data(df_sales, SALES_SHEET) 
-                    save_data(df_stock, STOCK_SHEET) 
-                    st.rerun()
+                df_stock.at[idx_p, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_p, '货柜数量'], errors='coerce') or 0) - s_q
+                df_stock.at[idx_p, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_p, '已售出数量'], errors='coerce') or 0) + s_q
+                df_stock.at[idx_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                
+                save_data(df_sales, SALES_SHEET) 
+                save_data(df_stock, STOCK_SHEET) 
+                st.success(f"🎉 成功记录流水：{selected_row['商品名称']} x{s_q}件，折后单价 ${s_p:.2f}")
+                st.rerun()
 
     st.divider()
     f_sl = get_f(df_sales, q)
@@ -501,14 +515,12 @@ with t5:
                 daily_np['毛利润'] = daily_np['扣点后营收'] - daily_np['总进价成本']
                 daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
 
-                # 提取总计指标
                 tot_rev = daily_np['总营业额'].sum()
                 tot_comm = daily_np['商场抽成(36%)'].sum()
                 tot_cogs = daily_np['总进价成本'].sum()
                 tot_wage = daily_np['人工成本'].sum()
                 tot_net = daily_np['真实净利润'].sum()
 
-                # 🚀 新增计算各项百分比占比 (防 0 报错处理)
                 pct_comm = (tot_comm / tot_rev * 100) if tot_rev > 0 else 0
                 pct_cogs = (tot_cogs / tot_rev * 100) if tot_rev > 0 else 0
                 pct_wage = (tot_wage / tot_rev * 100) if tot_rev > 0 else 0
@@ -516,7 +528,6 @@ with t5:
 
                 st.markdown("### 📊 阶段性核心指标")
                 m1, m2, m3, m4, m5 = st.columns(5)
-                # 使用 delta_color="off" 渲染干净的灰色副标题
                 m1.metric("💰 总营业额", f"${tot_rev:.2f}", delta="100.0% (营收基准)", delta_color="off")
                 m2.metric("🏢 商场抽成 (36%)", f"${tot_comm:.2f}", delta=f"占比: {pct_comm:.1f}%", delta_color="off")
                 m3.metric("📦 商品成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
