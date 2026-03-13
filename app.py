@@ -617,7 +617,6 @@ with t6:
         c3.metric("⏳ 待结清尾款", f"${tot_b2b_pending:.2f}")
         c4.metric("💎 B2B 预估净利润", f"${tot_b2b_profit:.2f}", delta=f"净利率: {pct_b2b_profit:.1f}%", delta_color="off")
 
-    # 🚀 核心升级：打破表单，使用原生容器，让系统能实时帮你算钱
     with st.expander("➕ 录入全新 B2B 订单", expanded=True):
         col1, col2 = st.columns(2)
         b2b_client = col1.text_input("🏢 客户/企业名称 (必填)", placeholder="例如：NGS")
@@ -665,11 +664,9 @@ with t6:
                     final_name = ""
 
         else:
-            # 🚀 革命性升级：组合购物车模式
             combo_name = st.text_input("📦 组合大单名称 (必填)", placeholder="例如：NGS 100件定制混装礼盒")
             st.write("👇 **请在下方表格中录入组合包含的商品明细 (可自由添加多行)**")
             
-            # 创建初始购物车表格
             default_df = pd.DataFrame([{"商品或定制名称": "钛杯", "颜色/规格": "默认", "单价($)": 0.0, "数量": 1}])
             
             edited_cart = st.data_editor(
@@ -684,16 +681,17 @@ with t6:
             )
 
             desc_items = []
-            for idx, row in edited_cart.iterrows():
+            # 🚀 核心修复：将循环里的变量改成独立名称，防止与全局搜索框 q 冲突
+            for cart_idx, cart_row in edited_cart.iterrows():
                 try:
-                    p = float(row["单价($)"])
-                    q = int(row["数量"])
-                    n = str(row["商品或定制名称"]).strip()
-                    c = str(row["颜色/规格"]).strip()
-                    if n:
-                        final_total += p * q
-                        final_qty += q
-                        item_str = f"{n}({c})x{q}" if c else f"{n}x{q}"
+                    cart_p = float(cart_row["单价($)"])
+                    cart_q = int(cart_row["数量"])
+                    cart_n = str(cart_row["商品或定制名称"]).strip()
+                    cart_c = str(cart_row["颜色/规格"]).strip()
+                    if cart_n:
+                        final_total += cart_p * cart_q
+                        final_qty += cart_q
+                        item_str = f"{cart_n}({cart_c})x{cart_q}" if cart_c else f"{cart_n}x{cart_q}"
                         desc_items.append(item_str)
                 except:
                     pass
