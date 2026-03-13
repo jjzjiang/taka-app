@@ -127,16 +127,16 @@ with st.sidebar:
 # --- 3. 辅助功能 ---
 q = st.text_input("🔍 快速筛选 (全局搜索)...", placeholder="搜商品/姓名/客户/反馈内容...")
 
+# 🚀 核心升级：真·全局搜索，无视列名，扫描整张表的所有角落！
 def get_f(df, q):
     if q and not df.empty:
-        if '商品名称' in df.columns and '颜色' in df.columns:
-            return df[df['商品名称'].astype(str).str.contains(q, case=False, na=False) | df['颜色'].astype(str).str.contains(q, case=False, na=False)]
-        elif '员工姓名' in df.columns:
-            return df[df['员工姓名'].astype(str).str.contains(q, case=False, na=False)]
-        elif '客户名称' in df.columns: 
-            return df[df['客户名称'].astype(str).str.contains(q, case=False, na=False)]
-        elif '详细原话' in df.columns: 
-            return df[df['详细原话'].astype(str).str.contains(q, case=False, na=False) | df['商品名称'].astype(str).str.contains(q, case=False, na=False)]
+        # 创建一个全是 False 的遮罩
+        mask = pd.Series(False, index=df.index)
+        # 遍历每一列，只要有一列包含搜索词，就标为 True
+        for col in df.columns:
+            # regex=False 确保输入特殊符号(如括号、星号)时不会崩溃
+            mask = mask | df[col].fillna('').astype(str).str.contains(q, case=False, regex=False)
+        return df[mask]
     return df
 
 # --- 4. 主界面布局 ---
@@ -227,11 +227,13 @@ with t1:
                         save_data(df_stock, STOCK_SHEET) 
                         st.session_state.stock_reset_key += 1 
                         st.rerun()
+    else:
+        st.info("💡 暂无数据或没有找到符合搜索条件的记录。")
 
 with t2:
     st.subheader("销售记账与流水管理")
     with st.expander("➕ 新增销售 (支持动态折扣)", expanded=True):
-        f_opts = get_f(df_stock, q).copy() 
+        f_opts = get_f(df_stock, "").copy() 
         if not f_opts.empty:
             f_opts['label'] = f_opts['商品名称'].astype(str) + " (" + f_opts['颜色'].astype(str) + ")" 
             
@@ -293,6 +295,8 @@ with t2:
                     st.session_state.sales_reset_key += 1
                     st.rerun()
             with sc2: st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
+    else:
+        st.info("💡 暂无流水记录或没有找到符合条件的流水。")
 
 with t3:
     st.subheader("📊 财务报表 (仅含商品毛利)")
@@ -323,30 +327,34 @@ with t3:
                 summ['具体毛利'] = summ['总营业额'] - (summ['销售数量'] * summ['进价成本'])
                 
                 filtered_summ = get_f(summ, q) 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("总营业额", f"${filtered_summ['总营业额'].sum():.2f}")
-                c2.metric("具体毛利", f"${filtered_summ['具体毛利'].sum():.2f}")
-                c3.metric("总售出件数", f"{int(filtered_summ['销售数量'].sum())} 件")
-                avg_m = filtered_summ['具体毛利'].sum() / filtered_summ['总营业额'].sum() * 100 if filtered_summ['总营业额'].sum() > 0 else 0
-                c4.metric("平均毛利率", f"{avg_m:.1f}%")
                 
-                st.divider()
-                st.markdown("### 📈 营收与毛利走势")
-                chart_data_t3 = filtered_summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
-                st.bar_chart(chart_data_t3, use_container_width=True)
+                if not filtered_summ.empty:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("总营业额", f"${filtered_summ['总营业额'].sum():.2f}")
+                    c2.metric("具体毛利", f"${filtered_summ['具体毛利'].sum():.2f}")
+                    c3.metric("总售出件数", f"{int(filtered_summ['销售数量'].sum())} 件")
+                    avg_m = filtered_summ['具体毛利'].sum() / filtered_summ['总营业额'].sum() * 100 if filtered_summ['总营业额'].sum() > 0 else 0
+                    c4.metric("平均毛利率", f"{avg_m:.1f}%")
+                    
+                    st.divider()
+                    st.markdown("### 📈 营收与毛利走势")
+                    chart_data_t3 = filtered_summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
+                    st.bar_chart(chart_data_t3, use_container_width=True)
 
-                dl_c1, dl_c2 = st.columns([1, 4])
-                with dl_c1:
-                    csv_t3 = convert_df_to_csv(filtered_summ)
-                    st.download_button(
-                        label="⬇️ 一键导出毛利报表 (CSV)",
-                        data=csv_t3,
-                        file_name=f"Takashimaya_毛利报表_{datetime.now().strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                        type="primary"
-                    )
-                
-                st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+                    dl_c1, dl_c2 = st.columns([1, 4])
+                    with dl_c1:
+                        csv_t3 = convert_df_to_csv(filtered_summ)
+                        st.download_button(
+                            label="⬇️ 一键导出毛利报表 (CSV)",
+                            data=csv_t3,
+                            file_name=f"Takashimaya_毛利报表_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            type="primary"
+                        )
+                    
+                    st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+                else:
+                    st.info("💡 在选定时间段内没有找到符合搜索条件的销售记录。")
         else:
             st.info("流水表中没有有效的日期数据。")
 
@@ -633,7 +641,7 @@ with t6:
 
         if order_mode == "🎯 单一商品 (常规下单)":
             st.write("📦 **商品信息 (二选一)**")
-            f_opts_b2b = get_f(df_stock, q).copy() 
+            f_opts_b2b = get_f(df_stock, "").copy() 
             stock_list = []
             if not f_opts_b2b.empty:
                 f_opts_b2b['label'] = f_opts_b2b['商品名称'].astype(str) + " (" + f_opts_b2b['颜色'].astype(str) + ")" 
@@ -681,7 +689,6 @@ with t6:
             )
 
             desc_items = []
-            # 🚀 核心修复：将循环里的变量改成独立名称，防止与全局搜索框 q 冲突
             for cart_idx, cart_row in edited_cart.iterrows():
                 try:
                     cart_p = float(cart_row["单价($)"])
@@ -795,6 +802,8 @@ with t6:
                     st.session_state.b2b_reset_key += 1 
                     st.rerun()
             with bc2: st.button("🔄 取消选中", key="btn_cancel_b2b", on_click=clear_b2b)
+    else:
+        st.info("💡 暂无 B2B 订单记录或没有找到符合搜索条件的订单。")
 
 with t7:
     st.subheader("🗣️ 新加坡本地客户产品反馈池")
@@ -810,7 +819,7 @@ with t7:
     fb_status_options = ["🚨 待处理 / 待评估", "📝 已记录 / 待反馈工厂", "✅ 已解决 / 已采纳"]
 
     with st.expander("➕ 快速录入新反馈", expanded=True):
-        f_opts_fb = get_f(df_stock, q).copy()
+        f_opts_fb = get_f(df_stock, "").copy()
         with st.form("add_feedback"):
             c1, c2 = st.columns(2)
             fb_date = c1.date_input("反馈日期", value=datetime.now())
@@ -892,4 +901,4 @@ with t7:
                     st.rerun()
             with fbc2: st.button("🔄 取消选中", key="btn_cancel_fb", on_click=clear_fb)
     else:
-        st.info("💡 暂时没有客户反馈记录。")
+        st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
