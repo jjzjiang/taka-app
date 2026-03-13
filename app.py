@@ -593,7 +593,7 @@ with t5:
 
 with t6:
     st.subheader("🤝 B2B 大客户与企采订单管理")
-    st.info("💡 B2B订单独立核算，免收快闪店抽成！不仅可以从库存选爆款，更支持【一键录入定制商品】。")
+    st.info("💡 B2B订单独立核算，免收快闪店抽成！支持【单一SKU】与【多件组合套装】两种模式。")
 
     if not df_b2b.empty:
         for num_col in ['总计应收', '已收定金', '货物成本', '物流成本', '关税']:
@@ -617,57 +617,80 @@ with t6:
         c3.metric("⏳ 待结清尾款", f"${tot_b2b_pending:.2f}")
         c4.metric("💎 B2B 预估净利润", f"${tot_b2b_profit:.2f}", delta=f"净利率: {pct_b2b_profit:.1f}%", delta_color="off")
 
-    with st.expander("➕ 录入全新 B2B 订单", expanded=False):
+    with st.expander("➕ 录入全新 B2B 订单", expanded=True):
+        # 🚀 核心升级：外置单选框，用于动态切换表单模式
+        order_mode = st.radio("🛒 选择订单类型", ["🎯 单一SKU模式", "📦 多件组合 / 套装模式"], horizontal=True)
+        
         f_opts_b2b = get_f(df_stock, q).copy() 
-        with st.form("add_b2b"):
+        stock_list = []
+        if not f_opts_b2b.empty:
+            f_opts_b2b['label'] = f_opts_b2b['商品名称'].astype(str) + " (" + f_opts_b2b['颜色'].astype(str) + ")" 
+            stock_list = f_opts_b2b['label'].tolist()
+
+        with st.form(f"add_b2b_{order_mode}"):
             col1, col2 = st.columns(2)
             b2b_client = col1.text_input("客户/企业名称 (如: NGS)", placeholder="必填")
             b2b_date = col2.date_input("建单日期", value=datetime.now())
             
-            # 🚀 核心升级：覆盖式双模输入
-            st.write("📦 **采购商品信息 (二选一)**")
-            col_sel, col_cust_name, col_cust_color = st.columns([2, 1.5, 1])
-            if not f_opts_b2b.empty:
-                f_opts_b2b['label'] = f_opts_b2b['商品名称'].astype(str) + " (" + f_opts_b2b['颜色'].astype(str) + ")" 
-                b2b_prod = col_sel.selectbox("方式A：选择现有商品", ["(不选择)"] + f_opts_b2b['label'].tolist())
-            else:
-                b2b_prod = col_sel.selectbox("方式A：选择现有商品", ["(不选择)"])
+            # 根据模式渲染不同的输入区域
+            if order_mode == "🎯 单一SKU模式":
+                st.write("📦 **采购商品信息 (二选一)**")
+                col_sel, col_cust_name, col_cust_color = st.columns([2, 1.5, 1])
+                b2b_prod = col_sel.selectbox("方式A：选择现有商品", ["(不选择)"] + stock_list)
+                b2b_custom_prod = col_cust_name.text_input("方式B：手动输入定制商品", placeholder="填写此项将覆盖左侧")
+                b2b_custom_color = col_cust_color.text_input("定制颜色", placeholder="选填")
                 
-            b2b_custom_prod = col_cust_name.text_input("方式B：手动输入定制商品", placeholder="填写此项将覆盖左侧选择", help="专为企采定制、套装打样设计")
-            b2b_custom_color = col_cust_color.text_input("定制颜色", placeholder="选填")
-            
-            col_q, col_p, col_d = st.columns(3)
-            b2b_qty = col_q.number_input("采购数量", min_value=1, value=100, step=10)
-            b2b_price = col_p.number_input("B2B 批发单价 ($)", format="%.2f", min_value=0.0)
-            b2b_deposit = col_d.number_input("已收定金/首款 ($)", format="%.2f", min_value=0.0)
+                col3, col4, col5 = st.columns(3)
+                b2b_qty = col3.number_input("采购数量", min_value=1, value=100, step=10)
+                b2b_price = col4.number_input("B2B 批发单价 ($)", format="%.2f", min_value=0.0)
+                b2b_deposit = col5.number_input("已收定金/首款 ($)", format="%.2f", min_value=0.0)
+                
+            else:
+                st.write("📦 **组合 / 套装商品信息**")
+                col_name, col_desc = st.columns([1, 2])
+                combo_name = col_name.text_input("组合总名称", placeholder="如：NGS 100件定制混装礼盒")
+                combo_desc = col_desc.text_input("包含明细", placeholder="如：50个红杯 + 50个蓝杯 + 专属刻字")
+                
+                col3, col4, col5 = st.columns(3)
+                b2b_qty = col3.number_input("总套数 / 总批次", min_value=1, value=1, step=1)
+                b2b_price = col4.number_input("单套 / 整批均价 ($)", format="%.2f", min_value=0.0)
+                b2b_deposit = col5.number_input("已收定金/首款 ($)", format="%.2f", min_value=0.0)
             
             st.write("🚚 **履约成本预估 (可填 0，后续货到了再在表格中修改)**")
             col10, col11, col12 = st.columns(3)
-            b2b_cogs = col10.number_input("预估货物成本 ($)", format="%.2f", min_value=0.0)
+            b2b_cogs = col10.number_input("预估货物总成本 ($)", format="%.2f", min_value=0.0)
             b2b_shipping = col11.number_input("预估物流成本 ($)", format="%.2f", min_value=0.0)
             b2b_tax = col12.number_input("预估关税 ($)", format="%.2f", min_value=0.0)
             
             col8, col9, col_deadline = st.columns([1, 1.5, 1])
             b2b_status = col8.selectbox("当前状态", ["意向/沟通中", "已付定金/备货中", "已发货/待结尾款", "✅ 订单已完成"])
-            b2b_notes = col9.text_input("备注信息", placeholder="发货地址、定制要求等...")
+            b2b_notes = col9.text_input("备注信息", placeholder="发货地址、其他要求等...")
             b2b_deadline = col_deadline.date_input("约定交货日期", value=datetime.now() + timedelta(days=30))
             
             if st.form_submit_button("确认创建 B2B 订单", type="primary"):
                 if b2b_client.strip() == "":
                     st.warning("⚠️ 请填写客户名称！")
                 else:
-                    # 🚀 判断逻辑：优先使用手动填写的名字
-                    if b2b_custom_prod.strip() != "":
-                        final_name = b2b_custom_prod.strip()
-                        final_color = b2b_custom_color.strip()
-                    else:
-                        if b2b_prod == "(不选择)":
-                            st.error("⚠️ 请在下拉框选择现有商品，或在右侧手动输入定制商品名称！")
-                            st.stop()
+                    if order_mode == "🎯 单一SKU模式":
+                        if b2b_custom_prod.strip() != "":
+                            final_name = b2b_custom_prod.strip()
+                            final_color = b2b_custom_color.strip()
                         else:
-                            sel_row = f_opts_b2b[f_opts_b2b['label'] == b2b_prod].iloc[0]
-                            final_name = sel_row['商品名称']
-                            final_color = sel_row['颜色']
+                            if b2b_prod == "(不选择)":
+                                st.error("⚠️ 请在下拉框选择现有商品，或在右侧手动输入定制商品名称！")
+                                st.stop()
+                            else:
+                                sel_row = f_opts_b2b[f_opts_b2b['label'] == b2b_prod].iloc[0]
+                                final_name = sel_row['商品名称']
+                                final_color = sel_row['颜色']
+                        final_notes = b2b_notes
+                    else:
+                        if combo_name.strip() == "":
+                            st.error("⚠️ 请填写组合名称！")
+                            st.stop()
+                        final_name = f"【组合】{combo_name.strip()}"
+                        final_color = "多件混装"
+                        final_notes = f"明细: {combo_desc} | 备注: {b2b_notes}" if combo_desc else b2b_notes
 
                     total_val = b2b_qty * b2b_price
                     balance = total_val - b2b_deposit
@@ -675,7 +698,7 @@ with t6:
                     new_b2b = pd.DataFrame([[
                         b2b_date.strftime("%Y/%m/%d"), b2b_client, final_name, final_color, 
                         b2b_qty, b2b_price, total_val, b2b_cogs, b2b_shipping, b2b_tax, b2b_deposit, balance, 
-                        b2b_deadline.strftime("%Y/%m/%d"), b2b_status, b2b_notes
+                        b2b_deadline.strftime("%Y/%m/%d"), b2b_status, final_notes
                     ]], columns=B2B_COLS)
                     
                     df_b2b = pd.concat([new_b2b, df_b2b], ignore_index=True)
