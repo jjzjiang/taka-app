@@ -127,14 +127,10 @@ with st.sidebar:
 # --- 3. 辅助功能 ---
 q = st.text_input("🔍 快速筛选 (全局搜索)...", placeholder="搜商品/姓名/客户/反馈内容...")
 
-# 🚀 核心升级：真·全局搜索，无视列名，扫描整张表的所有角落！
 def get_f(df, q):
     if q and not df.empty:
-        # 创建一个全是 False 的遮罩
         mask = pd.Series(False, index=df.index)
-        # 遍历每一列，只要有一列包含搜索词，就标为 True
         for col in df.columns:
-            # regex=False 确保输入特殊符号(如括号、星号)时不会崩溃
             mask = mask | df[col].fillna('').astype(str).str.contains(q, case=False, regex=False)
         return df[mask]
     return df
@@ -746,15 +742,15 @@ with t6:
                 st.rerun()
 
     st.divider()
-    st.markdown("### 📋 B2B 订单明细榜 (可直接涂改成本和状态)")
+    st.markdown("### 📋 B2B 订单明细榜 (全字段解禁，可直接双击涂改)")
     
     f_b2b = get_f(df_b2b, q)
     if not f_b2b.empty:
         v_b2b = f_b2b.copy()
         v_b2b.insert(0, "选择", False)
         
-        editable_cols = ['货物成本', '物流成本', '关税', '已收定金', '订单状态', '约定交期', '备注']
-        disabled_cols = [c for c in v_b2b.columns if c not in editable_cols and c != "选择"]
+        # 🚀 核心升级：把只读锁全部砸碎！只锁住那几个系统算出来的结果列。
+        disabled_cols = ['待收尾款', 'B2B净利润', '预估净利率']
         
         styled_b2b = v_b2b.style.format({
             'B2B单价': '${:.2f}', '总计应收': '${:.2f}', 
@@ -773,21 +769,22 @@ with t6:
             key=f"b2b_editor_{st.session_state.b2b_reset_key}"
         )
         
+        # 🚀 既然解禁了所有列，保存逻辑也要全部重写，支持全量保存
         if not edited_b2b.drop(columns=['选择']).equals(v_b2b.drop(columns=['选择'])):
             for idx, row in edited_b2b.iterrows():
-                if row['客户名称'] == v_b2b.at[idx, '客户名称'] and row['商品名称'] == v_b2b.at[idx, '商品名称']:
-                    df_b2b.at[idx, '已收定金'] = row['已收定金']
-                    df_b2b.at[idx, '货物成本'] = row['货物成本']
-                    df_b2b.at[idx, '物流成本'] = row['物流成本']
-                    df_b2b.at[idx, '关税'] = row['关税']
+                if not row.drop('选择').equals(v_b2b.loc[idx].drop('选择')):
+                    # 将所有基础列的修改同步到 df_b2b
+                    for col in B2B_COLS:
+                        if col in row:
+                            df_b2b.at[idx, col] = row[col]
                     
-                    df_b2b.at[idx, '待收尾款'] = float(row['总计应收']) - float(row['已收定金'])
-                    df_b2b.at[idx, '订单状态'] = row['订单状态']
-                    df_b2b.at[idx, '约定交期'] = row['约定交期']
-                    df_b2b.at[idx, '备注'] = row['备注']
-            
-            save_data(df_b2b.drop(columns=['B2B净利润', '预估净利率']), B2B_SHEET)
-            st.success("✅ B2B 订单各项修改已自动保存！")
+                    # 重新核算尾款 (以防你修改了总价或定金)
+                    total_receivable = float(row['总计应收'] or 0)
+                    deposit = float(row['已收定金'] or 0)
+                    df_b2b.at[idx, '待收尾款'] = total_receivable - deposit
+                    
+            save_data(df_b2b[B2B_COLS], B2B_SHEET) # 确保存进谷歌的只有基础列
+            st.success("✅ B2B 订单修改已全量精准保存！")
             st.session_state.b2b_reset_key += 1
             st.rerun()
 
@@ -798,7 +795,7 @@ with t6:
                 if st.button("🗑️ 删除选中订单", type="primary", key="del_b2b"):
                     for _, row in selected_b2b.iterrows():
                         df_b2b = df_b2b[~((df_b2b['客户名称'] == row['客户名称']) & (df_b2b['商品名称'] == row['商品名称']) & (df_b2b['创建日期'] == row['创建日期']))]
-                    save_data(df_b2b.drop(columns=['B2B净利润', '预估净利率']), B2B_SHEET)
+                    save_data(df_b2b[B2B_COLS], B2B_SHEET)
                     st.session_state.b2b_reset_key += 1 
                     st.rerun()
             with bc2: st.button("🔄 取消选中", key="btn_cancel_b2b", on_click=clear_b2b)
