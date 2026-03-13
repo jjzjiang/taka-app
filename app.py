@@ -30,14 +30,12 @@ ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
 
-# 🚀 核心升级：为每张表分配独立的“记忆版本号”
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {
         STOCK_SHEET: 0, SALES_SHEET: 0, EMP_SHEET: 0,
         ATT_SHEET: 0, B2B_SHEET: 0, FEEDBACK_SHEET: 0
     }
 
-# 读取数据时，带上这张表专属的版本号
 @st.cache_data(ttl=300, show_spinner=False)
 def load_raw_data(sheet_name, version):
     try:
@@ -50,7 +48,6 @@ def load_raw_data(sheet_name, version):
         return pd.DataFrame()
 
 def load_data(sheet_name, columns):
-    # 获取这张表当前的版本号
     ver = st.session_state.sheet_versions.get(sheet_name, 0)
     df = load_raw_data(sheet_name, ver)
     if df.empty:
@@ -70,8 +67,6 @@ def save_data(df, sheet_name):
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
     worksheet.update(values=data_to_upload, range_name='A1')
     
-    # 🚀 精准刷新：我只让当前被修改的这张表的版本号 +1
-    # 这样下次读取时，只有这张表会去谷歌拉新数据，其他表继续用缓存！彻底告别爆表！
     st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
 
 def clean_date_col(df, col_name):
@@ -598,7 +593,7 @@ with t5:
 
 with t6:
     st.subheader("🤝 B2B 大客户与企采订单管理")
-    st.info("💡 B2B订单独立核算，免收快闪店抽成！在这里记录订金、尾款、各项成本和交付状态。")
+    st.info("💡 B2B订单独立核算，免收快闪店抽成！不仅可以从库存选爆款，更支持【一键录入定制商品】。")
 
     if not df_b2b.empty:
         for num_col in ['总计应收', '已收定金', '货物成本', '物流成本', '关税']:
@@ -624,50 +619,69 @@ with t6:
 
     with st.expander("➕ 录入全新 B2B 订单", expanded=False):
         f_opts_b2b = get_f(df_stock, q).copy() 
-        if not f_opts_b2b.empty:
-            f_opts_b2b['label'] = f_opts_b2b['商品名称'].astype(str) + " (" + f_opts_b2b['颜色'].astype(str) + ")" 
-            with st.form("add_b2b"):
-                col1, col2 = st.columns(2)
-                b2b_client = col1.text_input("客户/企业名称 (如: NGS)", placeholder="必填")
-                b2b_date = col2.date_input("建单日期", value=datetime.now())
+        with st.form("add_b2b"):
+            col1, col2 = st.columns(2)
+            b2b_client = col1.text_input("客户/企业名称 (如: NGS)", placeholder="必填")
+            b2b_date = col2.date_input("建单日期", value=datetime.now())
+            
+            # 🚀 核心升级：覆盖式双模输入
+            st.write("📦 **采购商品信息 (二选一)**")
+            col_sel, col_cust_name, col_cust_color = st.columns([2, 1.5, 1])
+            if not f_opts_b2b.empty:
+                f_opts_b2b['label'] = f_opts_b2b['商品名称'].astype(str) + " (" + f_opts_b2b['颜色'].astype(str) + ")" 
+                b2b_prod = col_sel.selectbox("方式A：选择现有商品", ["(不选择)"] + f_opts_b2b['label'].tolist())
+            else:
+                b2b_prod = col_sel.selectbox("方式A：选择现有商品", ["(不选择)"])
                 
-                col3, col4 = st.columns(2)
-                b2b_prod = col3.selectbox("采购商品", f_opts_b2b['label'])
-                b2b_qty = col4.number_input("采购数量", min_value=1, value=100, step=10)
-                
-                col5, col6, col7 = st.columns(3)
-                b2b_price = col5.number_input("B2B 批发单价 ($)", format="%.2f", min_value=0.0)
-                b2b_deposit = col6.number_input("已收定金/首款 ($)", format="%.2f", min_value=0.0)
-                b2b_deadline = col7.date_input("约定交货日期", value=datetime.now() + timedelta(days=30))
-                
-                st.write("🚚 履约成本预估 (可填 0，后续货到了再在表格中修改)")
-                col10, col11, col12 = st.columns(3)
-                b2b_cogs = col10.number_input("预估货物成本 ($)", format="%.2f", min_value=0.0)
-                b2b_shipping = col11.number_input("预估物流成本 ($)", format="%.2f", min_value=0.0)
-                b2b_tax = col12.number_input("预估关税 ($)", format="%.2f", min_value=0.0)
-                
-                col8, col9 = st.columns([1, 2])
-                b2b_status = col8.selectbox("当前状态", ["意向/沟通中", "已付定金/备货中", "已发货/待结尾款", "✅ 订单已完成"])
-                b2b_notes = col9.text_input("备注信息", placeholder="发货地址、定制要求等...")
-                
-                if st.form_submit_button("确认创建 B2B 订单", type="primary"):
-                    if b2b_client.strip() == "":
-                        st.warning("⚠️ 请填写客户名称！")
+            b2b_custom_prod = col_cust_name.text_input("方式B：手动输入定制商品", placeholder="填写此项将覆盖左侧选择", help="专为企采定制、套装打样设计")
+            b2b_custom_color = col_cust_color.text_input("定制颜色", placeholder="选填")
+            
+            col_q, col_p, col_d = st.columns(3)
+            b2b_qty = col_q.number_input("采购数量", min_value=1, value=100, step=10)
+            b2b_price = col_p.number_input("B2B 批发单价 ($)", format="%.2f", min_value=0.0)
+            b2b_deposit = col_d.number_input("已收定金/首款 ($)", format="%.2f", min_value=0.0)
+            
+            st.write("🚚 **履约成本预估 (可填 0，后续货到了再在表格中修改)**")
+            col10, col11, col12 = st.columns(3)
+            b2b_cogs = col10.number_input("预估货物成本 ($)", format="%.2f", min_value=0.0)
+            b2b_shipping = col11.number_input("预估物流成本 ($)", format="%.2f", min_value=0.0)
+            b2b_tax = col12.number_input("预估关税 ($)", format="%.2f", min_value=0.0)
+            
+            col8, col9, col_deadline = st.columns([1, 1.5, 1])
+            b2b_status = col8.selectbox("当前状态", ["意向/沟通中", "已付定金/备货中", "已发货/待结尾款", "✅ 订单已完成"])
+            b2b_notes = col9.text_input("备注信息", placeholder="发货地址、定制要求等...")
+            b2b_deadline = col_deadline.date_input("约定交货日期", value=datetime.now() + timedelta(days=30))
+            
+            if st.form_submit_button("确认创建 B2B 订单", type="primary"):
+                if b2b_client.strip() == "":
+                    st.warning("⚠️ 请填写客户名称！")
+                else:
+                    # 🚀 判断逻辑：优先使用手动填写的名字
+                    if b2b_custom_prod.strip() != "":
+                        final_name = b2b_custom_prod.strip()
+                        final_color = b2b_custom_color.strip()
                     else:
-                        sel_row = f_opts_b2b[f_opts_b2b['label'] == b2b_prod].iloc[0]
-                        total_val = b2b_qty * b2b_price
-                        balance = total_val - b2b_deposit
-                        
-                        new_b2b = pd.DataFrame([[
-                            b2b_date.strftime("%Y/%m/%d"), b2b_client, sel_row['商品名称'], sel_row['颜色'], 
-                            b2b_qty, b2b_price, total_val, b2b_cogs, b2b_shipping, b2b_tax, b2b_deposit, balance, 
-                            b2b_deadline.strftime("%Y/%m/%d"), b2b_status, b2b_notes
-                        ]], columns=B2B_COLS)
-                        
-                        df_b2b = pd.concat([new_b2b, df_b2b], ignore_index=True)
-                        save_data(df_b2b, B2B_SHEET)
-                        st.success(f"✅ B2B 订单创建成功！客户：{b2b_client}")
-                        st.rerun()
+                        if b2b_prod == "(不选择)":
+                            st.error("⚠️ 请在下拉框选择现有商品，或在右侧手动输入定制商品名称！")
+                            st.stop()
+                        else:
+                            sel_row = f_opts_b2b[f_opts_b2b['label'] == b2b_prod].iloc[0]
+                            final_name = sel_row['商品名称']
+                            final_color = sel_row['颜色']
+
+                    total_val = b2b_qty * b2b_price
+                    balance = total_val - b2b_deposit
+                    
+                    new_b2b = pd.DataFrame([[
+                        b2b_date.strftime("%Y/%m/%d"), b2b_client, final_name, final_color, 
+                        b2b_qty, b2b_price, total_val, b2b_cogs, b2b_shipping, b2b_tax, b2b_deposit, balance, 
+                        b2b_deadline.strftime("%Y/%m/%d"), b2b_status, b2b_notes
+                    ]], columns=B2B_COLS)
+                    
+                    df_b2b = pd.concat([new_b2b, df_b2b], ignore_index=True)
+                    save_data(df_b2b, B2B_SHEET)
+                    st.success(f"✅ B2B 订单创建成功！录入商品：{final_name}")
+                    st.rerun()
 
     st.divider()
     st.markdown("### 📋 B2B 订单明细榜 (可直接涂改成本和状态)")
