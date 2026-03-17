@@ -228,7 +228,9 @@ with t1:
 
 with t2:
     st.subheader("销售记账与流水管理")
-    with st.expander("➕ 新增销售 (支持动态折扣)", expanded=True):
+    
+    # 原有的常规销售
+    with st.expander("➕ 新增常规销售 (支持动态折扣)", expanded=False):
         f_opts = get_f(df_stock, "").copy() 
         if not f_opts.empty:
             f_opts['label'] = f_opts['商品名称'].astype(str) + " (" + f_opts['颜色'].astype(str) + ")" 
@@ -249,7 +251,7 @@ with t2:
             s_p = c3.number_input("4. 最终成交单价 ($)", value=float(auto_calc_price), format="%.2f")
             s_d = c4.date_input("5. 交易日期", value=datetime.now())
             
-            if st.button("✅ 确认记录销售", type="primary", use_container_width=True):
+            if st.button("✅ 确认记录常规销售", type="primary", use_container_width=True):
                 idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
                 new_s = pd.DataFrame([[s_d.strftime("%Y/%m/%d"), df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
                 df_sales = pd.concat([new_s, df_sales], ignore_index=True)
@@ -261,6 +263,66 @@ with t2:
                 save_data(df_sales, SALES_SHEET) 
                 save_data(df_stock, STOCK_SHEET) 
                 st.success(f"🎉 成功记录流水：{selected_row['商品名称']} x{s_q}件，折后单价 ${s_p:.2f}")
+                st.rerun()
+
+    # 🚀 核心升级：全新换货中心
+    with st.expander("🔄 客户换货处理 (Exchange) - 保证财务毛利准确", expanded=True):
+        st.info("💡 系统会自动生成一条负数的退货流水和一条正数的新销售流水，完美自动冲销，不影响报表毛利率！")
+        if not f_opts.empty:
+            xc1, xc2 = st.columns(2)
+            with xc1:
+                st.markdown("### 🔙 客户退回的商品 (入库)")
+                ex_ret_l = st.selectbox("1. 选择退回的商品", f_opts['label'], key="ex_ret_sku")
+                ret_row = f_opts[f_opts['label'] == ex_ret_l].iloc[0]
+                ret_base_p = float(pd.to_numeric(ret_row['售卖价格'], errors='coerce') or 0)
+                ret_p = st.number_input("2. 当时成交单价 (退款额 $)", value=ret_base_p, format="%.2f", help="客人当时买这个杯子花了多少钱？")
+                ret_dmg = st.checkbox("⚠️ 退回商品有瑕疵 (记入坏货库，不回上架)", value=False)
+
+            with xc2:
+                st.markdown("### 🆕 客户换购的商品 (出库)")
+                ex_new_l = st.selectbox("1. 选择拿走的商品", f_opts['label'], key="ex_new_sku")
+                new_row = f_opts[f_opts['label'] == ex_new_l].iloc[0]
+                new_base_p = float(pd.to_numeric(new_row['售卖价格'], errors='coerce') or 0)
+                new_p = st.number_input("2. 今日换购单价 (售价 $)", value=new_base_p, format="%.2f")
+
+            st.markdown("---")
+            diff = new_p - ret_p
+            if diff > 0:
+                st.warning(f"💰 **需补差价：请向客户收取 ${diff:.2f}**")
+            elif diff < 0:
+                st.success(f"💸 **需退差价：请退还客户 ${abs(diff):.2f}**")
+            else:
+                st.info("🤝 **等价交换：无需补退差价**")
+
+            if st.button("🔄 确认执行换货", type="primary", use_container_width=True):
+                ex_date = datetime.now().strftime("%Y/%m/%d")
+                
+                # 生成退货流水 (数量-1, 金额负数)
+                idx_ret = df_stock[(df_stock['商品名称'] == ret_row['商品名称']) & (df_stock['颜色'] == ret_row['颜色'])].index[0]
+                s_ret = pd.DataFrame([[ex_date, df_stock.at[idx_ret,'商品名称'], df_stock.at[idx_ret,'颜色'], -1, ret_p, -1 * ret_p]], columns=SALES_COLS)
+                
+                # 生成新购流水 (数量+1, 金额正数)
+                idx_new = df_stock[(df_stock['商品名称'] == new_row['商品名称']) & (df_stock['颜色'] == new_row['颜色'])].index[0]
+                s_new = pd.DataFrame([[ex_date, df_stock.at[idx_new,'商品名称'], df_stock.at[idx_new,'颜色'], 1, new_p, 1 * new_p]], columns=SALES_COLS)
+                
+                df_sales = pd.concat([s_new, s_ret, df_sales], ignore_index=True)
+                
+                # 更新库存：退回物品处理
+                if ret_dmg:
+                    df_stock.at[idx_ret, '坏货数量'] = int(pd.to_numeric(df_stock.at[idx_ret, '坏货数量'], errors='coerce') or 0) + 1
+                else:
+                    df_stock.at[idx_ret, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_ret, '货柜数量'], errors='coerce') or 0) + 1
+                    df_stock.at[idx_ret, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_ret, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                df_stock.at[idx_ret, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_ret, '已售出数量'], errors='coerce') or 0) - 1
+                
+                # 更新库存：拿走物品处理
+                df_stock.at[idx_new, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_new, '货柜数量'], errors='coerce') or 0) - 1
+                df_stock.at[idx_new, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_new, '已售出数量'], errors='coerce') or 0) + 1
+                df_stock.at[idx_new, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_new, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                
+                save_data(df_sales, SALES_SHEET) 
+                save_data(df_stock, STOCK_SHEET) 
+                st.success(f"🎉 换货成功！已自动入库/出库，并冲销差价流水。")
                 st.rerun()
 
     st.divider()
@@ -621,7 +683,7 @@ with t6:
         c3.metric("⏳ 待结清尾款", f"${tot_b2b_pending:.2f}")
         c4.metric("💎 B2B 预估净利润", f"${tot_b2b_profit:.2f}", delta=f"净利率: {pct_b2b_profit:.1f}%", delta_color="off")
 
-    with st.expander("➕ 录入全新 B2B 订单", expanded=True):
+    with st.expander("➕ 录入全新 B2B 订单", expanded=False):
         col1, col2 = st.columns(2)
         b2b_client = col1.text_input("🏢 客户/企业名称 (必填)", placeholder="例如：NGS")
         b2b_date = col2.date_input("📅 建单日期", value=datetime.now())
@@ -749,7 +811,6 @@ with t6:
         v_b2b = f_b2b.copy()
         v_b2b.insert(0, "选择", False)
         
-        # 🚀 核心升级：把只读锁全部砸碎！只锁住那几个系统算出来的结果列。
         disabled_cols = ['待收尾款', 'B2B净利润', '预估净利率']
         
         styled_b2b = v_b2b.style.format({
@@ -769,21 +830,18 @@ with t6:
             key=f"b2b_editor_{st.session_state.b2b_reset_key}"
         )
         
-        # 🚀 既然解禁了所有列，保存逻辑也要全部重写，支持全量保存
         if not edited_b2b.drop(columns=['选择']).equals(v_b2b.drop(columns=['选择'])):
             for idx, row in edited_b2b.iterrows():
                 if not row.drop('选择').equals(v_b2b.loc[idx].drop('选择')):
-                    # 将所有基础列的修改同步到 df_b2b
                     for col in B2B_COLS:
                         if col in row:
                             df_b2b.at[idx, col] = row[col]
                     
-                    # 重新核算尾款 (以防你修改了总价或定金)
                     total_receivable = float(row['总计应收'] or 0)
                     deposit = float(row['已收定金'] or 0)
                     df_b2b.at[idx, '待收尾款'] = total_receivable - deposit
                     
-            save_data(df_b2b[B2B_COLS], B2B_SHEET) # 确保存进谷歌的只有基础列
+            save_data(df_b2b[B2B_COLS], B2B_SHEET) 
             st.success("✅ B2B 订单修改已全量精准保存！")
             st.session_state.b2b_reset_key += 1
             st.rerun()
