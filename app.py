@@ -229,7 +229,6 @@ with t1:
 with t2:
     st.subheader("销售记账与流水管理")
     
-    # 原有的常规销售
     with st.expander("➕ 新增常规销售 (支持动态折扣)", expanded=False):
         f_opts = get_f(df_stock, "").copy() 
         if not f_opts.empty:
@@ -265,7 +264,6 @@ with t2:
                 st.success(f"🎉 成功记录流水：{selected_row['商品名称']} x{s_q}件，折后单价 ${s_p:.2f}")
                 st.rerun()
 
-    # 🚀 核心升级：全新换货中心
     with st.expander("🔄 客户换货处理 (Exchange) - 保证财务毛利准确", expanded=True):
         st.info("💡 系统会自动生成一条负数的退货流水和一条正数的新销售流水，完美自动冲销，不影响报表毛利率！")
         if not f_opts.empty:
@@ -286,28 +284,33 @@ with t2:
                 new_p = st.number_input("2. 今日换购单价 (售价 $)", value=new_base_p, format="%.2f")
 
             st.markdown("---")
-            diff = new_p - ret_p
-            if diff > 0:
-                st.warning(f"💰 **需补差价：请向客户收取 ${diff:.2f}**")
-            elif diff < 0:
-                st.success(f"💸 **需退差价：请退还客户 ${abs(diff):.2f}**")
-            else:
-                st.info("🤝 **等价交换：无需补退差价**")
+            
+            # 🚀 核心升级：加入了换货日期选择器
+            c_date, c_diff = st.columns(2)
+            with c_date:
+                ex_date_input = st.date_input("📅 换货交易日期", value=datetime.now(), key="ex_date_input")
+            
+            with c_diff:
+                diff = new_p - ret_p
+                if diff > 0:
+                    st.warning(f"💰 **需补差价：请向客户收取 ${diff:.2f}**")
+                elif diff < 0:
+                    st.success(f"💸 **需退差价：请退还客户 ${abs(diff):.2f}**")
+                else:
+                    st.info("🤝 **等价交换：无需补退差价**")
 
             if st.button("🔄 确认执行换货", type="primary", use_container_width=True):
-                ex_date = datetime.now().strftime("%Y/%m/%d")
+                # 获取用户选择的日期
+                ex_date = ex_date_input.strftime("%Y/%m/%d")
                 
-                # 生成退货流水 (数量-1, 金额负数)
                 idx_ret = df_stock[(df_stock['商品名称'] == ret_row['商品名称']) & (df_stock['颜色'] == ret_row['颜色'])].index[0]
                 s_ret = pd.DataFrame([[ex_date, df_stock.at[idx_ret,'商品名称'], df_stock.at[idx_ret,'颜色'], -1, ret_p, -1 * ret_p]], columns=SALES_COLS)
                 
-                # 生成新购流水 (数量+1, 金额正数)
                 idx_new = df_stock[(df_stock['商品名称'] == new_row['商品名称']) & (df_stock['颜色'] == new_row['颜色'])].index[0]
                 s_new = pd.DataFrame([[ex_date, df_stock.at[idx_new,'商品名称'], df_stock.at[idx_new,'颜色'], 1, new_p, 1 * new_p]], columns=SALES_COLS)
                 
                 df_sales = pd.concat([s_new, s_ret, df_sales], ignore_index=True)
                 
-                # 更新库存：退回物品处理
                 if ret_dmg:
                     df_stock.at[idx_ret, '坏货数量'] = int(pd.to_numeric(df_stock.at[idx_ret, '坏货数量'], errors='coerce') or 0) + 1
                 else:
@@ -315,14 +318,13 @@ with t2:
                     df_stock.at[idx_ret, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_ret, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                 df_stock.at[idx_ret, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_ret, '已售出数量'], errors='coerce') or 0) - 1
                 
-                # 更新库存：拿走物品处理
                 df_stock.at[idx_new, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_new, '货柜数量'], errors='coerce') or 0) - 1
                 df_stock.at[idx_new, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_new, '已售出数量'], errors='coerce') or 0) + 1
                 df_stock.at[idx_new, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_new, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                 
                 save_data(df_sales, SALES_SHEET) 
                 save_data(df_stock, STOCK_SHEET) 
-                st.success(f"🎉 换货成功！已自动入库/出库，并冲销差价流水。")
+                st.success(f"🎉 换货成功！已按日期 {ex_date} 自动入库/出库，并冲销流水。")
                 st.rerun()
 
     st.divider()
