@@ -264,7 +264,7 @@ with t2:
                 st.success(f"🎉 成功记录流水：{selected_row['商品名称']} x{s_q}件，折后单价 ${s_p:.2f}")
                 st.rerun()
 
-    with st.expander("🔄 客户换货处理 (Exchange) - 保证财务毛利准确", expanded=True):
+    with st.expander("🔄 客户换货处理 (Exchange) - 保证财务毛利准确", expanded=False):
         st.info("💡 系统会自动生成一条负数的退货流水和一条正数的新销售流水，完美自动冲销，不影响报表毛利率！")
         if not f_opts.empty:
             xc1, xc2 = st.columns(2)
@@ -285,7 +285,6 @@ with t2:
 
             st.markdown("---")
             
-            # 🚀 核心升级：加入了换货日期选择器
             c_date, c_diff = st.columns(2)
             with c_date:
                 ex_date_input = st.date_input("📅 换货交易日期", value=datetime.now(), key="ex_date_input")
@@ -300,7 +299,6 @@ with t2:
                     st.info("🤝 **等价交换：无需补退差价**")
 
             if st.button("🔄 确认执行换货", type="primary", use_container_width=True):
-                # 获取用户选择的日期
                 ex_date = ex_date_input.strftime("%Y/%m/%d")
                 
                 idx_ret = df_stock[(df_stock['商品名称'] == ret_row['商品名称']) & (df_stock['颜色'] == ret_row['颜色'])].index[0]
@@ -355,6 +353,72 @@ with t2:
                     st.session_state.sales_reset_key += 1
                     st.rerun()
             with sc2: st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
+            
+            # 🚀 核心升级：无缝编辑单条流水（含智能库存对冲）
+            if len(sel) == 1:
+                st.write("### ⚙️ 编辑选中流水记录 (修改将自动同步修正库存)")
+                orig_idx = sel.index[0] # 精准抓取原始数据里的位置
+                
+                old_name = str(df_sales.at[orig_idx, '商品名称'])
+                old_color = str(df_sales.at[orig_idx, '颜色'])
+                curr_label = f"{old_name} ({old_color})"
+                
+                prod_list = []
+                if not df_stock.empty:
+                    prod_list = (df_stock['商品名称'].astype(str) + " (" + df_stock['颜色'].astype(str) + ")").tolist()
+                # 如果这个商品在库存里被删了，保证它依然显示在下拉框里防止报错
+                if curr_label not in prod_list:
+                    prod_list.insert(0, curr_label)
+                    
+                with st.form("edit_sale_form"):
+                    e_c1, e_c2, e_c3, e_c4 = st.columns(4)
+                    
+                    try:
+                        parsed_date = pd.to_datetime(df_sales.at[orig_idx, '日期']).date()
+                    except:
+                        parsed_date = datetime.now().date()
+                        
+                    e_date = e_c1.date_input("交易日期", value=parsed_date)
+                    e_prod = e_c2.selectbox("修改款式/颜色", prod_list, index=prod_list.index(curr_label))
+                    e_qty = e_c3.number_input("销售数量", value=int(df_sales.at[orig_idx, '销售数量']), min_value=1, step=1)
+                    e_price = e_c4.number_input("成交单价 ($)", value=float(df_sales.at[orig_idx, '成交单价']), format="%.2f")
+                    
+                    if st.form_submit_button("💾 保存流水修改", type="primary", use_container_width=True):
+                        old_qty = int(df_sales.at[orig_idx, '销售数量'])
+                        
+                        # 1. 自动对账第一步：把原本扣掉的老库存，重新加回去
+                        old_m = df_stock[(df_stock['商品名称'] == old_name) & (df_stock['颜色'] == old_color)].index
+                        if not old_m.empty:
+                            o_idx = old_m[0]
+                            df_stock.at[o_idx, '货柜数量'] = int(pd.to_numeric(df_stock.at[o_idx, '货柜数量'], errors='coerce') or 0) + old_qty
+                            df_stock.at[o_idx, '已售出数量'] = int(pd.to_numeric(df_stock.at[o_idx, '已售出数量'], errors='coerce') or 0) - old_qty
+                            df_stock.at[o_idx, '总库存'] = sum([int(pd.to_numeric(df_stock.at[o_idx, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                        
+                        # 2. 自动对账第二步：去扣除修改后的新库存
+                        new_name = e_prod.rsplit(" (", 1)[0]
+                        new_color = e_prod.rsplit(" (", 1)[1].replace(")", "")
+                        new_qty = e_qty
+                        
+                        new_m = df_stock[(df_stock['商品名称'] == new_name) & (df_stock['颜色'] == new_color)].index
+                        if not new_m.empty:
+                            n_idx = new_m[0]
+                            df_stock.at[n_idx, '货柜数量'] = int(pd.to_numeric(df_stock.at[n_idx, '货柜数量'], errors='coerce') or 0) - new_qty
+                            df_stock.at[n_idx, '已售出数量'] = int(pd.to_numeric(df_stock.at[n_idx, '已售出数量'], errors='coerce') or 0) + new_qty
+                            df_stock.at[n_idx, '总库存'] = sum([int(pd.to_numeric(df_stock.at[n_idx, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                        
+                        # 3. 把这条流水本尊在云端给改了
+                        df_sales.at[orig_idx, '日期'] = e_date.strftime("%Y/%m/%d")
+                        df_sales.at[orig_idx, '商品名称'] = new_name
+                        df_sales.at[orig_idx, '颜色'] = new_color
+                        df_sales.at[orig_idx, '销售数量'] = new_qty
+                        df_sales.at[orig_idx, '成交单价'] = e_price
+                        df_sales.at[orig_idx, '总营业额'] = new_qty * e_price
+                        
+                        save_data(df_stock, STOCK_SHEET)
+                        save_data(df_sales, SALES_SHEET)
+                        st.session_state.sales_reset_key += 1
+                        st.rerun()
+
     else:
         st.info("💡 暂无流水记录或没有找到符合条件的流水。")
 
@@ -685,6 +749,7 @@ with t6:
         c3.metric("⏳ 待结清尾款", f"${tot_b2b_pending:.2f}")
         c4.metric("💎 B2B 预估净利润", f"${tot_b2b_profit:.2f}", delta=f"净利率: {pct_b2b_profit:.1f}%", delta_color="off")
 
+    # 🚀 核心修复：移除了 st.form，使用普通容器，释放 DataFrame Editor 魔力
     with st.expander("➕ 录入全新 B2B 订单", expanded=False):
         col1, col2 = st.columns(2)
         b2b_client = col1.text_input("🏢 客户/企业名称 (必填)", placeholder="例如：NGS")
