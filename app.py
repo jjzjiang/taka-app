@@ -1029,7 +1029,12 @@ with t7:
 
 with t8:
     st.subheader("📈 选品与战略决策盘 (SKU 矩阵分析)")
-    st.info("💡 系统基于时间加权动销率和库存深度，自动为你诊断商品健康度，拒绝纸面富贵，定位真实爆款。")
+    st.info("💡 系统基于全局时间加权动销率和库存深度，自动为你诊断商品健康度，拒绝纸面富贵，定位真实爆款。")
+    
+    # 🚀 核心升级：全局时间基准线选择器
+    c_launch, _ = st.columns([1, 3])
+    # 默认日期直接设为你高岛屋快闪店开业的 3月4日
+    launch_date = c_launch.date_input("🏬 快闪店/专柜开业日期 (基准起算日)", value=datetime(2026, 3, 4).date())
 
     if not df_sales.empty and not df_stock.empty:
         df_s_bi = df_sales.copy()
@@ -1037,10 +1042,10 @@ with t8:
         df_s_bi['销售数量'] = pd.to_numeric(df_s_bi['销售数量'], errors='coerce').fillna(0)
         df_s_bi['总营业额'] = pd.to_numeric(df_s_bi['总营业额'], errors='coerce').fillna(0.0)
 
+        # 不再依赖第一次卖出的日期，只取总销量和总营业额
         bi_sales = df_s_bi.groupby(['商品名称', '颜色']).agg({
             '销售数量': 'sum',
-            '总营业额': 'sum',
-            '日期_dt': 'min'
+            '总营业额': 'sum'
         }).reset_index()
 
         df_stk_bi = df_stock[['商品名称', '颜色', '进价成本', '总库存']].copy()
@@ -1051,10 +1056,13 @@ with t8:
         bi_df['销售数量'] = bi_df['销售数量'].fillna(0)
         bi_df['总营业额'] = bi_df['总营业额'].fillna(0.0)
 
-        today = pd.Timestamp(datetime.now().date())
-        bi_df['在店天数'] = (today - bi_df['日期_dt']).dt.days.fillna(1)
-        bi_df['在店天数'] = bi_df['在店天数'].apply(lambda x: x if x > 0 else 1) 
-        
+        # 🚀 全局在店天数计算
+        today = datetime.now().date()
+        delta_days = (today - launch_date).days
+        if delta_days <= 0:
+            delta_days = 1 # 防止除以0报错
+            
+        bi_df['在店天数'] = delta_days
         bi_df['日均动销率'] = bi_df['销售数量'] / bi_df['在店天数']
         
         bi_df['总进价成本'] = bi_df['销售数量'] * bi_df['进价成本']
@@ -1090,7 +1098,6 @@ with t8:
 
         bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
         
-        # 🚀 核心修复：强制转为字符串，防止空值或纯数字引发 TypeError
         bi_df['商品规格'] = bi_df['商品名称'].astype(str) + " (" + bi_df['颜色'].astype(str) + ")"
         
         st.markdown("### 🎯 动销率 vs 盈利能力 雷达图")
