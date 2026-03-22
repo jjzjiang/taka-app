@@ -354,10 +354,9 @@ with t2:
                     st.rerun()
             with sc2: st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
             
-            # 🚀 核心升级：无缝编辑单条流水（含智能库存对冲）
             if len(sel) == 1:
                 st.write("### ⚙️ 编辑选中流水记录 (修改将自动同步修正库存)")
-                orig_idx = sel.index[0] # 精准抓取原始数据里的位置
+                orig_idx = sel.index[0] 
                 
                 old_name = str(df_sales.at[orig_idx, '商品名称'])
                 old_color = str(df_sales.at[orig_idx, '颜色'])
@@ -366,7 +365,6 @@ with t2:
                 prod_list = []
                 if not df_stock.empty:
                     prod_list = (df_stock['商品名称'].astype(str) + " (" + df_stock['颜色'].astype(str) + ")").tolist()
-                # 如果这个商品在库存里被删了，保证它依然显示在下拉框里防止报错
                 if curr_label not in prod_list:
                     prod_list.insert(0, curr_label)
                     
@@ -380,13 +378,12 @@ with t2:
                         
                     e_date = e_c1.date_input("交易日期", value=parsed_date)
                     e_prod = e_c2.selectbox("修改款式/颜色", prod_list, index=prod_list.index(curr_label))
-                    e_qty = e_c3.number_input("销售数量", value=int(df_sales.at[orig_idx, '销售数量']), min_value=1, step=1)
+                    e_qty = e_c3.number_input("销售数量", value=int(df_sales.at[orig_idx, '销售数量']))
                     e_price = e_c4.number_input("成交单价 ($)", value=float(df_sales.at[orig_idx, '成交单价']), format="%.2f")
                     
                     if st.form_submit_button("💾 保存流水修改", type="primary", use_container_width=True):
                         old_qty = int(df_sales.at[orig_idx, '销售数量'])
                         
-                        # 1. 自动对账第一步：把原本扣掉的老库存，重新加回去
                         old_m = df_stock[(df_stock['商品名称'] == old_name) & (df_stock['颜色'] == old_color)].index
                         if not old_m.empty:
                             o_idx = old_m[0]
@@ -394,7 +391,6 @@ with t2:
                             df_stock.at[o_idx, '已售出数量'] = int(pd.to_numeric(df_stock.at[o_idx, '已售出数量'], errors='coerce') or 0) - old_qty
                             df_stock.at[o_idx, '总库存'] = sum([int(pd.to_numeric(df_stock.at[o_idx, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                         
-                        # 2. 自动对账第二步：去扣除修改后的新库存
                         new_name = e_prod.rsplit(" (", 1)[0]
                         new_color = e_prod.rsplit(" (", 1)[1].replace(")", "")
                         new_qty = e_qty
@@ -406,7 +402,6 @@ with t2:
                             df_stock.at[n_idx, '已售出数量'] = int(pd.to_numeric(df_stock.at[n_idx, '已售出数量'], errors='coerce') or 0) + new_qty
                             df_stock.at[n_idx, '总库存'] = sum([int(pd.to_numeric(df_stock.at[n_idx, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                         
-                        # 3. 把这条流水本尊在云端给改了
                         df_sales.at[orig_idx, '日期'] = e_date.strftime("%Y/%m/%d")
                         df_sales.at[orig_idx, '商品名称'] = new_name
                         df_sales.at[orig_idx, '颜色'] = new_color
@@ -453,12 +448,21 @@ with t3:
                 filtered_summ = get_f(summ, q) 
                 
                 if not filtered_summ.empty:
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("总营业额", f"${filtered_summ['总营业额'].sum():.2f}")
+                    # 🚀 核心升级：计算日均销售额
+                    delta_days = (end - start).days + 1
+                    
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    tot_rev = filtered_summ['总营业额'].sum()
+                    
+                    c1.metric("总营业额", f"${tot_rev:.2f}")
                     c2.metric("具体毛利", f"${filtered_summ['具体毛利'].sum():.2f}")
                     c3.metric("总售出件数", f"{int(filtered_summ['销售数量'].sum())} 件")
-                    avg_m = filtered_summ['具体毛利'].sum() / filtered_summ['总营业额'].sum() * 100 if filtered_summ['总营业额'].sum() > 0 else 0
+                    
+                    avg_m = filtered_summ['具体毛利'].sum() / tot_rev * 100 if tot_rev > 0 else 0
                     c4.metric("平均毛利率", f"{avg_m:.1f}%")
+                    
+                    avg_daily = tot_rev / delta_days if delta_days > 0 else 0
+                    c5.metric("日均销售额", f"${avg_daily:.2f}")
                     
                     st.divider()
                     st.markdown("### 📈 营收与毛利走势")
@@ -749,7 +753,6 @@ with t6:
         c3.metric("⏳ 待结清尾款", f"${tot_b2b_pending:.2f}")
         c4.metric("💎 B2B 预估净利润", f"${tot_b2b_profit:.2f}", delta=f"净利率: {pct_b2b_profit:.1f}%", delta_color="off")
 
-    # 🚀 核心修复：移除了 st.form，使用普通容器，释放 DataFrame Editor 魔力
     with st.expander("➕ 录入全新 B2B 订单", expanded=False):
         col1, col2 = st.columns(2)
         b2b_client = col1.text_input("🏢 客户/企业名称 (必填)", placeholder="例如：NGS")
