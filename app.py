@@ -22,7 +22,7 @@ EMP_SHEET = "Employee"
 ATT_SHEET = "Attendance"
 B2B_SHEET = "B2B_Orders" 
 FEEDBACK_SHEET = "Feedback"
-RESTOCK_SHEET = "Restock_Log" # 🚀 新增：正规出入库流水账
+RESTOCK_SHEET = "Restock_Log"
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
@@ -30,7 +30,7 @@ EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
-RESTOCK_COLS = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '单件成本', '备注'] # 🚀 新增表头
+RESTOCK_COLS = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '单件成本', '备注']
 
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {
@@ -87,7 +87,7 @@ df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期')
 df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期') 
 df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
 df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
-df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期') # 🚀 载入入库日志
+df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期')
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -120,7 +120,6 @@ with st.sidebar:
                     new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
                     df_stock = pd.concat([df_stock, new_r], ignore_index=True)
                     
-                    # 🚀 同步记录建档时的初始库存流水
                     if total > 0 or n_dmg > 0:
                         log_date = datetime.now().strftime("%Y/%m/%d")
                         init_log = pd.DataFrame([[log_date, "初始建档", n_name, n_color, total+n_dmg, "多库位", n_cost, "侧边栏初始建档"]], columns=RESTOCK_COLS)
@@ -151,7 +150,6 @@ st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
 t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈", "🧠 战略(BI)"])
 
 with t1:
-    # 🚀 核心升级：正规军操作台
     st.subheader("📦 专业 ERP 库存与货位管家")
     st.info("💡 双边账引擎已启动：禁止在此直接篡改库存数，系统将严格依据下方的【入库】、【调拨】、【盘点】通道进行自动化记账。")
     
@@ -292,30 +290,45 @@ with t1:
 
         styled_df = display_df.style.format({'进价成本': '${:.2f}', '售卖价格': '${:.2f}'}).apply(highlight_low_stock, axis=1)
         
-        # 🚀 强制锁定所有库存列！ERP铁律：只能读，不能直接改！
         disabled_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '单品毛利率']
+        editor_key = f"stock_editor_{st.session_state.stock_reset_key}"
         
         edited_stock = st.data_editor(
             styled_df,
             column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
             disabled=disabled_cols,
             use_container_width=True, hide_index=True, 
-            key=f"stock_editor_{st.session_state.stock_reset_key}" 
+            key=editor_key 
         )
         
-        # 保存基础信息的修改（价格、名字）
-        if not edited_stock.drop(columns=['选择']).equals(display_df.drop(columns=['选择'])):
+        # 🚀 终极防死循环：狙击手级监听，只有你真实编辑了单元格才触发保存！
+        editor_state = st.session_state.get(editor_key, {})
+        if editor_state.get("edited_rows"):
+            has_real_edits = False
             for idx, row in edited_stock.iterrows():
-                if not row.drop('选择').equals(display_df.loc[idx].drop('选择')):
-                    orig_idx = df_stock[(df_stock['商品名称'] == display_df.loc[idx, '商品名称']) & (df_stock['颜色'] == display_df.loc[idx, '颜色'])].index[0]
-                    df_stock.at[orig_idx, '商品名称'] = row['商品名称']
-                    df_stock.at[orig_idx, '颜色'] = row['颜色']
-                    df_stock.at[orig_idx, '进价成本'] = row['进价成本']
-                    df_stock.at[orig_idx, '售卖价格'] = row['售卖价格']
-            save_data(df_stock, STOCK_SHEET) 
-            st.success("✅ 商品基础信息修改已保存！(注：库存变动请走上方专用通道)")
-            st.session_state.stock_reset_key += 1
-            st.rerun()
+                old_name = str(display_df.loc[idx, '商品名称'])
+                old_color = str(display_df.loc[idx, '颜色'])
+                old_cost = float(display_df.loc[idx, '进价成本'])
+                old_price = float(display_df.loc[idx, '售卖价格'])
+                
+                new_name = str(row['商品名称'])
+                new_color = str(row['颜色'])
+                new_cost = float(row['进价成本'])
+                new_price = float(row['售卖价格'])
+                
+                if (old_name != new_name) or (old_color != new_color) or (old_cost != new_cost) or (old_price != new_price):
+                    has_real_edits = True
+                    orig_idx = df_stock[(df_stock['商品名称'] == old_name) & (df_stock['颜色'] == old_color)].index[0]
+                    df_stock.at[orig_idx, '商品名称'] = new_name
+                    df_stock.at[orig_idx, '颜色'] = new_color
+                    df_stock.at[orig_idx, '进价成本'] = new_cost
+                    df_stock.at[orig_idx, '售卖价格'] = new_price
+
+            if has_real_edits:
+                save_data(df_stock, STOCK_SHEET) 
+                st.success("✅ 商品基础信息修改已保存！(注：库存变动请走上方专用通道)")
+                st.session_state.stock_reset_key += 1
+                st.rerun()
         
         selected_stock = edited_stock[edited_stock["选择"] == True]
         if not selected_stock.empty:
@@ -998,6 +1011,7 @@ with t6:
             '已收定金': '${:.2f}', '待收尾款': '${:.2f}', 'B2B净利润': '${:.2f}'
         })
         
+        editor_key = f"b2b_editor_{st.session_state.b2b_reset_key}"
         edited_b2b = st.data_editor(
             styled_b2b, 
             column_config={
@@ -1006,12 +1020,23 @@ with t6:
             }, 
             disabled=disabled_cols, 
             use_container_width=True, hide_index=True, 
-            key=f"b2b_editor_{st.session_state.b2b_reset_key}"
+            key=editor_key
         )
         
-        if not edited_b2b.drop(columns=['选择']).equals(v_b2b.drop(columns=['选择'])):
+        # 🚀 终极防死循环：只监听真实的编辑动作
+        editor_state = st.session_state.get(editor_key, {})
+        if editor_state.get("edited_rows"):
+            has_real_edits = False
             for idx, row in edited_b2b.iterrows():
-                if not row.drop('选择').equals(v_b2b.loc[idx].drop('选择')):
+                editable_cols = ['货物成本', '物流成本', '关税', '已收定金', '订单状态', '约定交期', '备注']
+                is_changed = False
+                for c in editable_cols:
+                    if str(row[c]) != str(v_b2b.loc[idx, c]):
+                        is_changed = True
+                        break
+                
+                if is_changed:
+                    has_real_edits = True
                     for col in B2B_COLS:
                         if col in row:
                             df_b2b.at[idx, col] = row[col]
@@ -1020,10 +1045,11 @@ with t6:
                     deposit = float(row['已收定金'] or 0)
                     df_b2b.at[idx, '待收尾款'] = total_receivable - deposit
                     
-            save_data(df_b2b[B2B_COLS], B2B_SHEET) 
-            st.success("✅ B2B 订单修改已全量精准保存！")
-            st.session_state.b2b_reset_key += 1
-            st.rerun()
+            if has_real_edits:
+                save_data(df_b2b[B2B_COLS], B2B_SHEET) 
+                st.success("✅ B2B 订单修改已全量精准保存！")
+                st.session_state.b2b_reset_key += 1
+                st.rerun()
 
         selected_b2b = edited_b2b[edited_b2b["选择"] == True]
         if not selected_b2b.empty:
@@ -1100,6 +1126,7 @@ with t7:
         v_fb = f_fb.copy()
         v_fb.insert(0, "选择", False)
 
+        editor_key = f"fb_editor_{st.session_state.fb_reset_key}"
         edited_fb = st.data_editor(
             v_fb,
             column_config={
@@ -1110,18 +1137,28 @@ with t7:
             },
             disabled=[], 
             use_container_width=True, hide_index=True,
-            key=f"fb_editor_{st.session_state.fb_reset_key}"
+            key=editor_key
         )
 
-        if not edited_fb.drop(columns=['选择']).equals(v_fb.drop(columns=['选择'])):
+        # 🚀 终极防死循环：只监听真实的编辑动作
+        editor_state = st.session_state.get(editor_key, {})
+        if editor_state.get("edited_rows"):
+            has_real_edits = False
             for idx, row in edited_fb.iterrows():
-                if not row.drop('选择').equals(v_fb.loc[idx].drop('选择')):
+                is_changed = False
+                for c in FEEDBACK_COLS:
+                    if str(row[c]) != str(v_fb.loc[idx, c]):
+                        is_changed = True
+                        break
+                if is_changed:
+                    has_real_edits = True
                     for col in FEEDBACK_COLS:
                         df_feedback.at[idx, col] = row[col]
-            save_data(df_feedback, FEEDBACK_SHEET)
-            st.success("✅ 客户反馈修改已全量精准保存！")
-            st.session_state.fb_reset_key += 1
-            st.rerun()
+            if has_real_edits:
+                save_data(df_feedback, FEEDBACK_SHEET)
+                st.success("✅ 客户反馈修改已全量精准保存！")
+                st.session_state.fb_reset_key += 1
+                st.rerun()
 
         selected_fb = edited_fb[edited_fb["选择"] == True]
         if not selected_fb.empty:
@@ -1163,7 +1200,6 @@ with t8:
         bi_df['销售数量'] = bi_df['销售数量'].fillna(0)
         bi_df['总营业额'] = bi_df['总营业额'].fillna(0.0)
 
-        # 🚀 核心黑科技：去入库日志里抓取真正的首批到货时间！
         if not df_restock.empty:
             first_restock = df_restock[df_restock['操作类型'].isin(['入库', '初始建档'])].groupby(['商品名称', '颜色'])['记录日期'].min().reset_index()
             first_restock.rename(columns={'记录日期': '首批入库日期'}, inplace=True)
@@ -1174,11 +1210,10 @@ with t8:
 
         today = datetime.now().date()
         
-        # 智能计算在店天数：优先用真实入库时间，没有则用开业时间兜底
         def get_days(row):
             start_date = row['首批入库日期'] if pd.notnull(row['首批入库日期']) else launch_date
             days = (today - start_date).days
-            return max(days, 1) # 至少算1天，防止除以0报错
+            return max(days, 1) 
             
         bi_df['在店天数'] = bi_df.apply(get_days, axis=1)
         bi_df['日均动销率'] = bi_df['销售数量'] / bi_df['在店天数']
