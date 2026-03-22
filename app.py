@@ -137,7 +137,6 @@ def get_f(df, q):
 
 # --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
-# 🚀 增加全新模块：Tab 8 (战略 BI 看板)
 t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈", "🧠 战略(BI)"])
 
 with t1:
@@ -1028,69 +1027,103 @@ with t7:
     else:
         st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
+# 🚀 核心升级：全新战略罗盘
 with t8:
     st.subheader("📈 选品与战略决策盘 (SKU 矩阵分析)")
-    st.info("💡 基于【波士顿矩阵】模型，自动交叉分析销量与毛利，帮你找出店铺的摇钱树和吸血鬼。")
+    st.info("💡 系统基于时间加权动销率和库存深度，自动为你诊断商品健康度，拒绝纸面富贵，定位真实爆款。")
 
     if not df_sales.empty and not df_stock.empty:
-        # 提取并清理需要的数据
-        f_sales_bi = df_sales.copy()
-        f_sales_bi['销售数量'] = pd.to_numeric(f_sales_bi['销售数量'], errors='coerce').fillna(0)
-        f_sales_bi['总营业额'] = pd.to_numeric(f_sales_bi['总营业额'], errors='coerce').fillna(0.0)
+        df_s_bi = df_sales.copy()
+        df_s_bi['日期_dt'] = pd.to_datetime(df_s_bi['日期'], errors='coerce')
+        df_s_bi['销售数量'] = pd.to_numeric(df_s_bi['销售数量'], errors='coerce').fillna(0)
+        df_s_bi['总营业额'] = pd.to_numeric(df_s_bi['总营业额'], errors='coerce').fillna(0.0)
+
+        # 找出每个 SKU 第一次卖出去的日子，作为“在店生命周期”的起点
+        bi_sales = df_s_bi.groupby(['商品名称', '颜色']).agg({
+            '销售数量': 'sum',
+            '总营业额': 'sum',
+            '日期_dt': 'min'
+        }).reset_index()
+
+        df_stk_bi = df_stock[['商品名称', '颜色', '进价成本', '总库存']].copy()
+        df_stk_bi['进价成本'] = pd.to_numeric(df_stk_bi['进价成本'], errors='coerce').fillna(0.0)
+        df_stk_bi['总库存'] = pd.to_numeric(df_stk_bi['总库存'], errors='coerce').fillna(0)
+
+        bi_df = pd.merge(df_stk_bi, bi_sales, on=['商品名称', '颜色'], how='left')
+        bi_df['销售数量'] = bi_df['销售数量'].fillna(0)
+        bi_df['总营业额'] = bi_df['总营业额'].fillna(0.0)
+
+        # 核心引擎 1：计算时间加权的日均动销率
+        today = pd.Timestamp(datetime.now().date())
+        # 如果没卖过，默认在店天数为 1 天避免报错
+        bi_df['在店天数'] = (today - bi_df['日期_dt']).dt.days.fillna(1)
+        bi_df['在店天数'] = bi_df['在店天数'].apply(lambda x: x if x > 0 else 1) 
         
-        # 聚合每个 SKU 的总销量和总营业额
-        bi_df = f_sales_bi.groupby(['商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
+        bi_df['日均动销率'] = bi_df['销售数量'] / bi_df['在店天数']
         
-        # 关联进价成本来计算利润
-        df_stock_bi = df_stock[['商品名称', '颜色', '进价成本']].copy()
-        df_stock_bi['进价成本'] = pd.to_numeric(df_stock_bi['进价成本'], errors='coerce').fillna(0.0)
-        
-        bi_df = pd.merge(bi_df, df_stock_bi, on=['商品名称', '颜色'], how='left')
+        # 核心盈利能力核算
         bi_df['总进价成本'] = bi_df['销售数量'] * bi_df['进价成本']
         bi_df['具体毛利'] = bi_df['总营业额'] - bi_df['总进价成本']
+        bi_df['毛利率(%)'] = (bi_df['具体毛利'] / bi_df['总营业额'] * 100).fillna(0.0)
         
-        # 计算单品毛利率 (用百分比表示，保留一位小数方便显示)
-        bi_df['毛利率(%)'] = (bi_df['具体毛利'] / bi_df['总营业额'] * 100).fillna(0.0).round(1)
-        
-        # 计算中位数作为十字准星的分割线
-        median_qty = bi_df['销售数量'].median()
-        median_margin = bi_df['毛利率(%)'].median()
-        
-        # 象限诊断逻辑
-        def get_quadrant(row):
-            qty = row['销售数量']
-            margin = row['毛利率(%)']
-            if qty >= median_qty and margin >= median_margin:
-                return "⭐ 明星爆款"
-            elif qty >= median_qty and margin < median_margin:
-                return "🧲 引流走量款"
-            elif qty < median_qty and margin >= median_margin:
-                return "💎 利润潜力股"
+        # 售罄指标
+        bi_df['售罄率(%)'] = (bi_df['销售数量'] / (bi_df['销售数量'] + bi_df['总库存']) * 100).fillna(0.0)
+
+        # 核心引擎 2：计算还能卖多少天 (存销比)
+        def calc_cover(row):
+            if row['日均动销率'] > 0:
+                return int(row['总库存'] / row['日均动销率'])
+            return 999 # 动销率为0时，代表死水一潭，标为 999 天
+        bi_df['可售天数'] = bi_df.apply(calc_cover, axis=1)
+
+        # 划定及格线：算平均水平(中位数)
+        active_skus = bi_df[bi_df['销售数量'] > 0]
+        if not active_skus.empty:
+            med_vel = active_skus['日均动销率'].median()
+            med_mar = active_skus['毛利率(%)'].median()
+        else:
+            med_vel, med_mar = 0.1, 0.1
+
+        # 🧠 终极 5 大智能标签算法植入
+        def get_tag(row):
+            # 1. 刚上架秒空：总库存极低，且售罄率极高
+            if row['总库存'] <= 2 and row['售罄率(%)'] >= 80 and row['销售数量'] > 0:
+                return "🔥 秒空断货王 (低估需求)"
+            # 2. 双高：真正的摇钱树
+            elif row['日均动销率'] >= med_vel and row['毛利率(%)'] >= med_mar:
+                return "⭐ 绝对明星 (死保库存)"
+            # 3. 流水大但不赚钱
+            elif row['日均动销率'] >= med_vel and row['毛利率(%)'] < med_mar:
+                return "🧲 赚吆喝引流款 (建议搭配)"
+            # 4. 纸面富贵陷阱：看似高利润但几个月卖不掉一个
+            elif row['日均动销率'] < med_vel and row['毛利率(%)'] >= med_mar:
+                return "🐢 伪需求高利款 (占压资金)"
+            # 5. 双低：彻底没救
             else:
-                return "☠️ 滞销死库存"
-                
-        bi_df['象限诊断'] = bi_df.apply(get_quadrant, axis=1)
+                return "☠️ 清仓废柴 (果断斩仓)"
+
+        bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
         bi_df['商品规格'] = bi_df['商品名称'] + " (" + bi_df['颜色'] + ")"
         
-        # 绘制散点图
-        st.markdown("### 🎯 SKU 表现雷达图")
+        # 可视化罗盘
+        st.markdown("### 🎯 动销率 vs 盈利能力 雷达图")
         st.scatter_chart(
             bi_df,
-            x='销售数量',
+            x='日均动销率',
             y='毛利率(%)',
-            color='象限诊断',
+            color='诊断标签',
             height=400
         )
         
-        st.markdown("### 📋 SKU 战略行动指南")
+        st.markdown("### 📋 智能选品行动指南表")
         
-        # 格式化表格显示
-        display_bi_df = bi_df[['商品规格', '象限诊断', '销售数量', '总营业额', '毛利率(%)', '具体毛利']].sort_values(by=['象限诊断', '销售数量'], ascending=[True, False])
+        display_bi_df = bi_df[['商品规格', '诊断标签', '日均动销率', '毛利率(%)', '可售天数', '总库存', '总营业额']].sort_values(by=['诊断标签', '日均动销率'], ascending=[True, False])
         
         styled_bi = display_bi_df.style.format({
             '总营业额': '${:.2f}', 
-            '具体毛利': '${:.2f}',
-            '毛利率(%)': '{:.1f}%'
+            '日均动销率': '{:.2f} 件/天',
+            '毛利率(%)': '{:.1f}%',
+            '可售天数': lambda x: '> 半年' if x == 999 else f"{x} 天"
         })
         
         st.dataframe(styled_bi, use_container_width=True, hide_index=True)
