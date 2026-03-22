@@ -1027,7 +1027,6 @@ with t7:
     else:
         st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
-# 🚀 核心升级：全新战略罗盘
 with t8:
     st.subheader("📈 选品与战略决策盘 (SKU 矩阵分析)")
     st.info("💡 系统基于时间加权动销率和库存深度，自动为你诊断商品健康度，拒绝纸面富贵，定位真实爆款。")
@@ -1038,7 +1037,6 @@ with t8:
         df_s_bi['销售数量'] = pd.to_numeric(df_s_bi['销售数量'], errors='coerce').fillna(0)
         df_s_bi['总营业额'] = pd.to_numeric(df_s_bi['总营业额'], errors='coerce').fillna(0.0)
 
-        # 找出每个 SKU 第一次卖出去的日子，作为“在店生命周期”的起点
         bi_sales = df_s_bi.groupby(['商品名称', '颜色']).agg({
             '销售数量': 'sum',
             '总营业额': 'sum',
@@ -1053,30 +1051,24 @@ with t8:
         bi_df['销售数量'] = bi_df['销售数量'].fillna(0)
         bi_df['总营业额'] = bi_df['总营业额'].fillna(0.0)
 
-        # 核心引擎 1：计算时间加权的日均动销率
         today = pd.Timestamp(datetime.now().date())
-        # 如果没卖过，默认在店天数为 1 天避免报错
         bi_df['在店天数'] = (today - bi_df['日期_dt']).dt.days.fillna(1)
         bi_df['在店天数'] = bi_df['在店天数'].apply(lambda x: x if x > 0 else 1) 
         
         bi_df['日均动销率'] = bi_df['销售数量'] / bi_df['在店天数']
         
-        # 核心盈利能力核算
         bi_df['总进价成本'] = bi_df['销售数量'] * bi_df['进价成本']
         bi_df['具体毛利'] = bi_df['总营业额'] - bi_df['总进价成本']
         bi_df['毛利率(%)'] = (bi_df['具体毛利'] / bi_df['总营业额'] * 100).fillna(0.0)
         
-        # 售罄指标
         bi_df['售罄率(%)'] = (bi_df['销售数量'] / (bi_df['销售数量'] + bi_df['总库存']) * 100).fillna(0.0)
 
-        # 核心引擎 2：计算还能卖多少天 (存销比)
         def calc_cover(row):
             if row['日均动销率'] > 0:
                 return int(row['总库存'] / row['日均动销率'])
-            return 999 # 动销率为0时，代表死水一潭，标为 999 天
+            return 999 
         bi_df['可售天数'] = bi_df.apply(calc_cover, axis=1)
 
-        # 划定及格线：算平均水平(中位数)
         active_skus = bi_df[bi_df['销售数量'] > 0]
         if not active_skus.empty:
             med_vel = active_skus['日均动销率'].median()
@@ -1084,28 +1076,23 @@ with t8:
         else:
             med_vel, med_mar = 0.1, 0.1
 
-        # 🧠 终极 5 大智能标签算法植入
         def get_tag(row):
-            # 1. 刚上架秒空：总库存极低，且售罄率极高
             if row['总库存'] <= 2 and row['售罄率(%)'] >= 80 and row['销售数量'] > 0:
                 return "🔥 秒空断货王 (低估需求)"
-            # 2. 双高：真正的摇钱树
             elif row['日均动销率'] >= med_vel and row['毛利率(%)'] >= med_mar:
                 return "⭐ 绝对明星 (死保库存)"
-            # 3. 流水大但不赚钱
             elif row['日均动销率'] >= med_vel and row['毛利率(%)'] < med_mar:
                 return "🧲 赚吆喝引流款 (建议搭配)"
-            # 4. 纸面富贵陷阱：看似高利润但几个月卖不掉一个
             elif row['日均动销率'] < med_vel and row['毛利率(%)'] >= med_mar:
                 return "🐢 伪需求高利款 (占压资金)"
-            # 5. 双低：彻底没救
             else:
                 return "☠️ 清仓废柴 (果断斩仓)"
 
         bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
-        bi_df['商品规格'] = bi_df['商品名称'] + " (" + bi_df['颜色'] + ")"
         
-        # 可视化罗盘
+        # 🚀 核心修复：强制转为字符串，防止空值或纯数字引发 TypeError
+        bi_df['商品规格'] = bi_df['商品名称'].astype(str) + " (" + bi_df['颜色'].astype(str) + ")"
+        
         st.markdown("### 🎯 动销率 vs 盈利能力 雷达图")
         st.scatter_chart(
             bi_df,
