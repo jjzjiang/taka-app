@@ -137,7 +137,8 @@ def get_f(df, q):
 
 # --- 4. 主界面布局 ---
 st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
-t1, t2, t3, t4, t5, t6, t7 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈"])
+# 🚀 增加全新模块：Tab 8 (战略 BI 看板)
+t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈", "🧠 战略(BI)"])
 
 with t1:
     st.subheader("库存实物分布 (低库存自动标红预警)")
@@ -448,7 +449,6 @@ with t3:
                 filtered_summ = get_f(summ, q) 
                 
                 if not filtered_summ.empty:
-                    # 🚀 核心升级：计算日均销售额
                     delta_days = (end - start).days + 1
                     
                     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1027,3 +1027,73 @@ with t7:
             with fbc2: st.button("🔄 取消选中", key="btn_cancel_fb", on_click=clear_fb)
     else:
         st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
+
+with t8:
+    st.subheader("📈 选品与战略决策盘 (SKU 矩阵分析)")
+    st.info("💡 基于【波士顿矩阵】模型，自动交叉分析销量与毛利，帮你找出店铺的摇钱树和吸血鬼。")
+
+    if not df_sales.empty and not df_stock.empty:
+        # 提取并清理需要的数据
+        f_sales_bi = df_sales.copy()
+        f_sales_bi['销售数量'] = pd.to_numeric(f_sales_bi['销售数量'], errors='coerce').fillna(0)
+        f_sales_bi['总营业额'] = pd.to_numeric(f_sales_bi['总营业额'], errors='coerce').fillna(0.0)
+        
+        # 聚合每个 SKU 的总销量和总营业额
+        bi_df = f_sales_bi.groupby(['商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
+        
+        # 关联进价成本来计算利润
+        df_stock_bi = df_stock[['商品名称', '颜色', '进价成本']].copy()
+        df_stock_bi['进价成本'] = pd.to_numeric(df_stock_bi['进价成本'], errors='coerce').fillna(0.0)
+        
+        bi_df = pd.merge(bi_df, df_stock_bi, on=['商品名称', '颜色'], how='left')
+        bi_df['总进价成本'] = bi_df['销售数量'] * bi_df['进价成本']
+        bi_df['具体毛利'] = bi_df['总营业额'] - bi_df['总进价成本']
+        
+        # 计算单品毛利率 (用百分比表示，保留一位小数方便显示)
+        bi_df['毛利率(%)'] = (bi_df['具体毛利'] / bi_df['总营业额'] * 100).fillna(0.0).round(1)
+        
+        # 计算中位数作为十字准星的分割线
+        median_qty = bi_df['销售数量'].median()
+        median_margin = bi_df['毛利率(%)'].median()
+        
+        # 象限诊断逻辑
+        def get_quadrant(row):
+            qty = row['销售数量']
+            margin = row['毛利率(%)']
+            if qty >= median_qty and margin >= median_margin:
+                return "⭐ 明星爆款"
+            elif qty >= median_qty and margin < median_margin:
+                return "🧲 引流走量款"
+            elif qty < median_qty and margin >= median_margin:
+                return "💎 利润潜力股"
+            else:
+                return "☠️ 滞销死库存"
+                
+        bi_df['象限诊断'] = bi_df.apply(get_quadrant, axis=1)
+        bi_df['商品规格'] = bi_df['商品名称'] + " (" + bi_df['颜色'] + ")"
+        
+        # 绘制散点图
+        st.markdown("### 🎯 SKU 表现雷达图")
+        st.scatter_chart(
+            bi_df,
+            x='销售数量',
+            y='毛利率(%)',
+            color='象限诊断',
+            height=400
+        )
+        
+        st.markdown("### 📋 SKU 战略行动指南")
+        
+        # 格式化表格显示
+        display_bi_df = bi_df[['商品规格', '象限诊断', '销售数量', '总营业额', '毛利率(%)', '具体毛利']].sort_values(by=['象限诊断', '销售数量'], ascending=[True, False])
+        
+        styled_bi = display_bi_df.style.format({
+            '总营业额': '${:.2f}', 
+            '具体毛利': '${:.2f}',
+            '毛利率(%)': '{:.1f}%'
+        })
+        
+        st.dataframe(styled_bi, use_container_width=True, hide_index=True)
+        
+    else:
+        st.warning("⚠️ 需要有充足的【库存进价】和【销售流水】数据才能生成战略罗盘，快去多记两笔账吧！")
