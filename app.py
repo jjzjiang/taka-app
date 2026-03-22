@@ -290,7 +290,8 @@ with t1:
 
         styled_df = display_df.style.format({'进价成本': '${:.2f}', '售卖价格': '${:.2f}'}).apply(highlight_low_stock, axis=1)
         
-        disabled_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '单品毛利率']
+        # 为了极度安全，主表格现在全部锁死，完全通过下方弹出的独立表单编辑
+        disabled_cols = [c for c in display_cols if c != "选择"]
         editor_key = f"stock_editor_{st.session_state.stock_reset_key}"
         
         edited_stock = st.data_editor(
@@ -301,36 +302,78 @@ with t1:
             key=editor_key 
         )
         
-        # 🚀 终极防死循环：狙击手级监听，只有你真实编辑了单元格才触发保存！
-        editor_state = st.session_state.get(editor_key, {})
-        if editor_state.get("edited_rows"):
-            has_real_edits = False
-            for idx, row in edited_stock.iterrows():
-                old_name = str(display_df.loc[idx, '商品名称'])
-                old_color = str(display_df.loc[idx, '颜色'])
-                old_cost = float(display_df.loc[idx, '进价成本'])
-                old_price = float(display_df.loc[idx, '售卖价格'])
-                
-                new_name = str(row['商品名称'])
-                new_color = str(row['颜色'])
-                new_cost = float(row['进价成本'])
-                new_price = float(row['售卖价格'])
-                
-                if (old_name != new_name) or (old_color != new_color) or (old_cost != new_cost) or (old_price != new_price):
-                    has_real_edits = True
-                    orig_idx = df_stock[(df_stock['商品名称'] == old_name) & (df_stock['颜色'] == old_color)].index[0]
-                    df_stock.at[orig_idx, '商品名称'] = new_name
-                    df_stock.at[orig_idx, '颜色'] = new_color
-                    df_stock.at[orig_idx, '进价成本'] = new_cost
-                    df_stock.at[orig_idx, '售卖价格'] = new_price
-
-            if has_real_edits:
-                save_data(df_stock, STOCK_SHEET) 
-                st.success("✅ 商品基础信息修改已保存！(注：库存变动请走上方专用通道)")
-                st.session_state.stock_reset_key += 1
-                st.rerun()
-        
         selected_stock = edited_stock[edited_stock["选择"] == True]
+        
+        # 🚀 核心升级：终极 SKU 档案编辑与时光机
+        if len(selected_stock) == 1:
+            st.markdown("### ⚙️ SKU 档案修改与时间溯源机")
+            st.info("💡 放心改！如果你修改了【名称】或【颜色】，系统会自动潜入数据库，把你所有历史流水账里的名字一并改掉，绝不留死账。")
+            
+            orig_name = str(selected_stock.iloc[0]['商品名称'])
+            orig_color = str(selected_stock.iloc[0]['颜色'])
+            orig_cost = float(selected_stock.iloc[0]['进价成本'].replace('$', ''))
+            orig_price = float(selected_stock.iloc[0]['售卖价格'].replace('$', ''))
+            
+            # 去入库表里找这个 SKU 最早的入库时间
+            sku_logs = df_restock[(df_restock['商品名称'] == orig_name) & (df_restock['颜色'] == orig_color)]
+            has_history = False
+            if not sku_logs.empty:
+                try:
+                    first_date_str = sku_logs['记录日期'].min()
+                    first_date = pd.to_datetime(first_date_str).date()
+                    has_history = True
+                except:
+                    first_date = datetime.now().date()
+            else:
+                first_date = datetime.now().date()
+
+            with st.form("edit_base_info"):
+                ec1, ec2, ec3 = st.columns([1.5, 1.5, 2])
+                e_name = ec1.text_input("商品名称", value=orig_name)
+                e_color = ec2.text_input("颜色/规格", value=orig_color)
+                e_date = ec3.date_input("📅 首次入库时间 (BI 动销率基准点)", value=first_date, help="如果你发现Tab8里的动销率算的不对，直接在这里把日期往前或往后调！")
+                
+                ec4, ec5, _ = st.columns([1.5, 1.5, 2])
+                e_cost = ec4.number_input("单件进价成本 ($)", value=orig_cost, format="%.2f")
+                e_price = ec5.number_input("终端售卖价格 ($)", value=orig_price, format="%.2f")
+                
+                if st.form_submit_button("💾 保存档案与时间修改", type="primary"):
+                    # 1. 更新主数据表
+                    idx = df_stock[(df_stock['商品名称'] == orig_name) & (df_stock['颜色'] == orig_color)].index[0]
+                    df_stock.at[idx, '商品名称'] = e_name
+                    df_stock.at[idx, '颜色'] = e_color
+                    df_stock.at[idx, '进价成本'] = e_cost
+                    df_stock.at[idx, '售卖价格'] = e_price
+                    
+                    # 2. 🚀 全局级联更新：保证历史不丢失
+                    if e_name != orig_name or e_color != orig_color:
+                        if not df_sales.empty:
+                            df_sales.loc[(df_sales['商品名称'] == orig_name) & (df_sales['颜色'] == orig_color), ['商品名称', '颜色']] = [e_name, e_color]
+                            save_data(df_sales, SALES_SHEET)
+                        if not df_restock.empty:
+                            df_restock.loc[(df_restock['商品名称'] == orig_name) & (df_restock['颜色'] == orig_color), ['商品名称', '颜色']] = [e_name, e_color]
+                        if not df_b2b.empty:
+                            df_b2b.loc[(df_b2b['商品名称'] == orig_name) & (df_b2b['颜色'] == orig_color), ['商品名称', '颜色']] = [e_name, e_color]
+                            save_data(df_b2b, B2B_SHEET)
+
+                    # 3. 🚀 时间溯源：修改入库日记的最早记录
+                    date_str = e_date.strftime("%Y/%m/%d")
+                    if has_history:
+                        # 找到那条最早的记录，强行改掉它的日期
+                        min_idx = sku_logs['记录日期'].idxmin()
+                        df_restock.at[min_idx, '记录日期'] = date_str
+                    else:
+                        # 如果是无头案，强行补一条初始记录充当时间锚点
+                        new_log = pd.DataFrame([[date_str, "初始建档", e_name, e_color, 0, "时间追溯", e_cost, "系统溯源建档"]], columns=RESTOCK_COLS)
+                        df_restock = pd.concat([new_log, df_restock], ignore_index=True)
+                    
+                    save_data(df_stock, STOCK_SHEET)
+                    save_data(df_restock, RESTOCK_SHEET)
+                    
+                    st.session_state.stock_reset_key += 1
+                    st.success(f"✅ 【{e_name}】的档案和溯源时间已全局更新！Tab 8 的数据已重新校准。")
+                    st.rerun()
+
         if not selected_stock.empty:
             col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
             with col_btn1:
@@ -1023,7 +1066,6 @@ with t6:
             key=editor_key
         )
         
-        # 🚀 终极防死循环：只监听真实的编辑动作
         editor_state = st.session_state.get(editor_key, {})
         if editor_state.get("edited_rows"):
             has_real_edits = False
@@ -1140,7 +1182,6 @@ with t7:
             key=editor_key
         )
 
-        # 🚀 终极防死循环：只监听真实的编辑动作
         editor_state = st.session_state.get(editor_key, {})
         if editor_state.get("edited_rows"):
             has_real_edits = False
