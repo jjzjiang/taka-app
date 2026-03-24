@@ -25,7 +25,6 @@ FEEDBACK_SHEET = "Feedback"
 RESTOCK_SHEET = "Restock_Log"
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
-# 🚀 核心升级：新增订单号字段
 SALES_COLS = ['订单号', '日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
@@ -88,7 +87,6 @@ def convert_df_to_csv(df):
 
 df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期') 
-# 🚀 历史数据兼容：给旧账本加上默认历史单号，防止报错
 if not df_sales.empty:
     df_sales['订单号'] = df_sales['订单号'].astype(str).replace('0', '历史单').replace('', '历史单').replace('nan', '历史单')
 
@@ -165,7 +163,8 @@ with t1:
     f_opts_stk = df_stock.copy()
     stock_list_labels = []
     if not f_opts_stk.empty:
-        f_opts_stk['label'] = f_opts_stk['商品名称'].astype(str) + " (" + f_opts_stk['颜色'].astype(str) + ")"
+        # 🚀 防弹装甲
+        f_opts_stk['label'] = f_opts_stk['商品名称'].fillna('').astype(str) + " (" + f_opts_stk['颜色'].fillna('').astype(str) + ")"
         stock_list_labels = f_opts_stk['label'].tolist()
         
     t1_a, t1_b, t1_c = st.tabs(["📥 1. 补货入库 (Restock)", "🔄 2. 货位调拨 (Transfer)", "⚖️ 3. 盘点平账 (Adjust)"])
@@ -400,12 +399,12 @@ with t1:
 with t2:
     st.subheader("🛒 智能 POS 收银台 (多件合并结账)")
     
-    # 🚀 全新升级：双栏布局（左侧点单，右侧购物车）
     pos_col1, pos_col2 = st.columns([1.2, 1.5])
     
     f_opts = get_f(df_stock, "").copy() 
     if not f_opts.empty:
-        f_opts['label'] = f_opts['商品名称'].astype(str) + " (" + f_opts['颜色'].astype(str) + ")" 
+        # 🚀 防弹装甲
+        f_opts['label'] = f_opts['商品名称'].fillna('').astype(str) + " (" + f_opts['颜色'].fillna('').astype(str) + ")" 
         
         with pos_col1:
             with st.container(border=True):
@@ -440,7 +439,6 @@ with t2:
                     st.info("🛒 购物车空空如也，请从左侧添加商品。")
                 else:
                     cart_df = pd.DataFrame(st.session_state.pos_cart)
-                    # 显示漂亮的小计
                     st.dataframe(
                         cart_df.style.format({'单价': '${:.2f}', '小计': '${:.2f}'}), 
                         use_container_width=True, hide_index=True
@@ -454,23 +452,20 @@ with t2:
                     co_col1, co_col2 = st.columns([2, 1])
                     s_d = co_col1.date_input("交易日期 (可补录)", value=datetime.now(), key="pos_date")
                     
-                    if co_col2.button("🗑️ 清空重点", use_container_width=True):
+                    if co_col2.button("🗑️ 清空购物车", use_container_width=True):
                         st.session_state.pos_cart = []
                         st.rerun()
                         
                     if st.button("💳 确认结账 (生成流水)", type="primary", use_container_width=True):
-                        # 生成统一的订单号
                         order_id = "ORD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
                         order_date = s_d.strftime("%Y/%m/%d")
                         
                         new_rows = []
                         for item in st.session_state.pos_cart:
-                            # 1. 构建流水记录
                             new_rows.append([
                                 order_id, order_date, item['商品名称'], item['颜色'], 
                                 item['数量'], item['单价'], item['小计']
                             ])
-                            # 2. 同步扣减库存
                             idx_p = df_stock[(df_stock['商品名称'] == item['商品名称']) & (df_stock['颜色'] == item['颜色'])].index
                             if not idx_p.empty:
                                 i_p = idx_p[0]
@@ -478,15 +473,13 @@ with t2:
                                 df_stock.at[i_p, '已售出数量'] = int(pd.to_numeric(df_stock.at[i_p, '已售出数量'], errors='coerce') or 0) + item['数量']
                                 df_stock.at[i_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[i_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                         
-                        # 批量插入新订单
                         new_sales_df = pd.DataFrame(new_rows, columns=SALES_COLS)
-                        global df_sales
+                        # 🚀 删除错误的 global，直接覆盖更新当前会话的变量，并保存云端
                         df_sales = pd.concat([new_sales_df, df_sales], ignore_index=True)
                         
                         save_data(df_sales, SALES_SHEET) 
                         save_data(df_stock, STOCK_SHEET) 
                         
-                        # 结账完成后清空购物车
                         st.session_state.pos_cart = []
                         st.success(f"🎉 结账成功！流水号 {order_id} 已记录，库存已自动扣除。")
                         st.rerun()
@@ -530,7 +523,7 @@ with t2:
 
             if st.button("🔄 确认执行换货", type="primary", use_container_width=True):
                 ex_date = ex_date_input.strftime("%Y/%m/%d")
-                ex_order_id = "EXC-" + datetime.now().strftime("%Y%m%d-%H%M%S") # 换货专用订单号
+                ex_order_id = "EXC-" + datetime.now().strftime("%Y%m%d-%H%M%S") 
                 
                 idx_ret = df_stock[(df_stock['商品名称'] == ret_row['商品名称']) & (df_stock['颜色'] == ret_row['颜色'])].index[0]
                 s_ret = pd.DataFrame([[ex_order_id, ex_date, df_stock.at[idx_ret,'商品名称'], df_stock.at[idx_ret,'颜色'], -1, ret_p, -1 * ret_p]], columns=SALES_COLS)
@@ -579,7 +572,8 @@ with t2:
                             df_stock.at[m[0], '已售出数量'] = int(pd.to_numeric(df_stock.at[m[0], '已售出数量'], errors='coerce') or 0) - int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
                             df_stock.at[m[0], '总库存'] = sum([int(pd.to_numeric(df_stock.at[m[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                     for _, r in sel.iterrows():
-                        df_sales = df_sales[~((df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
+                        # 确保精确撤销对应的订单行
+                        df_sales = df_sales[~((df_sales['订单号']==r['订单号']) & (df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
                     save_data(df_stock, STOCK_SHEET); save_data(df_sales, SALES_SHEET)
                     st.session_state.sales_reset_key += 1
                     st.rerun()
@@ -595,7 +589,7 @@ with t2:
                 
                 prod_list = []
                 if not df_stock.empty:
-                    prod_list = (df_stock['商品名称'].astype(str) + " (" + df_stock['颜色'].astype(str) + ")").tolist()
+                    prod_list = (df_stock['商品名称'].fillna('').astype(str) + " (" + df_stock['颜色'].fillna('').astype(str) + ")").tolist()
                 if curr_label not in prod_list:
                     prod_list.insert(0, curr_label)
                     
@@ -663,18 +657,15 @@ with t3:
                 f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
                 f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
                 
-                # 🚀 核心升级：增加客流单数核算
                 tot_rev = f_sales_range['总营业额'].sum()
                 tot_items = f_sales_range['销售数量'].sum()
                 
-                # 算有多少个独立的新订单 (过滤掉换货单和历史单)
                 valid_orders = f_sales_range[
                     (~f_sales_range['订单号'].str.contains('历史单', na=False)) & 
                     (~f_sales_range['订单号'].str.contains('EXC-', na=False))
                 ]
                 order_count = valid_orders['订单号'].nunique()
                 
-                # 算历史单的粗略笔数（1行算1笔）用来兜底显示
                 legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
                 total_order_count = order_count + len(legacy_orders)
                 
@@ -1026,7 +1017,7 @@ with t6:
             f_opts_b2b = get_f(df_stock, "").copy() 
             stock_list = []
             if not f_opts_b2b.empty:
-                f_opts_b2b['label'] = f_opts_b2b['商品名称'].astype(str) + " (" + f_opts_b2b['颜色'].astype(str) + ")" 
+                f_opts_b2b['label'] = f_opts_b2b['商品名称'].fillna('').astype(str) + " (" + f_opts_b2b['颜色'].fillna('').astype(str) + ")" 
                 stock_list = f_opts_b2b['label'].tolist()
                 
             col_sel, col_cust_name, col_cust_color = st.columns([2, 1.5, 1])
@@ -1380,7 +1371,8 @@ with t8:
                 return "☠️ 清仓废柴 (果断斩仓)"
 
         bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
-        bi_df['商品规格'] = bi_df['商品名称'].astype(str) + " (" + bi_df['颜色'].astype(str) + ")"
+        # 🚀 防弹装甲
+        bi_df['商品规格'] = bi_df['商品名称'].fillna('').astype(str) + " (" + bi_df['颜色'].fillna('').astype(str) + ")"
         
         st.markdown("### 🎯 动销率 vs 盈利能力 雷达图")
         st.scatter_chart(
