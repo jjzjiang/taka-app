@@ -163,7 +163,6 @@ with t1:
     f_opts_stk = df_stock.copy()
     stock_list_labels = []
     if not f_opts_stk.empty:
-        # 🚀 防弹装甲
         f_opts_stk['label'] = f_opts_stk['商品名称'].fillna('').astype(str) + " (" + f_opts_stk['颜色'].fillna('').astype(str) + ")"
         stock_list_labels = f_opts_stk['label'].tolist()
         
@@ -403,12 +402,13 @@ with t2:
     
     f_opts = get_f(df_stock, "").copy() 
     if not f_opts.empty:
-        # 🚀 防弹装甲
         f_opts['label'] = f_opts['商品名称'].fillna('').astype(str) + " (" + f_opts['颜色'].fillna('').astype(str) + ")" 
         
         with pos_col1:
             with st.container(border=True):
                 st.markdown("#### 1️⃣ 扫码/点单区")
+                
+                # 商品选择和折扣选择
                 s_l = st.selectbox("选择售出商品", f_opts['label'], key="pos_item")
                 selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
                 base_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
@@ -419,7 +419,10 @@ with t2:
                 s_discount = c_d.selectbox("快捷折扣", list(discount_opts.keys()), key="pos_disc")
                 
                 auto_calc_price = base_price * discount_opts[s_discount]
-                s_p = st.number_input("此单品最终成交价 ($)", value=float(auto_calc_price), format="%.2f", key="pos_price")
+                
+                # 🚀 核心修复：用动态 key 解锁价格输入框！只要商品或折扣变了，输入框马上强制刷新
+                dynamic_key = f"price_{s_l}_{s_discount}"
+                s_p = st.number_input("此单品最终成交价 ($)", value=float(auto_calc_price), format="%.2f", key=dynamic_key)
                 
                 if st.button("➕ 加入当前购物车", use_container_width=True):
                     item_dict = {
@@ -474,7 +477,6 @@ with t2:
                                 df_stock.at[i_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[i_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                         
                         new_sales_df = pd.DataFrame(new_rows, columns=SALES_COLS)
-                        # 🚀 删除错误的 global，直接覆盖更新当前会话的变量，并保存云端
                         df_sales = pd.concat([new_sales_df, df_sales], ignore_index=True)
                         
                         save_data(df_sales, SALES_SHEET) 
@@ -572,7 +574,6 @@ with t2:
                             df_stock.at[m[0], '已售出数量'] = int(pd.to_numeric(df_stock.at[m[0], '已售出数量'], errors='coerce') or 0) - int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
                             df_stock.at[m[0], '总库存'] = sum([int(pd.to_numeric(df_stock.at[m[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                     for _, r in sel.iterrows():
-                        # 确保精确撤销对应的订单行
                         df_sales = df_sales[~((df_sales['订单号']==r['订单号']) & (df_sales['日期']==r['日期']) & (df_sales['商品名称']==r['商品名称']) & (df_sales['颜色']==r['颜色']) & (df_sales['销售数量']==r['销售数量']))]
                     save_data(df_stock, STOCK_SHEET); save_data(df_sales, SALES_SHEET)
                     st.session_state.sales_reset_key += 1
@@ -1371,7 +1372,6 @@ with t8:
                 return "☠️ 清仓废柴 (果断斩仓)"
 
         bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
-        # 🚀 防弹装甲
         bi_df['商品规格'] = bi_df['商品名称'].fillna('').astype(str) + " (" + bi_df['颜色'].fillna('').astype(str) + ")"
         
         st.markdown("### 🎯 动销率 vs 盈利能力 雷达图")
