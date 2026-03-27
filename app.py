@@ -109,23 +109,42 @@ def clear_att(): st.session_state.att_reset_key += 1
 def clear_b2b(): st.session_state.b2b_reset_key += 1
 def clear_fb(): st.session_state.fb_reset_key += 1
 
-# 🚀 核心升级 1：侧边栏引入身份验证系统
+# 🚀 核心升级 1：持久化身份验证系统 (Session State + URL Query Params)
+manager_password = "taka888"
+
+# 尝试从 URL 令牌中恢复登录状态 (抵御 F5 刷新)
+if "is_admin" not in st.session_state:
+    if st.query_params.get("role") == "admin":
+        st.session_state.is_admin = True
+    else:
+        st.session_state.is_admin = False
+
 with st.sidebar:
     st.header("🔐 系统权限")
-    # 👉 这里是你的专属店长密码，你可以把 'taka888' 改成任何你想要的字母或数字
-    manager_password = "taka888" 
     
-    pwd_input = st.text_input("输入店长密码解锁完整后台", type="password")
-    is_admin = (pwd_input == manager_password)
-    
-    if is_admin:
-        st.success("👑 店长模式已开启")
-    else:
+    if not st.session_state.is_admin:
         st.info("🧑‍💼 当前为：前台店员模式\n(仅限收银与查询库存)")
+        pwd_input = st.text_input("输入店长密码解锁", type="password")
+        if st.button("🔓 解锁店长后台", use_container_width=True):
+            if pwd_input == manager_password:
+                st.session_state.is_admin = True
+                # 发放 URL 隐形令牌，刷新不掉线！
+                st.query_params["role"] = "admin"
+                st.rerun()
+            else:
+                st.error("❌ 密码错误！")
+    else:
+        st.success("👑 店长上帝模式已开启")
+        if st.button("🔒 退出店长模式", use_container_width=True):
+            st.session_state.is_admin = False
+            # 销毁 URL 令牌
+            st.query_params.clear()
+            st.rerun()
+            
+    is_admin = st.session_state.is_admin
         
     st.divider()
     
-    # 只有店长能看到“核心管理”去建档
     if is_admin:
         st.header("🛠️ 核心管理")
         with st.expander("➕ 新增产品建档 (Add SKU)"):
@@ -166,13 +185,11 @@ def get_f(df, q):
         return df[mask]
     return df
 
-# 🚀 核心升级 2：动态布局，店员只能看到两个 Tab
 st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
 
 if is_admin:
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈", "🧠 战略(BI)"])
 else:
-    # 店员只展示这俩
     t1, t2 = st.tabs(["📊 实时库存查询", "🛒 智能POS收银台"])
 
 # ================= Tab 1: 库存 =================
@@ -303,7 +320,6 @@ with t1:
         v_df['单品毛利率'] = v_df.apply(calc_margin, axis=1)
         v_df.insert(0, "选择", False)
         
-        # 🚀 权限分流：店长看全部，店员只能看基本数量，隐藏成本和毛利
         if is_admin:
             display_cols = ['选择', '商品名称', '颜色', '应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '单品毛利率']
         else:
@@ -414,7 +430,6 @@ with t1:
                 with col_btn2: st.button("🔄 取消选中", key="btn_cancel_stock", on_click=clear_stock)
         
         else:
-            # 店员模式：直接看纯净版数据表，不给编辑，不给复选框
             styled_df = display_df.style.format({'售卖价格': '${:.2f}'}).apply(highlight_low_stock, axis=1)
             st.dataframe(styled_df, use_container_width=True, hide_index=True)
             
@@ -583,8 +598,6 @@ with t2:
     st.divider()
     f_sl = get_f(df_sales, q)
     if not f_sl.empty:
-        
-        # 🚀 权限分流：店长能删改，店员只能看（防止飞单）
         if is_admin:
             f_sl_sel = f_sl.copy(); f_sl_sel.insert(0, "选择", False)
             f_sl_sel['成交单价'] = pd.to_numeric(f_sl_sel['成交单价'], errors='coerce').fillna(0.0)
