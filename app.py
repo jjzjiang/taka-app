@@ -26,7 +26,8 @@ RESTOCK_SHEET = "Restock_Log"
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
-EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期']
+# 🚀 核心升级：员工档案扩容，加入密码和状态
+EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期', '登录密码', '状态']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
@@ -58,7 +59,9 @@ def load_data(sheet_name, columns):
     if df.empty:
         df = pd.DataFrame(columns=columns)
     for col in columns:
-        if col not in df.columns: df[col] = 0
+        if col not in df.columns: 
+            # 防呆设计：缺失列填入空文本而不是0，防止密码验证报错
+            df[col] = "" 
     return df[columns]
 
 def save_data(df, sheet_name):
@@ -90,6 +93,11 @@ if not df_sales.empty:
     df_sales['订单号'] = df_sales['订单号'].astype(str).replace('0', '历史单').replace('', '历史单').replace('nan', '历史单')
 
 df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
+# 🚀 给云端旧数据打补丁：老员工默认全部为“在职”，密码为空
+if not df_employee.empty:
+    df_employee['状态'] = df_employee['状态'].astype(str).replace('0', '在职').replace('', '在职').replace('nan', '在职')
+    df_employee['登录密码'] = df_employee['登录密码'].astype(str).replace('0', '').replace('nan', '')
+
 df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期') 
 df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
 df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
@@ -109,72 +117,131 @@ def clear_att(): st.session_state.att_reset_key += 1
 def clear_b2b(): st.session_state.b2b_reset_key += 1
 def clear_fb(): st.session_state.fb_reset_key += 1
 
-# 🚀 核心升级 1：持久化身份验证系统 (Session State + URL Query Params)
+# ================= 🔐 全新身份验证网关 =================
 manager_password = "taka888"
 
-# 尝试从 URL 令牌中恢复登录状态 (抵御 F5 刷新)
-if "is_admin" not in st.session_state:
-    if st.query_params.get("role") == "admin":
-        st.session_state.is_admin = True
+# 抓取 URL 隐形令牌防掉线
+if "role" not in st.session_state:
+    query_role = st.query_params.get("role")
+    query_user = st.query_params.get("user")
+    
+    if query_role == "admin":
+        st.session_state.role = "admin"
+        st.session_state.current_user = "店长"
+    elif query_role == "employee" and query_user:
+        st.session_state.role = "employee"
+        st.session_state.current_user = query_user
     else:
-        st.session_state.is_admin = False
+        st.session_state.role = None
+        st.session_state.current_user = None
 
 with st.sidebar:
-    st.header("🔐 系统权限")
+    st.header("🔐 系统门禁")
     
-    if not st.session_state.is_admin:
-        st.info("🧑‍💼 当前为：前台店员模式\n(仅限收银与查询库存)")
-        pwd_input = st.text_input("输入店长密码解锁", type="password")
-        if st.button("🔓 解锁店长后台", use_container_width=True):
-            if pwd_input == manager_password:
-                st.session_state.is_admin = True
-                # 发放 URL 隐形令牌，刷新不掉线！
-                st.query_params["role"] = "admin"
-                st.rerun()
-            else:
-                st.error("❌ 密码错误！")
-    else:
-        st.success("👑 店长上帝模式已开启")
-        if st.button("🔒 退出店长模式", use_container_width=True):
-            st.session_state.is_admin = False
-            # 销毁 URL 令牌
+    # 判断是否已经登录
+    if st.session_state.role is not None:
+        user_emoji = "👑" if st.session_state.role == "admin" else "🧑‍💼"
+        st.success(f"{user_emoji} 欢迎回来：{st.session_state.current_user}")
+        if st.button("🚪 退出系统 (交接班)", use_container_width=True):
+            st.session_state.role = None
+            st.session_state.current_user = None
             st.query_params.clear()
             st.rerun()
             
-    is_admin = st.session_state.is_admin
+        is_admin = (st.session_state.role == "admin")
         
-    st.divider()
-    
-    if is_admin:
-        st.header("🛠️ 核心管理")
-        with st.expander("➕ 新增产品建档 (Add SKU)"):
-            with st.form("new_sku"):
-                n_name = st.text_input("产品名称")
-                n_color = st.text_input("颜色")
-                c1, c2, c3 = st.columns(3)
-                n_cost, n_price, n_expect = c1.number_input("进价", format="%.2f"), c2.number_input("售价", format="%.2f"), c3.number_input("应收")
-                i1, i2, i3, i4 = st.columns(4)
-                n_disp, n_shelf, n_stor, n_dmg = i1.number_input("展示"), i2.number_input("货柜"), i3.number_input("储物"), i4.number_input("坏货")
-                if st.form_submit_button("确认建档"):
-                    if n_name and n_color:
-                        total = n_disp + n_shelf + n_stor 
-                        new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
-                        df_stock = pd.concat([df_stock, new_r], ignore_index=True)
-                        
-                        if total > 0 or n_dmg > 0:
-                            log_date = datetime.now().strftime("%Y/%m/%d")
-                            init_log = pd.DataFrame([[log_date, "初始建档", n_name, n_color, total+n_dmg, "多库位", n_cost, "侧边栏初始建档"]], columns=RESTOCK_COLS)
-                            df_restock = pd.concat([init_log, df_restock], ignore_index=True)
-                            save_data(df_restock, RESTOCK_SHEET)
+        st.divider()
+        if is_admin:
+            st.header("🛠️ 核心管理")
+            with st.expander("➕ 新增产品建档 (Add SKU)"):
+                with st.form("new_sku"):
+                    n_name = st.text_input("产品名称")
+                    n_color = st.text_input("颜色")
+                    c1, c2, c3 = st.columns(3)
+                    n_cost, n_price, n_expect = c1.number_input("进价", format="%.2f"), c2.number_input("售价", format="%.2f"), c3.number_input("应收")
+                    i1, i2, i3, i4 = st.columns(4)
+                    n_disp, n_shelf, n_stor, n_dmg = i1.number_input("展示"), i2.number_input("货柜"), i3.number_input("储物"), i4.number_input("坏货")
+                    if st.form_submit_button("确认建档"):
+                        if n_name and n_color:
+                            total = n_disp + n_shelf + n_stor 
+                            new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
+                            df_stock = pd.concat([df_stock, new_r], ignore_index=True)
                             
-                        save_data(df_stock, STOCK_SHEET) 
-                        st.success("✅ 云端建档成功！")
-                        st.rerun()
+                            if total > 0 or n_dmg > 0:
+                                log_date = datetime.now().strftime("%Y/%m/%d")
+                                init_log = pd.DataFrame([[log_date, "初始建档", n_name, n_color, total+n_dmg, "多库位", n_cost, "侧边栏初始建档"]], columns=RESTOCK_COLS)
+                                df_restock = pd.concat([init_log, df_restock], ignore_index=True)
+                                save_data(df_restock, RESTOCK_SHEET)
+                                
+                            save_data(df_stock, STOCK_SHEET) 
+                            st.success("✅ 云端建档成功！")
+                            st.rerun()
+    
+    # 若未登录，显示登录面板
+    else:
+        login_type = st.radio("请选择您的身份", ["🧑‍💼 门店店员", "👑 店长/管理员"], horizontal=True)
+        
+        if login_type == "👑 店长/管理员":
+            pwd_input = st.text_input("输入授权密码", type="password")
+            if st.button("🔓 登录后台", use_container_width=True):
+                if pwd_input == manager_password:
+                    st.session_state.role = "admin"
+                    st.session_state.current_user = "店长"
+                    st.query_params["role"] = "admin"
+                    st.rerun()
+                else:
+                    st.error("❌ 密码错误！")
+        else:
+            if df_employee.empty:
+                st.warning("⚠️ 系统内暂无员工档案。请联系店长添加。")
+            else:
+                # 过滤出所有“在职”的员工，离职的直接人间蒸发
+                active_emps = df_employee[df_employee['状态'] != '离职']['员工姓名'].tolist()
+                
+                if not active_emps:
+                    st.warning("⚠️ 系统中无在职员工。")
+                else:
+                    emp_sel = st.selectbox("选择您的名字", active_emps)
+                    emp_row = df_employee[df_employee['员工姓名'] == emp_sel].iloc[0]
+                    emp_pwd = str(emp_row['登录密码']).strip()
+                    
+                    # 第一次登录，要求强制设密码
+                    if emp_pwd == "":
+                        st.info("🌟 系统检测到您是首次登录，请设置专属 PIN 码。")
+                        new_pwd = st.text_input("设置我的登录密码", type="password")
+                        if st.button("💾 保存并打卡上岗", use_container_width=True):
+                            if new_pwd.strip() == "":
+                                st.warning("密码不能为空哦！")
+                            else:
+                                idx = df_employee[df_employee['员工姓名'] == emp_sel].index[0]
+                                df_employee.at[idx, '登录密码'] = new_pwd
+                                save_data(df_employee, EMP_SHEET)
+                                
+                                st.session_state.role = "employee"
+                                st.session_state.current_user = emp_sel
+                                st.query_params["role"] = "employee"
+                                st.query_params["user"] = emp_sel
+                                st.success("✅ 密码设置成功！")
+                                st.rerun()
+                    else:
+                        emp_pwd_input = st.text_input("输入您的 PIN 码", type="password")
+                        if st.button("🔑 打卡上岗", use_container_width=True):
+                            if emp_pwd_input == emp_pwd:
+                                st.session_state.role = "employee"
+                                st.session_state.current_user = emp_sel
+                                st.query_params["role"] = "employee"
+                                st.query_params["user"] = emp_sel
+                                st.rerun()
+                            else:
+                                st.error("❌ 密码不匹配！")
 
-    st.divider()
-    st.write("### ☁️ 云端数据中心")
-    st.info("💡 数据实时同步至 Google Sheets。")
+# 拦截：如果不登录，直接阻断下方所有内容
+if st.session_state.role is None:
+    st.title("🏙️ Takashimaya 零售管理系统")
+    st.info("👈 请在左侧选择您的身份并完成登录。")
+    st.stop()  # 阻断器，代码在此停止运行
 
+# --- 3. 辅助功能 ---
 q = st.text_input("🔍 快速筛选 (全局搜索)...", placeholder="搜商品/姓名/客户/单号...")
 
 def get_f(df, q):
@@ -185,8 +252,10 @@ def get_f(df, q):
         return df[mask]
     return df
 
-st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
+# --- 4. 主界面布局 ---
+st.title("🏙️ Takashimaya 零售管理系统")
 
+# 动态加载 Tab
 if is_admin:
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈", "🧠 战略(BI)"])
 else:
@@ -791,7 +860,7 @@ if is_admin:
                 st.info("流水表中没有有效的日期数据。")
 
     with t4:
-        st.subheader("👥 员工档案管理")
+        st.subheader("👥 员工档案与门禁管理")
         with st.expander("➕ 新增员工档案", expanded=False):
             with st.form("add_employee"):
                 c1, c2 = st.columns(2)
@@ -805,7 +874,8 @@ if is_admin:
                     if e_name.strip() == "": st.warning("⚠️ 员工姓名不能为空！")
                     elif e_name in df_employee['员工姓名'].values: st.warning(f"⚠️ 员工 {e_name} 已经存在！")
                     else:
-                        new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d")]], columns=EMP_COLS)
+                        # 🚀 新增员工默认状态为"在职"，密码为空（等他自己首登去设）
+                        new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d"), "", "在职"]], columns=EMP_COLS)
                         df_employee = pd.concat([df_employee, new_emp], ignore_index=True)
                         save_data(df_employee, EMP_SHEET) 
                         st.session_state.emp_reset_key += 1
@@ -819,13 +889,43 @@ if is_admin:
             v_emp['时薪'] = pd.to_numeric(v_emp['时薪'], errors='coerce').fillna(0.0)
             styled_emp = v_emp.style.format({'时薪': '${:.2f}'})
             
-            edited_emp = st.data_editor(styled_emp, column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, disabled=f_employee.columns.tolist(), use_container_width=True, hide_index=True, key=f"emp_editor_{st.session_state.emp_reset_key}")
-            selected_emp = edited_emp[edited_emp["选择"] == True]
+            # 🚀 权限核心：店长可以直接在这里下拉改离职，或者清空密码框重置密码
+            editor_key = f"emp_editor_{st.session_state.emp_reset_key}"
+            edited_emp = st.data_editor(
+                styled_emp, 
+                column_config={
+                    "选择": st.column_config.CheckboxColumn("选择", default=False),
+                    "状态": st.column_config.SelectboxColumn("在离职状态", options=["在职", "离职"]),
+                    "登录密码": st.column_config.TextColumn("登录密码 (店长清空后，员工可重新设置)")
+                }, 
+                disabled=['员工姓名', '入职日期'], 
+                use_container_width=True, hide_index=True, key=editor_key
+            )
             
+            editor_state = st.session_state.get(editor_key, {})
+            if editor_state.get("edited_rows"):
+                has_real_edits = False
+                for idx, row in edited_emp.iterrows():
+                    is_changed = False
+                    for c in EMP_COLS:
+                        if str(row[c]) != str(v_emp.loc[idx, c]):
+                            is_changed = True
+                            break
+                    if is_changed:
+                        has_real_edits = True
+                        for col in EMP_COLS:
+                            df_employee.at[idx, col] = row[col]
+                if has_real_edits:
+                    save_data(df_employee, EMP_SHEET)
+                    st.success("✅ 员工档案修改已保存！如果标记为【离职】，该员工将立刻失去系统访问权限。")
+                    st.session_state.emp_reset_key += 1
+                    st.rerun()
+            
+            selected_emp = edited_emp[edited_emp["选择"] == True]
             if not selected_emp.empty:
                 col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
                 with col_btn1:
-                    if st.button("🗑️ 批量删除员工", type="primary", key="del_emp"):
+                    if st.button("🗑️ 彻底删除员工 (不建议)", type="primary", key="del_emp", help="建议直接将其【状态】改为【离职】即可，以保留打卡历史数据。"):
                         for _, row in selected_emp.iterrows():
                             df_employee = df_employee[df_employee['员工姓名'] != row['员工姓名']]
                         save_data(df_employee, EMP_SHEET)
