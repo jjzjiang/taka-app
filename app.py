@@ -25,8 +25,8 @@ FEEDBACK_SHEET = "Feedback"
 RESTOCK_SHEET = "Restock_Log"
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
-SALES_COLS = ['订单号', '日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
-# 🚀 核心升级：员工档案扩容，加入密码和状态
+# 🚀 核心升级：新增“收银员”字段，实现责任到人
+SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期', '登录密码', '状态']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
@@ -60,7 +60,6 @@ def load_data(sheet_name, columns):
         df = pd.DataFrame(columns=columns)
     for col in columns:
         if col not in df.columns: 
-            # 防呆设计：缺失列填入空文本而不是0，防止密码验证报错
             df[col] = "" 
     return df[columns]
 
@@ -91,9 +90,13 @@ df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期') 
 if not df_sales.empty:
     df_sales['订单号'] = df_sales['订单号'].astype(str).replace('0', '历史单').replace('', '历史单').replace('nan', '历史单')
+    # 🚀 历史补丁：如果老数据没有“收银员”，自动补充为“店长/历史”
+    if '收银员' not in df_sales.columns:
+        df_sales['收银员'] = '店长/历史'
+    else:
+        df_sales['收银员'] = df_sales['收银员'].astype(str).replace('0', '店长/历史').replace('', '店长/历史').replace('nan', '店长/历史')
 
 df_employee = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
-# 🚀 给云端旧数据打补丁：老员工默认全部为“在职”，密码为空
 if not df_employee.empty:
     df_employee['状态'] = df_employee['状态'].astype(str).replace('0', '在职').replace('', '在职').replace('nan', '在职')
     df_employee['登录密码'] = df_employee['登录密码'].astype(str).replace('0', '').replace('nan', '')
@@ -120,7 +123,6 @@ def clear_fb(): st.session_state.fb_reset_key += 1
 # ================= 🔐 全新身份验证网关 =================
 manager_password = "taka888"
 
-# 抓取 URL 隐形令牌防掉线
 if "role" not in st.session_state:
     query_role = st.query_params.get("role")
     query_user = st.query_params.get("user")
@@ -138,7 +140,6 @@ if "role" not in st.session_state:
 with st.sidebar:
     st.header("🔐 系统门禁")
     
-    # 判断是否已经登录
     if st.session_state.role is not None:
         user_emoji = "👑" if st.session_state.role == "admin" else "🧑‍💼"
         st.success(f"{user_emoji} 欢迎回来：{st.session_state.current_user}")
@@ -177,7 +178,6 @@ with st.sidebar:
                             st.success("✅ 云端建档成功！")
                             st.rerun()
     
-    # 若未登录，显示登录面板
     else:
         login_type = st.radio("请选择您的身份", ["🧑‍💼 门店店员", "👑 店长/管理员"], horizontal=True)
         
@@ -195,7 +195,6 @@ with st.sidebar:
             if df_employee.empty:
                 st.warning("⚠️ 系统内暂无员工档案。请联系店长添加。")
             else:
-                # 过滤出所有“在职”的员工，离职的直接人间蒸发
                 active_emps = df_employee[df_employee['状态'] != '离职']['员工姓名'].tolist()
                 
                 if not active_emps:
@@ -205,7 +204,6 @@ with st.sidebar:
                     emp_row = df_employee[df_employee['员工姓名'] == emp_sel].iloc[0]
                     emp_pwd = str(emp_row['登录密码']).strip()
                     
-                    # 第一次登录，要求强制设密码
                     if emp_pwd == "":
                         st.info("🌟 系统检测到您是首次登录，请设置专属 PIN 码。")
                         new_pwd = st.text_input("设置我的登录密码", type="password")
@@ -235,14 +233,13 @@ with st.sidebar:
                             else:
                                 st.error("❌ 密码不匹配！")
 
-# 拦截：如果不登录，直接阻断下方所有内容
 if st.session_state.role is None:
     st.title("🏙️ Takashimaya 零售管理系统")
     st.info("👈 请在左侧选择您的身份并完成登录。")
-    st.stop()  # 阻断器，代码在此停止运行
+    st.stop()  
 
 # --- 3. 辅助功能 ---
-q = st.text_input("🔍 快速筛选 (全局搜索)...", placeholder="搜商品/姓名/客户/单号...")
+q = st.text_input("🔍 快速筛选 (全局搜索)...", placeholder="搜商品/收银员/单号/客户...")
 
 def get_f(df, q):
     if q and not df.empty:
@@ -253,9 +250,8 @@ def get_f(df, q):
     return df
 
 # --- 4. 主界面布局 ---
-st.title("🏙️ Takashimaya 零售管理系统")
+st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
 
-# 动态加载 Tab
 if is_admin:
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈", "🧠 战略(BI)"])
 else:
@@ -577,10 +573,13 @@ with t2:
                         order_id = "ORD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
                         order_date = s_d.strftime("%Y/%m/%d")
                         
+                        # 🚀 获取当前正在操作系统的用户名字！
+                        curr_user = st.session_state.get("current_user", "未知员工")
+                        
                         new_rows = []
                         for item in st.session_state.pos_cart:
                             new_rows.append([
-                                order_id, order_date, item['商品名称'], item['颜色'], 
+                                order_id, order_date, curr_user, item['商品名称'], item['颜色'], 
                                 item['数量'], item['单价'], item['小计']
                             ])
                             idx_p = df_stock[(df_stock['商品名称'] == item['商品名称']) & (df_stock['颜色'] == item['颜色'])].index
@@ -597,7 +596,7 @@ with t2:
                         save_data(df_stock, STOCK_SHEET) 
                         
                         st.session_state.pos_cart = []
-                        st.success(f"🎉 结账成功！流水号 {order_id} 已记录，库存已自动扣除。")
+                        st.success(f"🎉 结账成功！流水号 {order_id}，收银员：{curr_user}。库存已扣除。")
                         st.rerun()
                         
     else:
@@ -639,12 +638,13 @@ with t2:
             if st.button("🔄 确认执行换货", type="primary", use_container_width=True):
                 ex_date = ex_date_input.strftime("%Y/%m/%d")
                 ex_order_id = "EXC-" + datetime.now().strftime("%Y%m%d-%H%M%S") 
+                curr_user = st.session_state.get("current_user", "未知员工")
                 
                 idx_ret = df_stock[(df_stock['商品名称'] == ret_row['商品名称']) & (df_stock['颜色'] == ret_row['颜色'])].index[0]
-                s_ret = pd.DataFrame([[ex_order_id, ex_date, df_stock.at[idx_ret,'商品名称'], df_stock.at[idx_ret,'颜色'], -1, ret_p, -1 * ret_p]], columns=SALES_COLS)
+                s_ret = pd.DataFrame([[ex_order_id, ex_date, curr_user, df_stock.at[idx_ret,'商品名称'], df_stock.at[idx_ret,'颜色'], -1, ret_p, -1 * ret_p]], columns=SALES_COLS)
                 
                 idx_new = df_stock[(df_stock['商品名称'] == new_row['商品名称']) & (df_stock['颜色'] == new_row['颜色'])].index[0]
-                s_new = pd.DataFrame([[ex_order_id, ex_date, df_stock.at[idx_new,'商品名称'], df_stock.at[idx_new,'颜色'], 1, new_p, 1 * new_p]], columns=SALES_COLS)
+                s_new = pd.DataFrame([[ex_order_id, ex_date, curr_user, df_stock.at[idx_new,'商品名称'], df_stock.at[idx_new,'颜色'], 1, new_p, 1 * new_p]], columns=SALES_COLS)
                 
                 df_sales = pd.concat([s_new, s_ret, df_sales], ignore_index=True)
                 
@@ -661,7 +661,41 @@ with t2:
                 
                 save_data(df_sales, SALES_SHEET) 
                 save_data(df_stock, STOCK_SHEET) 
-                st.success(f"🎉 换货成功！已按日期 {ex_date} 自动入库/出库，并冲销流水。")
+                st.success(f"🎉 换货成功！收银员：{curr_user}。")
+                st.rerun()
+
+    with st.expander("➕ 补录单件常规销售 (已降级)", expanded=False):
+        if not f_opts.empty:
+            s_l = st.selectbox("选中售出商品", f_opts['label'], key="old_pos")
+            selected_row = f_opts[f_opts['label'] == s_l].iloc[0]
+            base_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
+            
+            c1, c2 = st.columns(2)
+            s_q = c1.number_input("销售数量", min_value=1, value=1, step=1, key="old_qty")
+            discount_opts = {"无折扣 (原价)": 1.0, "95折": 0.95, "9折": 0.90, "85折": 0.85, "8折": 0.80, "75折": 0.75, "7折": 0.70, "5折 (半价)": 0.50}
+            s_discount = c2.selectbox("快捷折扣", list(discount_opts.keys()), key="old_disc")
+            
+            auto_calc_price = base_price * discount_opts[s_discount]
+            
+            c3, c4 = st.columns(2)
+            s_p = c3.number_input("最终成交单价 ($)", value=float(auto_calc_price), format="%.2f", key="old_price")
+            s_d = c4.date_input("交易日期", value=datetime.now(), key="old_date")
+            
+            if st.button("✅ 确认记录单笔销售", type="primary", use_container_width=True):
+                curr_user = st.session_state.get("current_user", "未知员工")
+                order_id = "ORD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+                
+                idx_p = df_stock[(df_stock['商品名称'] == selected_row['商品名称']) & (df_stock['颜色'] == selected_row['颜色'])].index[0]
+                new_s = pd.DataFrame([[order_id, s_d.strftime("%Y/%m/%d"), curr_user, df_stock.at[idx_p,'商品名称'], df_stock.at[idx_p,'颜色'], s_q, s_p, s_q*s_p]], columns=SALES_COLS)
+                df_sales = pd.concat([new_s, df_sales], ignore_index=True)
+                
+                df_stock.at[idx_p, '货柜数量'] = int(pd.to_numeric(df_stock.at[idx_p, '货柜数量'], errors='coerce') or 0) - s_q
+                df_stock.at[idx_p, '已售出数量'] = int(pd.to_numeric(df_stock.at[idx_p, '已售出数量'], errors='coerce') or 0) + s_q
+                df_stock.at[idx_p, '总库存'] = sum([int(pd.to_numeric(df_stock.at[idx_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                
+                save_data(df_sales, SALES_SHEET) 
+                save_data(df_stock, STOCK_SHEET) 
+                st.success(f"🎉 成功记录流水：{selected_row['商品名称']} x{s_q}件，收银员：{curr_user}。")
                 st.rerun()
 
     st.divider()
@@ -874,7 +908,6 @@ if is_admin:
                     if e_name.strip() == "": st.warning("⚠️ 员工姓名不能为空！")
                     elif e_name in df_employee['员工姓名'].values: st.warning(f"⚠️ 员工 {e_name} 已经存在！")
                     else:
-                        # 🚀 新增员工默认状态为"在职"，密码为空（等他自己首登去设）
                         new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d"), "", "在职"]], columns=EMP_COLS)
                         df_employee = pd.concat([df_employee, new_emp], ignore_index=True)
                         save_data(df_employee, EMP_SHEET) 
@@ -889,7 +922,6 @@ if is_admin:
             v_emp['时薪'] = pd.to_numeric(v_emp['时薪'], errors='coerce').fillna(0.0)
             styled_emp = v_emp.style.format({'时薪': '${:.2f}'})
             
-            # 🚀 权限核心：店长可以直接在这里下拉改离职，或者清空密码框重置密码
             editor_key = f"emp_editor_{st.session_state.emp_reset_key}"
             edited_emp = st.data_editor(
                 styled_emp, 
