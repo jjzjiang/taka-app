@@ -23,6 +23,7 @@ ATT_SHEET = "Attendance"
 B2B_SHEET = "B2B_Orders" 
 FEEDBACK_SHEET = "Feedback"
 RESTOCK_SHEET = "Restock_Log"
+TRAFFIC_SHEET = "Traffic_Log" # 🚀 新增：客流日记表
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
@@ -31,11 +32,12 @@ ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
 RESTOCK_COLS = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '单件成本', '备注']
+TRAFFIC_COLS = ['日期', '有效客流'] # 🚀 客流表头
 
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {
         STOCK_SHEET: 0, SALES_SHEET: 0, EMP_SHEET: 0,
-        ATT_SHEET: 0, B2B_SHEET: 0, FEEDBACK_SHEET: 0, RESTOCK_SHEET: 0
+        ATT_SHEET: 0, B2B_SHEET: 0, FEEDBACK_SHEET: 0, RESTOCK_SHEET: 0, TRAFFIC_SHEET: 0
     }
 
 if "pos_cart" not in st.session_state:
@@ -81,7 +83,6 @@ def clean_date_col(df, col_name):
         df[col_name] = formatted.fillna(df[col_name])
     return df
 
-# 🚀 极限防并发：数据预处理隔离器
 def load_safe_sales():
     df = clean_date_col(load_data(SALES_SHEET, SALES_COLS), '日期')
     if not df.empty:
@@ -99,9 +100,8 @@ def load_safe_emp():
         df['登录密码'] = df['登录密码'].astype(str).replace('0', '').replace('nan', '')
     return df
 
-# 🚀 极限防并发：JIT (Just-In-Time) 瞬间数据拉取器
 def JIT_fetch(sheets_to_fetch):
-    st.cache_data.clear() # 斩断所有老旧缓存，强制连线 Google
+    st.cache_data.clear() 
     res = {}
     if STOCK_SHEET in sheets_to_fetch: res[STOCK_SHEET] = load_data(STOCK_SHEET, STOCK_COLS)
     if SALES_SHEET in sheets_to_fetch: res[SALES_SHEET] = load_safe_sales()
@@ -110,13 +110,13 @@ def JIT_fetch(sheets_to_fetch):
     if FEEDBACK_SHEET in sheets_to_fetch: res[FEEDBACK_SHEET] = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
     if EMP_SHEET in sheets_to_fetch: res[EMP_SHEET] = load_safe_emp()
     if ATT_SHEET in sheets_to_fetch: res[ATT_SHEET] = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
+    if TRAFFIC_SHEET in sheets_to_fetch: res[TRAFFIC_SHEET] = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
     return res
 
 @st.cache_data(show_spinner=False)
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8-sig')
 
-# 常规页面显示用的读取 (读操作用缓存没问题，能加快网页速度)
 df_stock = load_data(STOCK_SHEET, STOCK_COLS)
 df_sales = load_safe_sales()
 df_employee = load_safe_emp()
@@ -124,6 +124,7 @@ df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
 df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
 df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
 df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期')
+df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -183,7 +184,6 @@ with st.sidebar:
                     n_disp, n_shelf, n_stor, n_dmg = i1.number_input("展示"), i2.number_input("货柜"), i3.number_input("储物"), i4.number_input("坏货")
                     if st.form_submit_button("确认建档"):
                         if n_name and n_color:
-                            # 🚀 写操作：必须先拉取最新数据
                             fresh = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
                             latest_stock = fresh[STOCK_SHEET]
                             latest_restock = fresh[RESTOCK_SHEET]
@@ -235,7 +235,6 @@ with st.sidebar:
                             if new_pwd.strip() == "":
                                 st.warning("密码不能为空哦！")
                             else:
-                                # 🚀 写操作：必须先拉取最新员工表
                                 fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
                                 idx = fresh_emp[fresh_emp['员工姓名'] == emp_sel].index[0]
                                 fresh_emp.at[idx, '登录密码'] = new_pwd
@@ -618,7 +617,6 @@ with t2:
                         st.rerun()
                         
                     if st.button("💳 确认结账 (生成流水)", type="primary", use_container_width=True):
-                        # 🚀 JIT：结账的瞬间，强制清空缓存获取最新云端数据
                         fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
                         latest_stock = fresh[STOCK_SHEET]
                         latest_sales = fresh[SALES_SHEET]
@@ -633,7 +631,6 @@ with t2:
                                 order_id, order_date, curr_user, item['商品名称'], item['颜色'], 
                                 item['数量'], item['单价'], item['小计']
                             ])
-                            # 使用最新拉取的库存表进行计算
                             idx_p = latest_stock[(latest_stock['商品名称'] == item['商品名称']) & (latest_stock['颜色'] == item['颜色'])].index
                             if not idx_p.empty:
                                 i_p = idx_p[0]
@@ -654,6 +651,33 @@ with t2:
     else:
         st.info("请先在库存中添加商品。")
 
+    st.divider()
+    
+    # 🚀 核心升级 2：客流打卡入口 (不管店长还是店员都能录)
+    with st.expander("🚶‍♂️ 录入/修正每日有效客流 (闭店前打卡)", expanded=False):
+        st.info("💡 只有真正驻足、咨询、体验材质的潜客才算入有效客流，以此计算漏斗最准确！如果录入错误，直接选择那一天重新填入正确数字覆盖即可。")
+        with st.form("traffic_form"):
+            tc1, tc2 = st.columns(2)
+            tr_date = tc1.date_input("📅 客流日期", value=datetime.now())
+            tr_num = tc2.number_input("👁️ 有效咨询/看货人数", min_value=0, step=1, value=0)
+            
+            if st.form_submit_button("💾 保存今日客流数据", type="primary", use_container_width=True):
+                fresh_traffic = JIT_fetch([TRAFFIC_SHEET])[TRAFFIC_SHEET]
+                tr_date_str = tr_date.strftime("%Y/%m/%d")
+                
+                idx = fresh_traffic[fresh_traffic['日期'] == tr_date_str].index
+                if not idx.empty:
+                    # 如果有当天的记录，直接覆盖修改
+                    fresh_traffic.at[idx[0], '有效客流'] = tr_num
+                else:
+                    # 如果是新的一天，增加一行
+                    new_row = pd.DataFrame([[tr_date_str, tr_num]], columns=TRAFFIC_COLS)
+                    fresh_traffic = pd.concat([new_row, fresh_traffic], ignore_index=True)
+                
+                save_data(fresh_traffic, TRAFFIC_SHEET)
+                st.success(f"✅ {tr_date_str} 的有效客流已成功更新为 {tr_num} 人！请去 Tab 3 查看转化率。")
+                st.rerun()
+
     with st.expander("🔄 客户换货处理 (Exchange)", expanded=False):
         if not f_opts.empty:
             xc1, xc2 = st.columns(2)
@@ -662,7 +686,7 @@ with t2:
                 ex_ret_l = st.selectbox("1. 选择退回的商品", f_opts['label'], key="ex_ret_sku")
                 ret_row = f_opts[f_opts['label'] == ex_ret_l].iloc[0]
                 ret_base_p = float(pd.to_numeric(ret_row['售卖价格'], errors='coerce') or 0)
-                ret_p = st.number_input("2. 当时成交单价 (退款额 $)", value=ret_base_p, format="%.2f", help="客人当时买这个杯子花了多少钱？")
+                ret_p = st.number_input("2. 当时成交单价 (退款额 $)", value=ret_base_p, format="%.2f")
                 ret_dmg = st.checkbox("⚠️ 退回商品有瑕疵 (记入坏货库，不回上架)", value=False)
 
             with xc2:
@@ -688,7 +712,6 @@ with t2:
                     st.info("🤝 **等价交换：无需补退差价**")
 
             if st.button("🔄 确认执行换货", type="primary", use_container_width=True):
-                # 🚀 JIT 防并发
                 fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
                 latest_stock = fresh[STOCK_SHEET]
                 latest_sales = fresh[SALES_SHEET]
@@ -844,7 +867,6 @@ with t2:
                                 latest_stock.at[n_idx, '已售出数量'] = int(pd.to_numeric(latest_stock.at[n_idx, '已售出数量'], errors='coerce') or 0) + new_qty
                                 latest_stock.at[n_idx, '总库存'] = sum([int(pd.to_numeric(latest_stock.at[n_idx, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
                             
-                            # 找出在最新云端流水表中的对应行进行修改
                             orig_order = df_sales.at[orig_idx, '订单号']
                             orig_date = df_sales.at[orig_idx, '日期']
                             
@@ -883,7 +905,7 @@ with t2:
 # ================= 🚀 以下所有高级 Tab 只有店长能看 =================
 if is_admin:
     with t3:
-        st.subheader("📊 财务与客流报表 (含连带率分析)")
+        st.subheader("📊 财务与客流报表 (含漏斗分析)")
         if not df_sales.empty:
             df_sales['日期_dt'] = pd.to_datetime(df_sales['日期'], errors='coerce')
             df_sales_clean = df_sales.dropna(subset=['日期_dt']).copy()
@@ -909,6 +931,16 @@ if is_admin:
                     legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
                     total_order_count = order_count + len(legacy_orders)
                     
+                    # 🚀 核心升级 3：客流与转化率核算
+                    df_traffic_clean = df_traffic.copy()
+                    if not df_traffic_clean.empty:
+                        df_traffic_clean['日期_dt'] = pd.to_datetime(df_traffic_clean['日期'], errors='coerce')
+                        f_traffic_range = df_traffic_clean[(df_traffic_clean['日期_dt'] >= pd.Timestamp(start)) & (df_traffic_clean['日期_dt'] <= pd.Timestamp(end))]
+                        total_traffic = pd.to_numeric(f_traffic_range['有效客流'], errors='coerce').fillna(0).sum()
+                    else:
+                        total_traffic = 0
+                        
+                    conv_rate = (total_order_count / total_traffic * 100) if total_traffic > 0 else 0.0
                     acv = tot_rev / total_order_count if total_order_count > 0 else 0
                     upt = tot_items / total_order_count if total_order_count > 0 else 0
                     
@@ -930,12 +962,18 @@ if is_admin:
                     if not filtered_summ.empty:
                         delta_days = (end - start).days + 1
                         
-                        st.markdown("### 🏬 门店核心客流漏斗")
-                        m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("总营业额", f"${tot_rev:.2f}")
-                        m2.metric("💳 交易单数 (客流)", f"{total_order_count} 单", help="包含多件合并的新系统订单以及过往的历史单行数")
-                        m3.metric("🛒 平均客单价 (ACV)", f"${acv:.2f}", help="平均每个结账的客人花多少钱 (总营收/总单数)")
-                        m4.metric("🛍️ 连带率 (UPT)", f"{upt:.2f} 件/单", help="平均每个客人一次买走几件东西 (总件数/总单数)")
+                        st.markdown("### 🏬 门店核心客流漏斗矩阵")
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("👁️ 有效总客流", f"{int(total_traffic)} 人", help="驻足停留、体验材质的真实潜客")
+                        m2.metric("💳 交易单数", f"{total_order_count} 单", help="最终掏钱买单的独立笔数")
+                        m3.metric("🔄 购买转化率", f"{conv_rate:.1f}%", help="交易单数 ÷ 有效总客流")
+                        
+                        st.divider()
+                        
+                        m4, m5, m6 = st.columns(3)
+                        m4.metric("💰 总营业额", f"${tot_rev:.2f}")
+                        m5.metric("🛒 平均客单价 (ACV)", f"${acv:.2f}", help="平均每个买单的客人花多少钱 (总营收 ÷ 总单数)")
+                        m6.metric("🛍️ 连带率 (UPT)", f"{upt:.2f} 件/单", help="平均每个客人一次买走几件东西 (总件数 ÷ 总单数)")
                         
                         st.divider()
                         
