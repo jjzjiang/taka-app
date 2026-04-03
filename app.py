@@ -23,7 +23,7 @@ ATT_SHEET = "Attendance"
 B2B_SHEET = "B2B_Orders" 
 FEEDBACK_SHEET = "Feedback"
 RESTOCK_SHEET = "Restock_Log"
-TRAFFIC_SHEET = "Traffic_Log" # 🚀 新增：客流日记表
+TRAFFIC_SHEET = "Traffic_Log"
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
@@ -32,7 +32,7 @@ ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
 RESTOCK_COLS = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '单件成本', '备注']
-TRAFFIC_COLS = ['日期', '有效客流'] # 🚀 客流表头
+TRAFFIC_COLS = ['日期', '有效客流']
 
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {
@@ -140,7 +140,6 @@ def clear_att(): st.session_state.att_reset_key += 1
 def clear_b2b(): st.session_state.b2b_reset_key += 1
 def clear_fb(): st.session_state.fb_reset_key += 1
 
-# ================= 🔐 全新身份验证网关 =================
 manager_password = "taka888"
 
 if "role" not in st.session_state:
@@ -653,7 +652,6 @@ with t2:
 
     st.divider()
     
-    # 🚀 核心升级 2：客流打卡入口 (不管店长还是店员都能录)
     with st.expander("🚶‍♂️ 录入/修正每日有效客流 (闭店前打卡)", expanded=False):
         st.info("💡 只有真正驻足、咨询、体验材质的潜客才算入有效客流，以此计算漏斗最准确！如果录入错误，直接选择那一天重新填入正确数字覆盖即可。")
         with st.form("traffic_form"):
@@ -667,10 +665,8 @@ with t2:
                 
                 idx = fresh_traffic[fresh_traffic['日期'] == tr_date_str].index
                 if not idx.empty:
-                    # 如果有当天的记录，直接覆盖修改
                     fresh_traffic.at[idx[0], '有效客流'] = tr_num
                 else:
-                    # 如果是新的一天，增加一行
                     new_row = pd.DataFrame([[tr_date_str, tr_num]], columns=TRAFFIC_COLS)
                     fresh_traffic = pd.concat([new_row, fresh_traffic], ignore_index=True)
                 
@@ -919,69 +915,71 @@ if is_admin:
                     f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
                     f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
                     
-                    tot_rev = f_sales_range['总营业额'].sum()
-                    tot_items = f_sales_range['销售数量'].sum()
-                    
-                    valid_orders = f_sales_range[
-                        (~f_sales_range['订单号'].str.contains('历史单', na=False)) & 
-                        (~f_sales_range['订单号'].str.contains('EXC-', na=False))
-                    ]
-                    order_count = valid_orders['订单号'].nunique()
-                    
-                    legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
-                    total_order_count = order_count + len(legacy_orders)
-                    
-                    # 🚀 核心升级 3：客流与转化率核算
-                    df_traffic_clean = df_traffic.copy()
-                    if not df_traffic_clean.empty:
-                        df_traffic_clean['日期_dt'] = pd.to_datetime(df_traffic_clean['日期'], errors='coerce')
-                        f_traffic_range = df_traffic_clean[(df_traffic_clean['日期_dt'] >= pd.Timestamp(start)) & (df_traffic_clean['日期_dt'] <= pd.Timestamp(end))]
-                        total_traffic = pd.to_numeric(f_traffic_range['有效客流'], errors='coerce').fillna(0).sum()
-                    else:
-                        total_traffic = 0
-                        
-                    conv_rate = (total_order_count / total_traffic * 100) if total_traffic > 0 else 0.0
-                    acv = tot_rev / total_order_count if total_order_count > 0 else 0
-                    upt = tot_items / total_order_count if total_order_count > 0 else 0
-                    
-                    period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
-                    if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m/%d')
-                    elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
-                    else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m')
-                    
-                    summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum'}).reset_index()
-                    
+                    # 🚀 提前合并进价成本，算出每一行的毛利
                     df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
                     df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
+                    f_sales_range = f_sales_range.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
+                    f_sales_range['具体毛利'] = f_sales_range['总营业额'] - (f_sales_range['销售数量'] * f_sales_range['进价成本'])
                     
-                    summ = summ.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
-                    summ['具体毛利'] = summ['总营业额'] - (summ['销售数量'] * summ['进价成本'])
+                    # 🚀 核心升级 4：在这里应用全局搜索！过滤出特定SKU或特定员工的流水
+                    f_sales_range = get_f(f_sales_range, q)
                     
-                    filtered_summ = get_f(summ, q) 
-                    
-                    if not filtered_summ.empty:
+                    if not f_sales_range.empty:
+                        tot_rev = f_sales_range['总营业额'].sum()
+                        tot_items = f_sales_range['销售数量'].sum()
+                        tot_margin = f_sales_range['具体毛利'].sum()
+                        
+                        valid_orders = f_sales_range[
+                            (~f_sales_range['订单号'].str.contains('历史单', na=False)) & 
+                            (~f_sales_range['订单号'].str.contains('EXC-', na=False))
+                        ]
+                        order_count = valid_orders['订单号'].nunique()
+                        
+                        legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
+                        total_order_count = order_count + len(legacy_orders)
+                        
+                        # 客流保持全局不变 (搜特定杯子时，客流依然是全店的)
+                        df_traffic_clean = df_traffic.copy()
+                        if not df_traffic_clean.empty:
+                            df_traffic_clean['日期_dt'] = pd.to_datetime(df_traffic_clean['日期'], errors='coerce')
+                            f_traffic_range = df_traffic_clean[(df_traffic_clean['日期_dt'] >= pd.Timestamp(start)) & (df_traffic_clean['日期_dt'] <= pd.Timestamp(end))]
+                            total_traffic = pd.to_numeric(f_traffic_range['有效客流'], errors='coerce').fillna(0).sum()
+                        else:
+                            total_traffic = 0
+                            
+                        conv_rate = (total_order_count / total_traffic * 100) if total_traffic > 0 else 0.0
+                        acv = tot_rev / total_order_count if total_order_count > 0 else 0
+                        upt = tot_items / total_order_count if total_order_count > 0 else 0
+                        
+                        period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
+                        if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m/%d')
+                        elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
+                        else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m')
+                        
+                        summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum', '具体毛利':'sum'}).reset_index()
+                        
                         delta_days = (end - start).days + 1
                         
-                        st.markdown("### 🏬 门店核心客流漏斗矩阵")
+                        st.markdown(f"### 🏬 核心客流漏斗矩阵 {f'(已过滤: {q})' if q else ''}")
                         m1, m2, m3 = st.columns(3)
-                        m1.metric("👁️ 有效总客流", f"{int(total_traffic)} 人", help="驻足停留、体验材质的真实潜客")
-                        m2.metric("💳 交易单数", f"{total_order_count} 单", help="最终掏钱买单的独立笔数")
-                        m3.metric("🔄 购买转化率", f"{conv_rate:.1f}%", help="交易单数 ÷ 有效总客流")
+                        m1.metric("👁️ 有效总客流 (全店)", f"{int(total_traffic)} 人", help="驻足停留、体验材质的真实潜客（全店客流不受商品搜索影响）")
+                        m2.metric("💳 交易单数", f"{total_order_count} 单", help="包含该商品的独立订单数")
+                        m3.metric("🔄 购买转化率", f"{conv_rate:.1f}%", help="交易单数 ÷ 有效总客流 (搜单品时此为该商品的进店购买率)")
                         
                         st.divider()
                         
                         m4, m5, m6 = st.columns(3)
                         m4.metric("💰 总营业额", f"${tot_rev:.2f}")
-                        m5.metric("🛒 平均客单价 (ACV)", f"${acv:.2f}", help="平均每个买单的客人花多少钱 (总营收 ÷ 总单数)")
-                        m6.metric("🛍️ 连带率 (UPT)", f"{upt:.2f} 件/单", help="平均每个客人一次买走几件东西 (总件数 ÷ 总单数)")
+                        m5.metric("🛒 平均客单价 (ACV)", f"${acv:.2f}", help="包含该商品的订单平均贡献金额")
+                        m6.metric("🛍️ 连带率 (UPT)", f"{upt:.2f} 件/单", help="包含该商品的订单平均购买件数")
                         
                         st.divider()
                         
                         c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("具体毛利", f"${filtered_summ['具体毛利'].sum():.2f}")
+                        c1.metric("具体毛利", f"${tot_margin:.2f}")
                         c2.metric("总售出件数", f"{int(tot_items)} 件")
                         
-                        avg_m = filtered_summ['具体毛利'].sum() / tot_rev * 100 if tot_rev > 0 else 0
+                        avg_m = tot_margin / tot_rev * 100 if tot_rev > 0 else 0
                         c3.metric("平均毛利率", f"{avg_m:.1f}%")
                         
                         avg_daily = tot_rev / delta_days if delta_days > 0 else 0
@@ -989,12 +987,12 @@ if is_admin:
                         
                         st.divider()
                         st.markdown("### 📈 营收与毛利走势")
-                        chart_data_t3 = filtered_summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
+                        chart_data_t3 = summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
                         st.bar_chart(chart_data_t3, use_container_width=True)
 
                         dl_c1, dl_c2 = st.columns([1, 4])
                         with dl_c1:
-                            csv_t3 = convert_df_to_csv(filtered_summ)
+                            csv_t3 = convert_df_to_csv(summ)
                             st.download_button(
                                 label="⬇️ 一键导出毛利报表 (CSV)",
                                 data=csv_t3,
@@ -1003,7 +1001,7 @@ if is_admin:
                                 type="primary"
                             )
                         
-                        st.dataframe(filtered_summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+                        st.dataframe(summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
                     else:
                         st.info("💡 在选定时间段内没有找到符合搜索条件的销售记录。")
             else:
