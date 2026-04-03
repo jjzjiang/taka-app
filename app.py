@@ -1609,9 +1609,10 @@ if is_admin:
         else:
             st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
+    # ================= 🚀 核心大改：Tab 8 战略矩阵重构 =================
     with t8:
-        st.subheader("📈 选品与战略决策盘 (SKU 矩阵分析)")
-        st.info("💡 系统根据你的两把尺子（3天至少卖1个 = 热销，30天卖不出5个 = 积压），自动为你诊断商品健康度，定位真实爆款与利润陷阱。")
+        st.subheader("📈 选品与战略决策盘 (零售 2.0 矩阵)")
+        st.info("💡 告别文字焦虑！系统已升级为顶级零售常用的『波士顿四象限 + ABC营收贡献 + 交通灯风控』模型，一秒看穿资金流向。")
         
         c_launch, _ = st.columns([1, 3])
         launch_date = c_launch.date_input("🏬 快闪店/专柜开业日期 (基准起算日)", value=datetime(2026, 3, 4).date())
@@ -1634,6 +1635,9 @@ if is_admin:
             bi_df = pd.merge(df_stk_bi, bi_sales, on=['商品名称', '颜色'], how='left')
             bi_df['销售数量'] = bi_df['销售数量'].fillna(0)
             bi_df['总营业额'] = bi_df['总营业额'].fillna(0.0)
+            
+            # 🚀 算算你在这个杯子上压了多少钱的货 (气泡大小)
+            bi_df['压货金额'] = bi_df['总库存'] * bi_df['进价成本']
 
             if not df_restock.empty:
                 first_restock = df_restock[df_restock['操作类型'].isin(['入库', '初始建档'])].groupby(['商品名称', '颜色'])['记录日期'].min().reset_index()
@@ -1656,58 +1660,68 @@ if is_admin:
             bi_df['总进价成本'] = bi_df['销售数量'] * bi_df['进价成本']
             bi_df['具体毛利'] = bi_df['总营业额'] - bi_df['总进价成本']
             bi_df['毛利率(%)'] = (bi_df['具体毛利'] / bi_df['总营业额'] * 100).fillna(0.0)
-            
-            bi_df['售罄率(%)'] = (bi_df['销售数量'] / (bi_df['销售数量'] + bi_df['总库存']) * 100).fillna(0.0)
 
             def calc_cover(row):
                 if row['日均动销率'] > 0:
                     return int(row['总库存'] / row['日均动销率'])
                 return 999 
             bi_df['可售天数'] = bi_df.apply(calc_cover, axis=1)
-
-            active_skus = bi_df[bi_df['销售数量'] > 0]
-            med_mar = active_skus['毛利率(%)'].median() if not active_skus.empty else 0.1
-
-            # 🚀 核心升级 5：引入真正的波士顿矩阵绝对阀值
-            def get_tag(row):
-                vel = row['日均动销率']
-                mar = row['毛利率(%)']
-                stock = row['总库存']
+            
+            # 🚀 核心：ABC 帕累托分类 (按总营业额贡献排)
+            bi_df = bi_df.sort_values(by='总营业额', ascending=False)
+            total_revenue = bi_df['总营业额'].sum()
+            bi_df['累计营收占比'] = bi_df['总营业额'].cumsum() / total_revenue if total_revenue > 0 else 0
+            
+            def get_abc(pct):
+                if pct <= 0.7: return "👑 A类 (核心70%业绩)"
+                elif pct <= 0.9: return "🌟 B类 (中坚20%业绩)"
+                else: return "📦 C类 (尾部10%业绩)"
+            bi_df['ABC等级'] = bi_df['累计营收占比'].apply(get_abc)
+            
+            # 🚀 核心：红绿灯风控系统
+            def get_health_light(row):
                 cover = row['可售天数']
+                stock = row['总库存']
+                if stock == 0 and row['销售数量'] > 0: return "⚫ 彻底断货 (流血中)"
+                elif cover <= 7 and stock > 0: return "🔴 濒临断货 (<7天)"
+                elif cover > 60 and stock > 0: return "🔴 严重积压 (>60天)"
+                elif 30 < cover <= 60: return "🟡 偏高预警 (30-60天)"
+                elif 7 < cover <= 15: return "🟡 偏低预警 (7-15天)"
+                else: return "🟢 健康周转 (15-30天)"
+            bi_df['库存风控灯'] = bi_df.apply(get_health_light, axis=1)
 
-                if stock <= 2 and row['销售数量'] > 0 and cover <= 7:
-                    return "🚨 爆款流血断货 (紧急空运)"
-                elif vel < 0.167 and cover > 30 and stock > 0:
-                    return "📦 严重积压套牢 (清仓警报)"
-                elif vel >= 0.33 and mar >= med_mar:
-                    return "⭐ 绝对明星 (死保库存)"
-                elif vel >= 0.33 and mar < med_mar:
-                    return "🧲 引流走量款 (交个朋友)"
-                elif vel < 0.167 and mar >= med_mar:
-                    return "🐢 利润陷阱 (伪需求占压资金)"
-                elif vel < 0.167 and mar < med_mar:
-                    return "☠️ 清仓废柴 (果断斩仓)"
-                else:
-                    return "🚶 平庸常规款 (建议优化组合)"
-
-            bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
             bi_df['商品规格'] = bi_df['商品名称'].fillna('').astype(str) + " (" + bi_df['颜色'].fillna('').astype(str) + ")"
             
-            st.markdown("### 🎯 动销率 vs 盈利能力 雷达图")
+            # 顶部统计卡片
+            a_count = len(bi_df[bi_df['ABC等级'].str.contains('A类')])
+            dead_stock_val = bi_df[bi_df['库存风控灯'].str.contains('严重积压')]['压货金额'].sum()
+            
+            bc1, bc2 = st.columns(2)
+            bc1.metric("👑 A类核心尖子生数量", f"{a_count} 款", help="这几个款式扛起了全店 70% 的营业额，店长必须每天死盯它们的库存！")
+            bc2.metric("🔴 严重积压资金 (>60天卖不掉)", f"${dead_stock_val:.2f}", help="必须立刻做活动清仓换现金的坏死资产！", delta_color="inverse")
+            
+            st.divider()
+            
+            st.markdown("### 🎯 战略波士顿矩阵 (右上角为神，左下角为坑)")
+            st.info("💡 横轴看销量，纵轴看毛利。泡泡的颜色代表它的业绩等级，**泡泡越大，说明压的钱越多！**")
+            
+            # 使用更强大的 scatter_chart，支持 size 传入
             st.scatter_chart(
                 bi_df,
                 x='日均动销率',
                 y='毛利率(%)',
-                color='诊断标签',
-                height=400
+                color='ABC等级',
+                size='压货金额',
+                height=450
             )
             
-            st.markdown("### 📋 智能选品行动指南表")
+            st.markdown("### 📋 全景库存风控表")
             
-            display_bi_df = bi_df[['商品规格', '诊断标签', '日均动销率', '毛利率(%)', '可售天数', '总库存', '总营业额']].sort_values(by=['诊断标签', '日均动销率'], ascending=[True, False])
+            display_bi_df = bi_df[['商品规格', 'ABC等级', '库存风控灯', '日均动销率', '毛利率(%)', '总营业额', '可售天数', '总库存', '压货金额']]
             
             styled_bi = display_bi_df.style.format({
                 '总营业额': '${:.2f}', 
+                '压货金额': '${:.2f}',
                 '日均动销率': '{:.2f} 件/天',
                 '毛利率(%)': '{:.1f}%',
                 '可售天数': lambda x: '> 半年' if x == 999 else f"{x} 天"
