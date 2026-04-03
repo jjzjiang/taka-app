@@ -915,13 +915,11 @@ if is_admin:
                     f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
                     f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
                     
-                    # 🚀 提前合并进价成本，算出每一行的毛利
                     df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
                     df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
                     f_sales_range = f_sales_range.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
                     f_sales_range['具体毛利'] = f_sales_range['总营业额'] - (f_sales_range['销售数量'] * f_sales_range['进价成本'])
                     
-                    # 🚀 核心升级 4：在这里应用全局搜索！过滤出特定SKU或特定员工的流水
                     f_sales_range = get_f(f_sales_range, q)
                     
                     if not f_sales_range.empty:
@@ -938,7 +936,6 @@ if is_admin:
                         legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
                         total_order_count = order_count + len(legacy_orders)
                         
-                        # 客流保持全局不变 (搜特定杯子时，客流依然是全店的)
                         df_traffic_clean = df_traffic.copy()
                         if not df_traffic_clean.empty:
                             df_traffic_clean['日期_dt'] = pd.to_datetime(df_traffic_clean['日期'], errors='coerce')
@@ -1614,7 +1611,7 @@ if is_admin:
 
     with t8:
         st.subheader("📈 选品与战略决策盘 (SKU 矩阵分析)")
-        st.info("💡 系统基于全局时间加权动销率和库存深度，自动为你诊断商品健康度，拒绝纸面富贵，定位真实爆款。")
+        st.info("💡 系统根据你的两把尺子（3天至少卖1个 = 热销，30天卖不出5个 = 积压），自动为你诊断商品健康度，定位真实爆款与利润陷阱。")
         
         c_launch, _ = st.columns([1, 3])
         launch_date = c_launch.date_input("🏬 快闪店/专柜开业日期 (基准起算日)", value=datetime(2026, 3, 4).date())
@@ -1669,23 +1666,29 @@ if is_admin:
             bi_df['可售天数'] = bi_df.apply(calc_cover, axis=1)
 
             active_skus = bi_df[bi_df['销售数量'] > 0]
-            if not active_skus.empty:
-                med_vel = active_skus['日均动销率'].median()
-                med_mar = active_skus['毛利率(%)'].median()
-            else:
-                med_vel, med_mar = 0.1, 0.1
+            med_mar = active_skus['毛利率(%)'].median() if not active_skus.empty else 0.1
 
+            # 🚀 核心升级 5：引入真正的波士顿矩阵绝对阀值
             def get_tag(row):
-                if row['总库存'] <= 2 and row['售罄率(%)'] >= 80 and row['销售数量'] > 0:
-                    return "🔥 秒空断货王 (低估需求)"
-                elif row['日均动销率'] >= med_vel and row['毛利率(%)'] >= med_mar:
+                vel = row['日均动销率']
+                mar = row['毛利率(%)']
+                stock = row['总库存']
+                cover = row['可售天数']
+
+                if stock <= 2 and row['销售数量'] > 0 and cover <= 7:
+                    return "🚨 爆款流血断货 (紧急空运)"
+                elif vel < 0.167 and cover > 30 and stock > 0:
+                    return "📦 严重积压套牢 (清仓警报)"
+                elif vel >= 0.33 and mar >= med_mar:
                     return "⭐ 绝对明星 (死保库存)"
-                elif row['日均动销率'] >= med_vel and row['毛利率(%)'] < med_mar:
-                    return "🧲 赚吆喝引流款 (建议搭配)"
-                elif row['日均动销率'] < med_vel and row['毛利率(%)'] >= med_mar:
-                    return "🐢 伪需求高利款 (占压资金)"
-                else:
+                elif vel >= 0.33 and mar < med_mar:
+                    return "🧲 引流走量款 (交个朋友)"
+                elif vel < 0.167 and mar >= med_mar:
+                    return "🐢 利润陷阱 (伪需求占压资金)"
+                elif vel < 0.167 and mar < med_mar:
                     return "☠️ 清仓废柴 (果断斩仓)"
+                else:
+                    return "🚶 平庸常规款 (建议优化组合)"
 
             bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
             bi_df['商品规格'] = bi_df['商品名称'].fillna('').astype(str) + " (" + bi_df['颜色'].fillna('').astype(str) + ")"
