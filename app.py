@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, time
 import gspread 
 from gspread.exceptions import WorksheetNotFound
 import json
+import plotly.express as px  # 🚀 新增：引入专业级交互绘图引擎
 
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
@@ -1609,10 +1610,10 @@ if is_admin:
         else:
             st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
-    # ================= 🚀 核心大改：Tab 8 战略矩阵重构 =================
+    # ================= 🚀 核心大改：Tab 8 战略矩阵重构 (引入 Plotly 交互引擎) =================
     with t8:
-        st.subheader("📈 选品与战略决策盘 (零售 2.0 矩阵)")
-        st.info("💡 告别文字焦虑！系统已升级为顶级零售常用的『波士顿四象限 + ABC营收贡献 + 交通灯风控』模型，一秒看穿资金流向。")
+        st.subheader("📈 选品与战略决策盘 (交互级视觉矩阵)")
+        st.info("💡 这是一个企业级 BI 罗盘。泡泡位置代表表现，颜色代表阵营，面积代表你被套牢的资金！鼠标悬停在泡泡上可进行极限透视。")
         
         c_launch, _ = st.columns([1, 3])
         launch_date = c_launch.date_input("🏬 快闪店/专柜开业日期 (基准起算日)", value=datetime(2026, 3, 4).date())
@@ -1636,7 +1637,6 @@ if is_admin:
             bi_df['销售数量'] = bi_df['销售数量'].fillna(0)
             bi_df['总营业额'] = bi_df['总营业额'].fillna(0.0)
             
-            # 🚀 算算你在这个杯子上压了多少钱的货 (气泡大小)
             bi_df['压货金额'] = bi_df['总库存'] * bi_df['进价成本']
 
             if not df_restock.empty:
@@ -1667,7 +1667,6 @@ if is_admin:
                 return 999 
             bi_df['可售天数'] = bi_df.apply(calc_cover, axis=1)
             
-            # 🚀 核心：ABC 帕累托分类 (按总营业额贡献排)
             bi_df = bi_df.sort_values(by='总营业额', ascending=False)
             total_revenue = bi_df['总营业额'].sum()
             bi_df['累计营收占比'] = bi_df['总营业额'].cumsum() / total_revenue if total_revenue > 0 else 0
@@ -1678,7 +1677,6 @@ if is_admin:
                 else: return "📦 C类 (尾部10%业绩)"
             bi_df['ABC等级'] = bi_df['累计营收占比'].apply(get_abc)
             
-            # 🚀 核心：红绿灯风控系统
             def get_health_light(row):
                 cover = row['可售天数']
                 stock = row['总库存']
@@ -1690,9 +1688,29 @@ if is_admin:
                 else: return "🟢 健康周转 (15-30天)"
             bi_df['库存风控灯'] = bi_df.apply(get_health_light, axis=1)
 
+            active_skus = bi_df[bi_df['销售数量'] > 0]
+            med_mar = active_skus['毛利率(%)'].median() if not active_skus.empty else 0.1
+
+            def get_tag(row):
+                vel = row['日均动销率']
+                mar = row['毛利率(%)']
+                stock = row['总库存']
+                cover = row['可售天数']
+
+                if stock <= 2 and row['销售数量'] > 0 and cover <= 7: return "🚨 爆款流血断货 (紧急空运)"
+                elif vel < 0.167 and cover > 30 and stock > 0: return "📦 严重积压套牢 (清仓警报)"
+                elif vel >= 0.33 and mar >= med_mar: return "⭐ 绝对明星 (死保库存)"
+                elif vel >= 0.33 and mar < med_mar: return "🧲 引流走量款 (交个朋友)"
+                elif vel < 0.167 and mar >= med_mar: return "🐢 利润陷阱 (伪需求占压资金)"
+                elif vel < 0.167 and mar < med_mar: return "☠️ 清仓废柴 (果断斩仓)"
+                else: return "🚶 平庸常规款 (建议优化组合)"
+
+            bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
             bi_df['商品规格'] = bi_df['商品名称'].fillna('').astype(str) + " (" + bi_df['颜色'].fillna('').astype(str) + ")"
             
-            # 顶部统计卡片
+            # 🚀 Plotly 防弹处理：防止气泡过小看不见，或出现负数报错
+            bi_df['气泡视觉大小'] = bi_df['压货金额'].apply(lambda x: max(float(x), 10))
+
             a_count = len(bi_df[bi_df['ABC等级'].str.contains('A类')])
             dead_stock_val = bi_df[bi_df['库存风控灯'].str.contains('严重积压')]['压货金额'].sum()
             
@@ -1702,18 +1720,42 @@ if is_admin:
             
             st.divider()
             
-            st.markdown("### 🎯 战略波士顿矩阵 (右上角为神，左下角为坑)")
-            st.info("💡 横轴看销量，纵轴看毛利。泡泡的颜色代表它的业绩等级，**泡泡越大，说明压的钱越多！**")
-            
-            # 使用更强大的 scatter_chart，支持 size 传入
-            st.scatter_chart(
+            # 🚀 引入专业级 Plotly 波士顿矩阵
+            fig = px.scatter(
                 bi_df,
                 x='日均动销率',
                 y='毛利率(%)',
-                color='ABC等级',
-                size='压货金额',
-                height=450
+                color='诊断标签',
+                size='气泡视觉大小',
+                hover_name='商品规格',
+                hover_data={
+                    'ABC等级': True,
+                    '库存风控灯': True,
+                    '日均动销率': ':.2f',
+                    '毛利率(%)': ':.1f',
+                    '总营业额': ':.2f',
+                    '可售天数': True,
+                    '总库存': True,
+                    '压货金额': ':.2f',
+                    '气泡视觉大小': False
+                },
+                size_max=45,
+                height=550,
+                template="plotly_white"
             )
+            
+            # 🚀 添加绝对刻度的十字准星
+            fig.add_vline(x=0.33, line_width=2, line_dash="dash", line_color="gray", annotation_text=" 及格销量线 (0.33件/天)", annotation_position="top right")
+            fig.add_hline(y=med_mar, line_width=2, line_dash="dash", line_color="gray", annotation_text=f" 全店中位毛利 ({med_mar:.1f}%)", annotation_position="bottom right")
+            
+            fig.update_layout(
+                xaxis_title="日均动销率 (件/天) ➡️ 越往右卖得越快",
+                yaxis_title="毛利率 (%) ⬆️ 越往上单件越赚钱",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title=""),
+                margin=dict(l=20, r=20, t=50, b=20)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
             
             st.markdown("### 📋 全景库存风控表")
             
