@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, time
 import gspread 
 from gspread.exceptions import WorksheetNotFound
 import json
-import plotly.express as px  # 🚀 新增：引入专业级交互绘图引擎
+import plotly.express as px
 
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
@@ -1157,9 +1157,9 @@ if is_admin:
                 c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
                 c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
+    # ================= 🚀 核心大改：Tab 5 净利润剥离重构 =================
     with t5:
-        st.subheader("💎 真实净利润核算 (Net Profit)")
-        st.info("💡 此页仅核算高岛屋【零售流水】。净利润 = 总营业额 - 高岛屋抽成(36%) - 进价成本 - 打卡工资。")
+        st.subheader("💎 真实净利润核算 (9% GST 剥离版)")
 
         if not df_sales.empty:
             df_s_np = df_sales.copy()
@@ -1210,29 +1210,42 @@ if is_admin:
                     daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0)
                     daily_np = daily_np.sort_values('日期_str', ascending=False)
 
-                    daily_np['商场抽成(36%)'] = daily_np['总营业额'] * 0.36
-                    daily_np['扣点后营收'] = daily_np['总营业额'] - daily_np['商场抽成(36%)']
-                    daily_np['毛利润'] = daily_np['扣点后营收'] - daily_np['总进价成本']
+                    # 🚀 GST 剥离与财务脱水核算
+                    daily_np['免税净营业额'] = daily_np['总营业额'] / 1.09
+                    daily_np['代扣GST(9%)'] = daily_np['总营业额'] - daily_np['免税净营业额']
+                    daily_np['商场抽成(36%)'] = daily_np['免税净营业额'] * 0.36
+                    daily_np['商场实际回款'] = daily_np['免税净营业额'] - daily_np['商场抽成(36%)']
+                    daily_np['毛利润'] = daily_np['商场实际回款'] - daily_np['总进价成本']
                     daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
 
-                    tot_rev = daily_np['总营业额'].sum()
+                    tot_gross = daily_np['总营业额'].sum()
+                    tot_net_rev = daily_np['免税净营业额'].sum()
+                    tot_gst = daily_np['代扣GST(9%)'].sum()
                     tot_comm = daily_np['商场抽成(36%)'].sum()
+                    tot_settlement = daily_np['商场实际回款'].sum()
                     tot_cogs = daily_np['总进价成本'].sum()
                     tot_wage = daily_np['人工成本'].sum()
                     tot_net = daily_np['真实净利润'].sum()
 
-                    pct_comm = (tot_comm / tot_rev * 100) if tot_rev > 0 else 0
-                    pct_cogs = (tot_cogs / tot_rev * 100) if tot_rev > 0 else 0
-                    pct_wage = (tot_wage / tot_rev * 100) if tot_rev > 0 else 0
-                    pct_net = (tot_net / tot_rev * 100) if tot_rev > 0 else 0
+                    pct_gst = (tot_gst / tot_gross * 100) if tot_gross > 0 else 0
+                    pct_comm = (tot_comm / tot_net_rev * 100) if tot_net_rev > 0 else 0
+                    pct_net = (tot_net / tot_gross * 100) if tot_gross > 0 else 0
 
-                    st.markdown("### 📊 阶段性核心指标")
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("💰 总营业额", f"${tot_rev:.2f}", delta="100.0% (营收基准)", delta_color="off")
-                    m2.metric("🏢 商场抽成 (36%)", f"${tot_comm:.2f}", delta=f"占比: {pct_comm:.1f}%", delta_color="off")
-                    m3.metric("📦 商品成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
-                    m4.metric("👥 人工成本", f"${tot_wage:.2f}", delta=f"占比: {pct_wage:.1f}%", delta_color="off")
-                    m5.metric("💎 真实净利润", f"${tot_net:.2f}", delta=f"净利率: {pct_net:.1f}%", delta_color="off")
+                    st.info("💡 财务脱水逻辑：顾客支付的含税总额中，9% 为政府消费税 (GST)。高岛屋的 36% 抽成基于**免税净额**计算。实际回款 = 免税净额 - 抽成。")
+                    
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("💰 含税总营业额", f"${tot_gross:.2f}", help="顾客实际刷卡支付的总金额")
+                    m2.metric("🏛️ 剥离 GST (9%)", f"${tot_gst:.2f}", delta=f"交税流失", delta_color="inverse")
+                    m3.metric("📉 商场抽成 (36%)", f"${tot_comm:.2f}", delta="基于免税额抽成", delta_color="inverse")
+                    m4.metric("💵 商场实际回款", f"${tot_settlement:.2f}", help="免税额减去抽成后，高岛屋真正打给你的钱")
+                    
+                    st.divider()
+                    
+                    m5, m6, m7, m8 = st.columns(4)
+                    m5.metric("📦 商品进价成本", f"${tot_cogs:.2f}", delta_color="off")
+                    m6.metric("👥 打卡人工成本", f"${tot_wage:.2f}", delta_color="off")
+                    m7.metric("💎 真实纯利润", f"${tot_net:.2f}", delta=f"含税净利率: {pct_net:.1f}%", delta_color="normal")
+                    m8.empty()
 
                     st.divider()
                     st.markdown("### 📈 每日营收 vs 净利润趋势")
@@ -1261,18 +1274,17 @@ if is_admin:
                         except: pass
                         return ''
                     
+                    format_dict = {
+                        '总营业额': '${:.2f}', '免税净营业额': '${:.2f}', '代扣GST(9%)': '${:.2f}',
+                        '商场抽成(36%)': '${:.2f}', '商场实际回款': '${:.2f}',
+                        '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
+                        '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
+                    }
+                    
                     try:
-                        styled_np = show_np.style.format({
-                            '总营业额': '${:.2f}', '商场抽成(36%)': '${:.2f}', '扣点后营收': '${:.2f}',
-                            '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
-                            '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
-                        }).map(color_net_profit, subset=['真实净利润'])
+                        styled_np = show_np.style.format(format_dict).map(color_net_profit, subset=['真实净利润'])
                     except AttributeError:
-                        styled_np = show_np.style.format({
-                            '总营业额': '${:.2f}', '商场抽成(36%)': '${:.2f}', '扣点后营收': '${:.2f}',
-                            '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
-                            '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
-                        }).applymap(color_net_profit, subset=['真实净利润'])
+                        styled_np = show_np.style.format(format_dict).applymap(color_net_profit, subset=['真实净利润'])
 
                     st.dataframe(styled_np, use_container_width=True, hide_index=True)
             else:
@@ -1610,7 +1622,6 @@ if is_admin:
         else:
             st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
-    # ================= 🚀 核心大改：Tab 8 战略矩阵重构 (引入 Plotly 交互引擎) =================
     with t8:
         st.subheader("📈 选品与战略决策盘 (交互级视觉矩阵)")
         st.info("💡 这是一个企业级 BI 罗盘。泡泡位置代表表现，颜色代表阵营，面积代表你被套牢的资金！鼠标悬停在泡泡上可进行极限透视。")
@@ -1708,7 +1719,6 @@ if is_admin:
             bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
             bi_df['商品规格'] = bi_df['商品名称'].fillna('').astype(str) + " (" + bi_df['颜色'].fillna('').astype(str) + ")"
             
-            # 🚀 Plotly 防弹处理：防止气泡过小看不见，或出现负数报错
             bi_df['气泡视觉大小'] = bi_df['压货金额'].apply(lambda x: max(float(x), 10))
 
             a_count = len(bi_df[bi_df['ABC等级'].str.contains('A类')])
@@ -1720,7 +1730,6 @@ if is_admin:
             
             st.divider()
             
-            # 🚀 引入专业级 Plotly 波士顿矩阵
             fig = px.scatter(
                 bi_df,
                 x='日均动销率',
@@ -1744,7 +1753,6 @@ if is_admin:
                 template="plotly_white"
             )
             
-            # 🚀 添加绝对刻度的十字准星
             fig.add_vline(x=0.33, line_width=2, line_dash="dash", line_color="gray", annotation_text=" 及格销量线 (0.33件/天)", annotation_position="top right")
             fig.add_hline(y=med_mar, line_width=2, line_dash="dash", line_color="gray", annotation_text=f" 全店中位毛利 ({med_mar:.1f}%)", annotation_position="bottom right")
             
