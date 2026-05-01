@@ -1157,7 +1157,7 @@ if is_admin:
                 c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
                 c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
-    # ================= 🚀 核心大改：Tab 5 净利润剥离重构 =================
+    # ================= 🚀 核心大改：Tab 5 净利润剥离重构 (加上绝对占比) =================
     with t5:
         st.subheader("💎 真实净利润核算 (9% GST 剥离版)")
 
@@ -1227,24 +1227,27 @@ if is_admin:
                     tot_wage = daily_np['人工成本'].sum()
                     tot_net = daily_np['真实净利润'].sum()
 
+                    # 🚀 补回：核心百分比逻辑（全部以“含税总营业额”为 100% 分母基准）
                     pct_gst = (tot_gst / tot_gross * 100) if tot_gross > 0 else 0
-                    pct_comm = (tot_comm / tot_net_rev * 100) if tot_net_rev > 0 else 0
+                    pct_comm = (tot_comm / tot_gross * 100) if tot_gross > 0 else 0
+                    pct_cogs = (tot_cogs / tot_gross * 100) if tot_gross > 0 else 0
+                    pct_wage = (tot_wage / tot_gross * 100) if tot_gross > 0 else 0
                     pct_net = (tot_net / tot_gross * 100) if tot_gross > 0 else 0
 
                     st.info("💡 财务脱水逻辑：顾客支付的含税总额中，9% 为政府消费税 (GST)。高岛屋的 36% 抽成基于**免税净额**计算。实际回款 = 免税净额 - 抽成。")
                     
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("💰 含税总营业额", f"${tot_gross:.2f}", help="顾客实际刷卡支付的总金额")
-                    m2.metric("🏛️ 剥离 GST (9%)", f"${tot_gst:.2f}", delta=f"交税流失", delta_color="inverse")
-                    m3.metric("📉 商场抽成 (36%)", f"${tot_comm:.2f}", delta="基于免税额抽成", delta_color="inverse")
+                    m1.metric("💰 含税总营业额", f"${tot_gross:.2f}", delta="100.0% (全店营收基准)", delta_color="off")
+                    m2.metric("🏛️ 剥离 GST (9%)", f"${tot_gst:.2f}", delta=f"占比: {pct_gst:.1f}%", delta_color="off")
+                    m3.metric("📉 商场抽成 (36%)", f"${tot_comm:.2f}", delta=f"占比: {pct_comm:.1f}%", delta_color="off")
                     m4.metric("💵 商场实际回款", f"${tot_settlement:.2f}", help="免税额减去抽成后，高岛屋真正打给你的钱")
                     
                     st.divider()
                     
                     m5, m6, m7, m8 = st.columns(4)
-                    m5.metric("📦 商品进价成本", f"${tot_cogs:.2f}", delta_color="off")
-                    m6.metric("👥 打卡人工成本", f"${tot_wage:.2f}", delta_color="off")
-                    m7.metric("💎 真实纯利润", f"${tot_net:.2f}", delta=f"含税净利率: {pct_net:.1f}%", delta_color="normal")
+                    m5.metric("📦 商品进价成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
+                    m6.metric("👥 打卡人工成本", f"${tot_wage:.2f}", delta=f"占比: {pct_wage:.1f}%", delta_color="off")
+                    m7.metric("💎 真实纯利润", f"${tot_net:.2f}", delta=f"真实含税净利率: {pct_net:.1f}%", delta_color="normal")
                     m8.empty()
 
                     st.divider()
