@@ -157,6 +157,10 @@ if "role" not in st.session_state:
         st.session_state.role = None
         st.session_state.current_user = None
 
+# --- 🚀 全局档期状态初始化 ---
+if "camp_start" not in st.session_state: st.session_state.camp_start = datetime(2026, 3, 26).date()
+if "camp_end" not in st.session_state: st.session_state.camp_end = datetime.now().date()
+
 with st.sidebar:
     st.header("🔐 系统门禁")
     
@@ -173,6 +177,29 @@ with st.sidebar:
         
         st.divider()
         if is_admin:
+            # 🚀 新增：全局档期控制器
+            st.header("🎯 全局档期控制台")
+            st.info("💡 在这里切换档期，财报和罗盘数据将自动隔离同步！物理库存不受影响。")
+            
+            # 提供快捷按钮
+            qc1, qc2 = st.columns(2)
+            if qc1.button("一期(3.26起)", use_container_width=True):
+                st.session_state.camp_start = datetime(2026, 3, 26).date()
+                st.session_state.camp_end = datetime(2026, 4, 30).date()
+                st.rerun()
+            if qc2.button("二期(5.14起)", use_container_width=True):
+                st.session_state.camp_start = datetime(2026, 5, 14).date()
+                st.session_state.camp_end = datetime(2026, 6, 30).date()
+                st.rerun()
+                
+            camp_range = st.date_input("自定义分析区间 (影响Tab3/5/8)", value=[st.session_state.camp_start, st.session_state.camp_end])
+            if len(camp_range) == 2:
+                c_start, c_end = camp_range
+            else:
+                c_start, c_end = camp_range[0], camp_range[0]
+            
+            st.divider()
+            
             st.header("🛠️ 核心管理")
             with st.expander("➕ 新增产品建档 (Add SKU)"):
                 with st.form("new_sku"):
@@ -282,7 +309,7 @@ if is_admin:
 else:
     t1, t2 = st.tabs(["📊 实时库存查询", "🛒 智能POS收银台"])
 
-# ================= Tab 1: 库存 =================
+# ================= Tab 1: 库存 (维持物理真实库存) =================
 with t1:
     f_opts_stk = df_stock.copy()
     stock_list_labels = []
@@ -292,7 +319,7 @@ with t1:
         
     if is_admin:
         st.subheader("📦 专业 ERP 库存与货位管家")
-        st.info("💡 双边账引擎已启动：禁止在此直接篡改库存数，系统将严格依据下方的【入库】、【调拨】、【盘点】通道进行自动化记账。")
+        st.info("💡 无论档期如何切换，这里的库存永远代表【当下物理世界】的真实剩余数量。")
         t1_a, t1_b, t1_c = st.tabs(["📥 1. 补货入库 (Restock)", "🔄 2. 货位调拨 (Transfer)", "⚖️ 3. 盘点平账 (Adjust)"])
         
         with t1_a:
@@ -457,7 +484,7 @@ with t1:
             selected_stock = edited_stock[edited_stock["选择"] == True]
             
             if len(selected_stock) == 1:
-                st.markdown("### ⚙️ SKU 档案修改与时间溯源机")
+                st.markdown("### ⚙️ SKU 档案修改机")
                 st.info("💡 放心改！如果你修改了【名称】或【颜色】，系统会自动潜入数据库，把你所有历史流水账里的名字一并改掉，绝不留死账。")
                 
                 orig_name = str(selected_stock.iloc[0]['商品名称'])
@@ -468,30 +495,17 @@ with t1:
                 
                 orig_cost = float(raw_cost) if raw_cost else 0.0
                 orig_price = float(raw_price) if raw_price else 0.0
-                
-                sku_logs = df_restock[(df_restock['商品名称'] == orig_name) & (df_restock['颜色'] == orig_color)]
-                has_history = False
-                if not sku_logs.empty:
-                    try:
-                        first_date_str = sku_logs['记录日期'].min()
-                        first_date = pd.to_datetime(first_date_str).date()
-                        has_history = True
-                    except:
-                        first_date = datetime.now().date()
-                else:
-                    first_date = datetime.now().date()
 
                 with st.form("edit_base_info"):
-                    ec1, ec2, ec3 = st.columns([1.5, 1.5, 2])
+                    ec1, ec2 = st.columns([1.5, 1.5])
                     e_name = ec1.text_input("商品名称", value=orig_name)
                     e_color = ec2.text_input("颜色/规格", value=orig_color)
-                    e_date = ec3.date_input("📅 首次入库时间 (BI 动销率基准点)", value=first_date, help="如果你发现Tab8里的动销率算的不对，直接在这里把日期往前或往后调！")
                     
-                    ec4, ec5, _ = st.columns([1.5, 1.5, 2])
+                    ec4, ec5 = st.columns([1.5, 1.5])
                     e_cost = ec4.number_input("单件进价成本 ($)", value=orig_cost, format="%.2f")
                     e_price = ec5.number_input("终端售卖价格 ($)", value=orig_price, format="%.2f")
                     
-                    if st.form_submit_button("💾 保存档案与时间修改", type="primary"):
+                    if st.form_submit_button("💾 保存档案修改", type="primary"):
                         fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET, B2B_SHEET, RESTOCK_SHEET])
                         latest_stock = fresh[STOCK_SHEET]
                         latest_sales = fresh[SALES_SHEET]
@@ -510,23 +524,14 @@ with t1:
                                 save_data(latest_sales, SALES_SHEET)
                             if not latest_restock.empty:
                                 latest_restock.loc[(latest_restock['商品名称'] == orig_name) & (latest_restock['颜色'] == orig_color), ['商品名称', '颜色']] = [e_name, e_color]
+                                save_data(latest_restock, RESTOCK_SHEET)
                             if not latest_b2b.empty:
                                 latest_b2b.loc[(latest_b2b['商品名称'] == orig_name) & (latest_b2b['颜色'] == orig_color), ['商品名称', '颜色']] = [e_name, e_color]
                                 save_data(latest_b2b, B2B_SHEET)
-
-                        date_str = e_date.strftime("%Y/%m/%d")
-                        if has_history:
-                            min_idx = latest_restock[(latest_restock['商品名称'] == e_name) & (latest_restock['颜色'] == e_color)]['记录日期'].idxmin()
-                            latest_restock.at[min_idx, '记录日期'] = date_str
-                        else:
-                            new_log = pd.DataFrame([[date_str, "初始建档", e_name, e_color, 0, "时间追溯", e_cost, "系统溯源建档"]], columns=RESTOCK_COLS)
-                            latest_restock = pd.concat([new_log, latest_restock], ignore_index=True)
                         
                         save_data(latest_stock, STOCK_SHEET)
-                        save_data(latest_restock, RESTOCK_SHEET)
-                        
                         st.session_state.stock_reset_key += 1
-                        st.success(f"✅ 【{e_name}】的档案和溯源时间已全局更新！")
+                        st.success(f"✅ 【{e_name}】的档案已全局更新！")
                         st.rerun()
 
             if not selected_stock.empty:
@@ -550,7 +555,7 @@ with t1:
         
     if is_admin:
         with st.expander("📜 ERP底单：查看所有出入库/平账流水账 (绝密审计日志)", expanded=False):
-            st.info("💡 这里记录了每一次库存加减的痕迹，犹如银行流水般不可篡改。如果当年发现改错了，请走『盘点』通道用红字冲回。")
+            st.info("💡 这里记录了每一次库存加减的痕迹，犹如银行流水般不可篡改。")
             st.dataframe(get_f(df_restock, q), use_container_width=True)
 
 # ================= Tab 2: 销售 =================
@@ -901,107 +906,110 @@ with t2:
 
 # ================= 🚀 以下所有高级 Tab 只有店长能看 =================
 if is_admin:
+    
+    # 🚀 从全局档期控制台获取统一时间范围
+    g_start = pd.Timestamp(st.session_state.camp_start)
+    g_end = pd.Timestamp(st.session_state.camp_end)
+    
     with t3:
-        st.subheader("📊 财务与客流报表 (含漏斗分析)")
+        st.subheader(f"📊 财务与客流报表 (当前档期: {st.session_state.camp_start} 至 {st.session_state.camp_end})")
+        st.info("💡 数据范围：已根据左侧边栏【全局档期控制台】自动同步过滤。")
         if not df_sales.empty:
             df_sales['日期_dt'] = pd.to_datetime(df_sales['日期'], errors='coerce')
             df_sales_clean = df_sales.dropna(subset=['日期_dt']).copy()
             
             if not df_sales_clean.empty:
-                sel_range = st.date_input("选择查看时间段", value=[df_sales_clean['日期_dt'].min().date(), df_sales_clean['日期_dt'].max().date()])
-                if len(sel_range) == 2:
-                    start, end = sel_range
-                    f_sales_range = df_sales_clean[(df_sales_clean['日期_dt'] >= pd.Timestamp(start)) & (df_sales_clean['日期_dt'] <= pd.Timestamp(end))].copy()
+                f_sales_range = df_sales_clean[(df_sales_clean['日期_dt'] >= g_start) & (df_sales_clean['日期_dt'] <= g_end)].copy()
+                
+                f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
+                f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
+                
+                df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
+                df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
+                f_sales_range = f_sales_range.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
+                f_sales_range['具体毛利'] = f_sales_range['总营业额'] - (f_sales_range['销售数量'] * f_sales_range['进价成本'])
+                
+                f_sales_range = get_f(f_sales_range, q)
+                
+                if not f_sales_range.empty:
+                    tot_rev = f_sales_range['总营业额'].sum()
+                    tot_items = f_sales_range['销售数量'].sum()
+                    tot_margin = f_sales_range['具体毛利'].sum()
                     
-                    f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
-                    f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
+                    valid_orders = f_sales_range[
+                        (~f_sales_range['订单号'].str.contains('历史单', na=False)) & 
+                        (~f_sales_range['订单号'].str.contains('EXC-', na=False))
+                    ]
+                    order_count = valid_orders['订单号'].nunique()
                     
-                    df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
-                    df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
-                    f_sales_range = f_sales_range.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
-                    f_sales_range['具体毛利'] = f_sales_range['总营业额'] - (f_sales_range['销售数量'] * f_sales_range['进价成本'])
+                    legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
+                    total_order_count = order_count + len(legacy_orders)
                     
-                    f_sales_range = get_f(f_sales_range, q)
-                    
-                    if not f_sales_range.empty:
-                        tot_rev = f_sales_range['总营业额'].sum()
-                        tot_items = f_sales_range['销售数量'].sum()
-                        tot_margin = f_sales_range['具体毛利'].sum()
-                        
-                        valid_orders = f_sales_range[
-                            (~f_sales_range['订单号'].str.contains('历史单', na=False)) & 
-                            (~f_sales_range['订单号'].str.contains('EXC-', na=False))
-                        ]
-                        order_count = valid_orders['订单号'].nunique()
-                        
-                        legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
-                        total_order_count = order_count + len(legacy_orders)
-                        
-                        df_traffic_clean = df_traffic.copy()
-                        if not df_traffic_clean.empty:
-                            df_traffic_clean['日期_dt'] = pd.to_datetime(df_traffic_clean['日期'], errors='coerce')
-                            f_traffic_range = df_traffic_clean[(df_traffic_clean['日期_dt'] >= pd.Timestamp(start)) & (df_traffic_clean['日期_dt'] <= pd.Timestamp(end))]
-                            total_traffic = pd.to_numeric(f_traffic_range['有效客流'], errors='coerce').fillna(0).sum()
-                        else:
-                            total_traffic = 0
-                            
-                        conv_rate = (total_order_count / total_traffic * 100) if total_traffic > 0 else 0.0
-                        acv = tot_rev / total_order_count if total_order_count > 0 else 0
-                        upt = tot_items / total_order_count if total_order_count > 0 else 0
-                        
-                        period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
-                        if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m/%d')
-                        elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
-                        else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m')
-                        
-                        summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum', '具体毛利':'sum'}).reset_index()
-                        
-                        delta_days = (end - start).days + 1
-                        
-                        st.markdown(f"### 🏬 核心客流漏斗矩阵 {f'(已过滤: {q})' if q else ''}")
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("👁️ 有效总客流 (全店)", f"{int(total_traffic)} 人", help="驻足停留、体验材质的真实潜客（全店客流不受商品搜索影响）")
-                        m2.metric("💳 交易单数", f"{total_order_count} 单", help="包含该商品的独立订单数")
-                        m3.metric("🔄 购买转化率", f"{conv_rate:.1f}%", help="交易单数 ÷ 有效总客流 (搜单品时此为该商品的进店购买率)")
-                        
-                        st.divider()
-                        
-                        m4, m5, m6 = st.columns(3)
-                        m4.metric("💰 总营业额", f"${tot_rev:.2f}")
-                        m5.metric("🛒 平均客单价 (ACV)", f"${acv:.2f}", help="包含该商品的订单平均贡献金额")
-                        m6.metric("🛍️ 连带率 (UPT)", f"{upt:.2f} 件/单", help="包含该商品的订单平均购买件数")
-                        
-                        st.divider()
-                        
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("具体毛利", f"${tot_margin:.2f}")
-                        c2.metric("总售出件数", f"{int(tot_items)} 件")
-                        
-                        avg_m = tot_margin / tot_rev * 100 if tot_rev > 0 else 0
-                        c3.metric("平均毛利率", f"{avg_m:.1f}%")
-                        
-                        avg_daily = tot_rev / delta_days if delta_days > 0 else 0
-                        c4.metric("日均坪效 (每日营收)", f"${avg_daily:.2f}")
-                        
-                        st.divider()
-                        st.markdown("### 📈 营收与毛利走势")
-                        chart_data_t3 = summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
-                        st.bar_chart(chart_data_t3, use_container_width=True)
-
-                        dl_c1, dl_c2 = st.columns([1, 4])
-                        with dl_c1:
-                            csv_t3 = convert_df_to_csv(summ)
-                            st.download_button(
-                                label="⬇️ 一键导出毛利报表 (CSV)",
-                                data=csv_t3,
-                                file_name=f"Takashimaya_毛利报表_{datetime.now().strftime('%Y%m%d')}.csv",
-                                mime="text/csv",
-                                type="primary"
-                            )
-                        
-                        st.dataframe(summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+                    df_traffic_clean = df_traffic.copy()
+                    if not df_traffic_clean.empty:
+                        df_traffic_clean['日期_dt'] = pd.to_datetime(df_traffic_clean['日期'], errors='coerce')
+                        f_traffic_range = df_traffic_clean[(df_traffic_clean['日期_dt'] >= g_start) & (df_traffic_clean['日期_dt'] <= g_end)]
+                        total_traffic = pd.to_numeric(f_traffic_range['有效客流'], errors='coerce').fillna(0).sum()
                     else:
-                        st.info("💡 在选定时间段内没有找到符合搜索条件的销售记录。")
+                        total_traffic = 0
+                        
+                    conv_rate = (total_order_count / total_traffic * 100) if total_traffic > 0 else 0.0
+                    acv = tot_rev / total_order_count if total_order_count > 0 else 0
+                    upt = tot_items / total_order_count if total_order_count > 0 else 0
+                    
+                    period = st.radio("维度", ["Daily", "Weekly", "Monthly"], horizontal=True)
+                    if "Daily" in period: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m/%d')
+                    elif "Weekly" in period: f_sales_range['周期'] = (f_sales_range['日期_dt'] - pd.to_timedelta(f_sales_range['日期_dt'].dt.dayofweek, unit='D')).dt.strftime('Week of %b %d')
+                    else: f_sales_range['周期'] = f_sales_range['日期_dt'].dt.strftime('%Y/%m')
+                    
+                    summ = f_sales_range.groupby(['周期', '商品名称', '颜色']).agg({'销售数量':'sum', '总营业额':'sum', '具体毛利':'sum'}).reset_index()
+                    
+                    delta_days = (g_end.date() - g_start.date()).days + 1
+                    
+                    st.markdown(f"### 🏬 核心客流漏斗矩阵 {f'(已过滤: {q})' if q else ''}")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("👁️ 有效总客流 (当前档期)", f"{int(total_traffic)} 人", help="驻足停留、体验材质的真实潜客（全店客流不受商品搜索影响）")
+                    m2.metric("💳 交易单数", f"{total_order_count} 单", help="包含该商品的独立订单数")
+                    m3.metric("🔄 购买转化率", f"{conv_rate:.1f}%", help="交易单数 ÷ 有效总客流 (搜单品时此为该商品的进店购买率)")
+                    
+                    st.divider()
+                    
+                    m4, m5, m6 = st.columns(3)
+                    m4.metric("💰 总营业额", f"${tot_rev:.2f}")
+                    m5.metric("🛒 平均客单价 (ACV)", f"${acv:.2f}", help="包含该商品的订单平均贡献金额")
+                    m6.metric("🛍️ 连带率 (UPT)", f"{upt:.2f} 件/单", help="包含该商品的订单平均购买件数")
+                    
+                    st.divider()
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("具体毛利", f"${tot_margin:.2f}")
+                    c2.metric("总售出件数", f"{int(tot_items)} 件")
+                    
+                    avg_m = tot_margin / tot_rev * 100 if tot_rev > 0 else 0
+                    c3.metric("平均毛利率", f"{avg_m:.1f}%")
+                    
+                    avg_daily = tot_rev / delta_days if delta_days > 0 else 0
+                    c4.metric("日均坪效 (每日营收)", f"${avg_daily:.2f}")
+                    
+                    st.divider()
+                    st.markdown("### 📈 营收与毛利走势")
+                    chart_data_t3 = summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
+                    st.bar_chart(chart_data_t3, use_container_width=True)
+
+                    dl_c1, dl_c2 = st.columns([1, 4])
+                    with dl_c1:
+                        csv_t3 = convert_df_to_csv(summ)
+                        st.download_button(
+                            label="⬇️ 一键导出毛利报表 (CSV)",
+                            data=csv_t3,
+                            file_name=f"Takashimaya_毛利报表_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            type="primary"
+                        )
+                    
+                    st.dataframe(summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
+                else:
+                    st.info("💡 在选定时间段内没有找到符合搜索条件的销售记录。")
             else:
                 st.info("流水表中没有有效的日期数据。")
 
@@ -1157,9 +1165,10 @@ if is_admin:
                 c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
                 c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
-    # ================= 🚀 核心大改：Tab 5 净利润剥离重构 (加上绝对占比) =================
+    # ================= 🚀 Tab 5: 净利润 (跟随全局档期) =================
     with t5:
-        st.subheader("💎 真实净利润核算 (9% GST 剥离版)")
+        st.subheader(f"💎 真实净利润核算 (当前档期: {st.session_state.camp_start} 至 {st.session_state.camp_end})")
+        st.info("💡 数据范围已锁定为当前档期。此页核算已剥离 9% GST。")
 
         if not df_sales.empty:
             df_s_np = df_sales.copy()
@@ -1174,122 +1183,110 @@ if is_admin:
                 df_a_np['日期_dt'] = pd.Series(dtype='datetime64[ns]')
 
             if not df_s_np.empty:
-                min_date = df_s_np['日期_dt'].min().date()
-                max_date = df_s_np['日期_dt'].max().date()
-                if not df_a_np.empty:
-                    min_date = min(min_date, df_a_np['日期_dt'].min().date())
-                    max_date = max(max_date, df_a_np['日期_dt'].max().date())
+                # 使用全局档期
+                fs = df_s_np[(df_s_np['日期_dt'] >= g_start) & (df_s_np['日期_dt'] <= g_end)].copy()
+                fa = df_a_np[(df_a_np['日期_dt'] >= g_start) & (df_a_np['日期_dt'] <= g_end)].copy()
 
-                np_range = st.date_input("选择核算时间段", value=[min_date, max_date], key="np_date_range")
+                fs['销售数量'] = pd.to_numeric(fs['销售数量'], errors='coerce').fillna(0)
+                fs['总营业额'] = pd.to_numeric(fs['总营业额'], errors='coerce').fillna(0.0)
 
-                if len(np_range) == 2:
-                    start_d, end_d = np_range
-                    
-                    fs = df_s_np[(df_s_np['日期_dt'] >= pd.Timestamp(start_d)) & (df_s_np['日期_dt'] <= pd.Timestamp(end_d))].copy()
-                    fa = df_a_np[(df_a_np['日期_dt'] >= pd.Timestamp(start_d)) & (df_a_np['日期_dt'] <= pd.Timestamp(end_d))].copy()
+                df_stock_cost = df_stock[['商品名称', '颜色', '进价成本']].copy()
+                df_stock_cost['进价成本'] = pd.to_numeric(df_stock_cost['进价成本'], errors='coerce').fillna(0.0)
+                fs = fs.merge(df_stock_cost, on=['商品名称', '颜色'], how='left')
+                fs['总进价成本'] = fs['销售数量'] * fs['进价成本']
 
-                    fs['销售数量'] = pd.to_numeric(fs['销售数量'], errors='coerce').fillna(0)
-                    fs['总营业额'] = pd.to_numeric(fs['总营业额'], errors='coerce').fillna(0.0)
+                fs['日期_str'] = fs['日期_dt'].dt.strftime('%Y/%m/%d')
+                daily_sales = fs.groupby('日期_str').agg({'总营业额': 'sum', '总进价成本': 'sum'}).reset_index()
 
-                    df_stock_cost = df_stock[['商品名称', '颜色', '进价成本']].copy()
-                    df_stock_cost['进价成本'] = pd.to_numeric(df_stock_cost['进价成本'], errors='coerce').fillna(0.0)
-                    fs = fs.merge(df_stock_cost, on=['商品名称', '颜色'], how='left')
-                    fs['总进价成本'] = fs['销售数量'] * fs['进价成本']
+                if not fa.empty:
+                    fa['核算薪资'] = pd.to_numeric(fa['核算薪资'], errors='coerce').fillna(0.0)
+                    fa['日期_str'] = fa['日期_dt'].dt.strftime('%Y/%m/%d')
+                    daily_att = fa.groupby('日期_str').agg({'核算薪资': 'sum'}).reset_index()
+                    daily_att.rename(columns={'核算薪资': '人工成本'}, inplace=True)
+                else:
+                    daily_att = pd.DataFrame(columns=['日期_str', '人工成本'])
 
-                    fs['日期_str'] = fs['日期_dt'].dt.strftime('%Y/%m/%d')
-                    daily_sales = fs.groupby('日期_str').agg({'总营业额': 'sum', '总进价成本': 'sum'}).reset_index()
+                daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0)
+                daily_np = daily_np.sort_values('日期_str', ascending=False)
 
-                    if not fa.empty:
-                        fa['核算薪资'] = pd.to_numeric(fa['核算薪资'], errors='coerce').fillna(0.0)
-                        fa['日期_str'] = fa['日期_dt'].dt.strftime('%Y/%m/%d')
-                        daily_att = fa.groupby('日期_str').agg({'核算薪资': 'sum'}).reset_index()
-                        daily_att.rename(columns={'核算薪资': '人工成本'}, inplace=True)
-                    else:
-                        daily_att = pd.DataFrame(columns=['日期_str', '人工成本'])
+                # 🚀 GST 剥离与财务脱水核算
+                daily_np['免税净营业额'] = daily_np['总营业额'] / 1.09
+                daily_np['代扣GST(9%)'] = daily_np['总营业额'] - daily_np['免税净营业额']
+                daily_np['商场抽成(36%)'] = daily_np['免税净营业额'] * 0.36
+                daily_np['商场实际回款'] = daily_np['免税净营业额'] - daily_np['商场抽成(36%)']
+                daily_np['毛利润'] = daily_np['商场实际回款'] - daily_np['总进价成本']
+                daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
 
-                    daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0)
-                    daily_np = daily_np.sort_values('日期_str', ascending=False)
+                tot_gross = daily_np['总营业额'].sum()
+                tot_net_rev = daily_np['免税净营业额'].sum()
+                tot_gst = daily_np['代扣GST(9%)'].sum()
+                tot_comm = daily_np['商场抽成(36%)'].sum()
+                tot_settlement = daily_np['商场实际回款'].sum()
+                tot_cogs = daily_np['总进价成本'].sum()
+                tot_wage = daily_np['人工成本'].sum()
+                tot_net = daily_np['真实净利润'].sum()
 
-                    # 🚀 GST 剥离与财务脱水核算
-                    daily_np['免税净营业额'] = daily_np['总营业额'] / 1.09
-                    daily_np['代扣GST(9%)'] = daily_np['总营业额'] - daily_np['免税净营业额']
-                    daily_np['商场抽成(36%)'] = daily_np['免税净营业额'] * 0.36
-                    daily_np['商场实际回款'] = daily_np['免税净营业额'] - daily_np['商场抽成(36%)']
-                    daily_np['毛利润'] = daily_np['商场实际回款'] - daily_np['总进价成本']
-                    daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
+                # 🚀 百分比全部回来啦，统统以 Gross 为基准
+                pct_gst = (tot_gst / tot_gross * 100) if tot_gross > 0 else 0
+                pct_comm = (tot_comm / tot_gross * 100) if tot_gross > 0 else 0
+                pct_cogs = (tot_cogs / tot_gross * 100) if tot_gross > 0 else 0
+                pct_wage = (tot_wage / tot_gross * 100) if tot_gross > 0 else 0
+                pct_net = (tot_net / tot_gross * 100) if tot_gross > 0 else 0
 
-                    tot_gross = daily_np['总营业额'].sum()
-                    tot_net_rev = daily_np['免税净营业额'].sum()
-                    tot_gst = daily_np['代扣GST(9%)'].sum()
-                    tot_comm = daily_np['商场抽成(36%)'].sum()
-                    tot_settlement = daily_np['商场实际回款'].sum()
-                    tot_cogs = daily_np['总进价成本'].sum()
-                    tot_wage = daily_np['人工成本'].sum()
-                    tot_net = daily_np['真实净利润'].sum()
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("💰 档期含税总营业额", f"${tot_gross:.2f}", delta="100.0% (全店营收基准)", delta_color="off")
+                m2.metric("🏛️ 剥离 GST (9%)", f"${tot_gst:.2f}", delta=f"占比: {pct_gst:.1f}%", delta_color="off")
+                m3.metric("📉 商场抽成 (36%)", f"${tot_comm:.2f}", delta=f"占比: {pct_comm:.1f}%", delta_color="off")
+                m4.metric("💵 商场实际回款", f"${tot_settlement:.2f}", help="免税额减去抽成后，高岛屋真正打给你的钱")
+                
+                st.divider()
+                
+                m5, m6, m7, m8 = st.columns(4)
+                m5.metric("📦 商品进价成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
+                m6.metric("👥 打卡人工成本", f"${tot_wage:.2f}", delta=f"占比: {pct_wage:.1f}%", delta_color="off")
+                m7.metric("💎 档期真实纯利润", f"${tot_net:.2f}", delta=f"真实含税净利率: {pct_net:.1f}%", delta_color="normal")
+                m8.empty()
 
-                    # 🚀 补回：核心百分比逻辑（全部以“含税总营业额”为 100% 分母基准）
-                    pct_gst = (tot_gst / tot_gross * 100) if tot_gross > 0 else 0
-                    pct_comm = (tot_comm / tot_gross * 100) if tot_gross > 0 else 0
-                    pct_cogs = (tot_cogs / tot_gross * 100) if tot_gross > 0 else 0
-                    pct_wage = (tot_wage / tot_gross * 100) if tot_gross > 0 else 0
-                    pct_net = (tot_net / tot_gross * 100) if tot_gross > 0 else 0
+                st.divider()
+                st.markdown("### 📈 每日营收 vs 净利润趋势")
+                chart_data_t5 = daily_np.set_index('日期_str')[['总营业额', '真实净利润']].sort_index(ascending=True)
+                st.bar_chart(chart_data_t5, use_container_width=True)
 
-                    st.info("💡 财务脱水逻辑：顾客支付的含税总额中，9% 为政府消费税 (GST)。高岛屋的 36% 抽成基于**免税净额**计算。实际回款 = 免税净额 - 抽成。")
-                    
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("💰 含税总营业额", f"${tot_gross:.2f}", delta="100.0% (全店营收基准)", delta_color="off")
-                    m2.metric("🏛️ 剥离 GST (9%)", f"${tot_gst:.2f}", delta=f"占比: {pct_gst:.1f}%", delta_color="off")
-                    m3.metric("📉 商场抽成 (36%)", f"${tot_comm:.2f}", delta=f"占比: {pct_comm:.1f}%", delta_color="off")
-                    m4.metric("💵 商场实际回款", f"${tot_settlement:.2f}", help="免税额减去抽成后，高岛屋真正打给你的钱")
-                    
-                    st.divider()
-                    
-                    m5, m6, m7, m8 = st.columns(4)
-                    m5.metric("📦 商品进价成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
-                    m6.metric("👥 打卡人工成本", f"${tot_wage:.2f}", delta=f"占比: {pct_wage:.1f}%", delta_color="off")
-                    m7.metric("💎 真实纯利润", f"${tot_net:.2f}", delta=f"真实含税净利率: {pct_net:.1f}%", delta_color="normal")
-                    m8.empty()
+                st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
+                dl_c3, dl_c4 = st.columns([1.5, 4])
+                with dl_c3:
+                    csv_t5 = convert_df_to_csv(daily_np)
+                    st.download_button(
+                        label="⬇️ 一键导出净利润明细 (CSV)",
+                        data=csv_t5,
+                        file_name=f"Takashimaya_净利明细_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        type="primary"
+                    )
 
-                    st.divider()
-                    st.markdown("### 📈 每日营收 vs 净利润趋势")
-                    chart_data_t5 = daily_np.set_index('日期_str')[['总营业额', '真实净利润']].sort_index(ascending=True)
-                    st.bar_chart(chart_data_t5, use_container_width=True)
-
-                    st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
-                    dl_c3, dl_c4 = st.columns([1.5, 4])
-                    with dl_c3:
-                        csv_t5 = convert_df_to_csv(daily_np)
-                        st.download_button(
-                            label="⬇️ 一键导出净利润明细 (CSV)",
-                            data=csv_t5,
-                            file_name=f"Takashimaya_净利明细_{datetime.now().strftime('%Y%m%d')}.csv",
-                            mime="text/csv",
-                            type="primary"
-                        )
-
-                    show_np = daily_np.rename(columns={'日期_str': '日期'})
-                    
-                    def color_net_profit(val):
-                        try:
-                            val = float(val)
-                            if val > 0: return 'background-color: #e6ffe6; color: #006600; font-weight: bold;'
-                            elif val < 0: return 'background-color: #ffe6e6; color: #cc0000; font-weight: bold;'
-                        except: pass
-                        return ''
-                    
-                    format_dict = {
-                        '总营业额': '${:.2f}', '免税净营业额': '${:.2f}', '代扣GST(9%)': '${:.2f}',
-                        '商场抽成(36%)': '${:.2f}', '商场实际回款': '${:.2f}',
-                        '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
-                        '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
-                    }
-                    
+                show_np = daily_np.rename(columns={'日期_str': '日期'})
+                
+                def color_net_profit(val):
                     try:
-                        styled_np = show_np.style.format(format_dict).map(color_net_profit, subset=['真实净利润'])
-                    except AttributeError:
-                        styled_np = show_np.style.format(format_dict).applymap(color_net_profit, subset=['真实净利润'])
+                        val = float(val)
+                        if val > 0: return 'background-color: #e6ffe6; color: #006600; font-weight: bold;'
+                        elif val < 0: return 'background-color: #ffe6e6; color: #cc0000; font-weight: bold;'
+                    except: pass
+                    return ''
+                
+                format_dict = {
+                    '总营业额': '${:.2f}', '免税净营业额': '${:.2f}', '代扣GST(9%)': '${:.2f}',
+                    '商场抽成(36%)': '${:.2f}', '商场实际回款': '${:.2f}',
+                    '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
+                    '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
+                }
+                
+                try:
+                    styled_np = show_np.style.format(format_dict).map(color_net_profit, subset=['真实净利润'])
+                except AttributeError:
+                    styled_np = show_np.style.format(format_dict).applymap(color_net_profit, subset=['真实净利润'])
 
-                    st.dataframe(styled_np, use_container_width=True, hide_index=True)
+                st.dataframe(styled_np, use_container_width=True, hide_index=True)
             else:
                 st.info("暂无有效销售数据进行核算。")
         else:
@@ -1625,16 +1622,18 @@ if is_admin:
         else:
             st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
+    # ================= 🚀 Tab 8 战略矩阵：根据档期切片重构 =================
     with t8:
-        st.subheader("📈 选品与战略决策盘 (交互级视觉矩阵)")
-        st.info("💡 这是一个企业级 BI 罗盘。泡泡位置代表表现，颜色代表阵营，面积代表你被套牢的资金！鼠标悬停在泡泡上可进行极限透视。")
-        
-        c_launch, _ = st.columns([1, 3])
-        launch_date = c_launch.date_input("🏬 快闪店/专柜开业日期 (基准起算日)", value=datetime(2026, 3, 4).date())
+        st.subheader(f"📈 选品与战略决策盘 (当前档期: {st.session_state.camp_start} 至 {st.session_state.camp_end})")
+        st.info("💡 这是一个动态 BI 罗盘。它的动销率和毛利表现已完全切换为**【当前档期】**切片，但气泡大小依然代表你**【当下被套牢的真实资金】**！")
 
         if not df_sales.empty and not df_stock.empty:
             df_s_bi = df_sales.copy()
             df_s_bi['日期_dt'] = pd.to_datetime(df_s_bi['日期'], errors='coerce')
+            
+            # 🚀 核心：只抓取属于这个档期范围的销售数据
+            df_s_bi = df_s_bi[(df_s_bi['日期_dt'] >= g_start) & (df_s_bi['日期_dt'] <= g_end)]
+            
             df_s_bi['销售数量'] = pd.to_numeric(df_s_bi['销售数量'], errors='coerce').fillna(0)
             df_s_bi['总营业额'] = pd.to_numeric(df_s_bi['总营业额'], errors='coerce').fillna(0.0)
 
@@ -1643,6 +1642,7 @@ if is_admin:
                 '总营业额': 'sum'
             }).reset_index()
 
+            # 库存数据依然是全局实时的
             df_stk_bi = df_stock[['商品名称', '颜色', '进价成本', '总库存']].copy()
             df_stk_bi['进价成本'] = pd.to_numeric(df_stk_bi['进价成本'], errors='coerce').fillna(0.0)
             df_stk_bi['总库存'] = pd.to_numeric(df_stk_bi['总库存'], errors='coerce').fillna(0)
@@ -1653,23 +1653,17 @@ if is_admin:
             
             bi_df['压货金额'] = bi_df['总库存'] * bi_df['进价成本']
 
-            if not df_restock.empty:
-                first_restock = df_restock[df_restock['操作类型'].isin(['入库', '初始建档'])].groupby(['商品名称', '颜色'])['记录日期'].min().reset_index()
-                first_restock.rename(columns={'记录日期': '首批入库日期'}, inplace=True)
-                first_restock['首批入库日期'] = pd.to_datetime(first_restock['首批入库日期'], errors='coerce').dt.date
-                bi_df = pd.merge(bi_df, first_restock, on=['商品名称', '颜色'], how='left')
-            else:
-                bi_df['首批入库日期'] = pd.NaT
-
+            # 🚀 核心：计算这个档期的在店天数
             today = datetime.now().date()
+            if today < st.session_state.camp_start:
+                # 档期还没开始
+                days_in_period = 1
+            else:
+                calc_end = min(today, st.session_state.camp_end)
+                days_in_period = (calc_end - st.session_state.camp_start).days + 1
+                days_in_period = max(days_in_period, 1)
             
-            def get_days(row):
-                start_date = row['首批入库日期'] if pd.notnull(row['首批入库日期']) else launch_date
-                days = (today - start_date).days
-                return max(days, 1) 
-                
-            bi_df['在店天数'] = bi_df.apply(get_days, axis=1)
-            bi_df['日均动销率'] = bi_df['销售数量'] / bi_df['在店天数']
+            bi_df['日均动销率'] = bi_df['销售数量'] / days_in_period
             
             bi_df['总进价成本'] = bi_df['销售数量'] * bi_df['进价成本']
             bi_df['具体毛利'] = bi_df['总营业额'] - bi_df['总进价成本']
@@ -1728,8 +1722,8 @@ if is_admin:
             dead_stock_val = bi_df[bi_df['库存风控灯'].str.contains('严重积压')]['压货金额'].sum()
             
             bc1, bc2 = st.columns(2)
-            bc1.metric("👑 A类核心尖子生数量", f"{a_count} 款", help="这几个款式扛起了全店 70% 的营业额，店长必须每天死盯它们的库存！")
-            bc2.metric("🔴 严重积压资金 (>60天卖不掉)", f"${dead_stock_val:.2f}", help="必须立刻做活动清仓换现金的坏死资产！", delta_color="inverse")
+            bc1.metric(f"👑 {st.session_state.camp_start} 至今 A类印钞机", f"{a_count} 款", help="这几个款式扛起了全店 70% 的营业额，店长必须每天死盯它们的库存！")
+            bc2.metric("🔴 当前全店死库套牢资金 (>60天卖不掉)", f"${dead_stock_val:.2f}", help="必须立刻做活动清仓换现金的坏死资产！", delta_color="inverse")
             
             st.divider()
             
@@ -1757,10 +1751,10 @@ if is_admin:
             )
             
             fig.add_vline(x=0.33, line_width=2, line_dash="dash", line_color="gray", annotation_text=" 及格销量线 (0.33件/天)", annotation_position="top right")
-            fig.add_hline(y=med_mar, line_width=2, line_dash="dash", line_color="gray", annotation_text=f" 全店中位毛利 ({med_mar:.1f}%)", annotation_position="bottom right")
+            fig.add_hline(y=med_mar, line_width=2, line_dash="dash", line_color="gray", annotation_text=f" 档期中位毛利 ({med_mar:.1f}%)", annotation_position="bottom right")
             
             fig.update_layout(
-                xaxis_title="日均动销率 (件/天) ➡️ 越往右卖得越快",
+                xaxis_title=f"档期日均动销率 (件/天) ➡️ 越往右卖得越快 (计算天数: {days_in_period}天)",
                 yaxis_title="毛利率 (%) ⬆️ 越往上单件越赚钱",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title=""),
                 margin=dict(l=20, r=20, t=50, b=20)
