@@ -226,14 +226,14 @@ with st.sidebar:
                 )
                 
                 if st.button("💾 保存档期名录", type="primary", use_container_width=True):
-    # 强制转换为时间格式后再格式化为字符串 (加入 errors='coerce' 防止空行报错)
-    edited_camp['开始日期'] = pd.to_datetime(edited_camp['开始日期'], errors='coerce').dt.strftime('%Y/%m/%d')
-    edited_camp['结束日期'] = pd.to_datetime(edited_camp['结束日期'], errors='coerce').dt.strftime('%Y/%m/%d')
-    
-    # 清理空行及无效日期
-    edited_camp = edited_camp[edited_camp['档期名称'].astype(str).str.strip() != '']
-    edited_camp['开始日期'] = edited_camp['开始日期'].fillna("")
-    edited_camp['结束日期'] = edited_camp['结束日期'].fillna("")
+                    # 强制转换为时间格式后再格式化为字符串 (加入 errors='coerce' 防止空行报错)
+                    edited_camp['开始日期'] = pd.to_datetime(edited_camp['开始日期'], errors='coerce').dt.strftime('%Y/%m/%d')
+                    edited_camp['结束日期'] = pd.to_datetime(edited_camp['结束日期'], errors='coerce').dt.strftime('%Y/%m/%d')
+                    
+                    # 清理空行及无效日期
+                    edited_camp = edited_camp[edited_camp['档期名称'].astype(str).str.strip() != '']
+                    edited_camp['开始日期'] = edited_camp['开始日期'].fillna("")
+                    edited_camp['结束日期'] = edited_camp['结束日期'].fillna("")
                     
                     save_data(edited_camp, CAMP_SHEET)
                     st.success("✅ 档期名录已更新入云端！")
@@ -578,6 +578,7 @@ with t1:
                                 save_data(latest_sales, SALES_SHEET)
                             if not latest_restock.empty:
                                 latest_restock.loc[(latest_restock['商品名称'] == orig_name) & (latest_restock['颜色'] == orig_color), ['商品名称', '颜色']] = [e_name, e_color]
+                                save_data(latest_restock, RESTOCK_SHEET)
                             if not latest_b2b.empty:
                                 latest_b2b.loc[(latest_b2b['商品名称'] == orig_name) & (latest_b2b['颜色'] == orig_color), ['商品名称', '颜色']] = [e_name, e_color]
                                 save_data(latest_b2b, B2B_SHEET)
