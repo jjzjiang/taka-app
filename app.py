@@ -226,11 +226,14 @@ with st.sidebar:
                 )
                 
                 if st.button("💾 保存档期名录", type="primary", use_container_width=True):
-                    # 格式化转换回字符串存入云端
-                    edited_camp['开始日期'] = edited_camp['开始日期'].dt.strftime('%Y/%m/%d')
-                    edited_camp['结束日期'] = edited_camp['结束日期'].dt.strftime('%Y/%m/%d')
-                    # 清理空行
-                    edited_camp = edited_camp[edited_camp['档期名称'].astype(str).str.strip() != '']
+    # 强制转换为时间格式后再格式化为字符串 (加入 errors='coerce' 防止空行报错)
+    edited_camp['开始日期'] = pd.to_datetime(edited_camp['开始日期'], errors='coerce').dt.strftime('%Y/%m/%d')
+    edited_camp['结束日期'] = pd.to_datetime(edited_camp['结束日期'], errors='coerce').dt.strftime('%Y/%m/%d')
+    
+    # 清理空行及无效日期
+    edited_camp = edited_camp[edited_camp['档期名称'].astype(str).str.strip() != '']
+    edited_camp['开始日期'] = edited_camp['开始日期'].fillna("")
+    edited_camp['结束日期'] = edited_camp['结束日期'].fillna("")
                     
                     save_data(edited_camp, CAMP_SHEET)
                     st.success("✅ 档期名录已更新入云端！")
