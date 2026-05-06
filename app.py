@@ -271,7 +271,6 @@ with st.sidebar:
                             st.rerun()
     
     else:
-        # 🚀 门禁选项升级：新增合作厂商通道
         login_type = st.radio("请选择您的身份", ["🧑‍💼 门店店员 / 🏭 合作厂商", "👑 店长/管理员"], horizontal=True)
         
         if login_type == "👑 店长/管理员":
@@ -358,7 +357,7 @@ elif is_supplier:
 else:
     t1, t2 = st.tabs(["📊 实时库存查询", "🛒 智能POS收银台"])
 
-# ================= 🚀 Tab 1: 库存面板 =================
+# ================= 🚀 Tab 1: 库存面板 (融合动态期间售出引擎) =================
 with t1:
     f_opts_stk = df_stock.copy()
     stock_list_labels = []
@@ -534,6 +533,7 @@ with t1:
         v_df['单品毛利率'] = v_df.apply(calc_margin, axis=1)
         v_df.insert(0, "选择", False)
         
+        # 🚀 角色隔离显示逻辑
         if is_supplier:
             display_cols = ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']
             styled_df = v_df[display_cols].style.format({'售卖价格': '${:.2f}'})
@@ -643,7 +643,7 @@ with t1:
     else:
         st.info("💡 暂无数据或没有找到符合搜索条件的记录。")
 
-# ================= Tab 2: 销售面板 (适配三方) =================
+# ================= Tab 2: 销售面板 =================
 with t2:
     if is_supplier:
         st.subheader("💰 销售报表对账查询")
@@ -655,7 +655,7 @@ with t2:
             if not df_s.empty:
                 min_date = df_s['日期_dt'].min().date()
                 max_date = df_s['日期_dt'].max().date()
-                sel_range = st.date_input("📅 选择查询日期区间", value=[min_date, max_date], key="sup_sales_date")
+                sel_range = st.date_input("📅 选择查询日期区间", value=[st.session_state.camp_start, st.session_state.camp_end], key="sup_sales_date")
                 
                 if len(sel_range) == 2:
                     s_start, s_end = sel_range
@@ -1138,7 +1138,7 @@ if is_admin:
                 st.info("流水表中没有有效的日期数据。")
 
 elif is_supplier:
-    # 🚀 三方：入库发货对账
+    # 🚀 三方：入库发货对账 (Bug修复版)
     with t3:
         st.subheader("📦 进货与入库对账单 (ERP 底单)")
         st.info("💡 这里记录了所有的进货与盘点日志，方便您直接对账发货数据。")
@@ -1149,7 +1149,7 @@ elif is_supplier:
             if not df_r.empty:
                 min_d = df_r['记录日期_dt'].min().date()
                 max_d = df_r['记录日期_dt'].max().date()
-                r_range = st.date_input("📅 选择对账日期区间", value=[min_d, max_date], key="sup_restock_date")
+                r_range = st.date_input("📅 选择对账日期区间", value=[st.session_state.camp_start, st.session_state.camp_end], key="sup_restock_date")
                 
                 if len(r_range) == 2:
                     r_start, r_end = r_range
@@ -1160,21 +1160,25 @@ elif is_supplier:
                 f_r = get_f(f_r, q)
                 
                 if not f_r.empty:
-                    type_filter = st.multiselect("筛选操作类型", options=f_r['操作类型'].unique(), default=["入库", "初始建档"])
-                    f_r = f_r[f_r['操作类型'].isin(type_filter)]
+                    # 🚀 极其安全的动态默认值提取 (防止因数据为空导致的报错)
+                    avail_ops = f_r['操作类型'].unique().tolist()
+                    safe_defaults = [op for op in ["入库", "初始建档"] if op in avail_ops]
                     
-                    if not f_r.empty:
+                    type_filter = st.multiselect("筛选操作类型", options=avail_ops, default=safe_defaults)
+                    
+                    if type_filter:
+                        f_r = f_r[f_r['操作类型'].isin(type_filter)]
                         tot_inbound = f_r['变动数量'].apply(lambda x: pd.to_numeric(x, errors='coerce')).fillna(0).sum()
                         st.metric("🚛 筛选后累计变动数量", f"{int(tot_inbound)} 件")
                         
                         show_cols = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '单件成本', '备注']
                         st.dataframe(f_r[show_cols], use_container_width=True, hide_index=True)
                     else:
-                        st.info("无对应操作类型的记录。")
+                        st.info("请选择至少一种操作类型。")
                 else:
                     st.info("该区间内无对账记录。")
 
-# ================= 🚀 Tab 4: 三方专属 B2B订单 或者 店长考勤 =================
+# ================= 🚀 Tab 4: 考勤(Admin) 或 B2B对账(Supplier) =================
 if is_supplier:
     with t4:
         st.subheader("🤝 B2B 订单对账单")
@@ -1187,7 +1191,7 @@ if is_supplier:
             if not df_b.empty:
                 min_date = df_b['创建日期_dt'].min().date()
                 max_date = df_b['创建日期_dt'].max().date()
-                sel_range = st.date_input("📅 选择建单日期区间", value=[min_date, max_date], key="sup_b2b_date")
+                sel_range = st.date_input("📅 选择建单日期区间", value=[st.session_state.camp_start, st.session_state.camp_end], key="sup_b2b_date")
                 
                 if len(sel_range) == 2:
                     b_start, b_end = sel_range
@@ -1231,7 +1235,6 @@ elif is_admin:
             with st.form("add_employee"):
                 c1, c2 = st.columns(2)
                 e_name = c1.text_input("人员姓名")
-                # 🚀 新增合作厂商 Role
                 e_role = c2.selectbox("身份职位", ["店长", "全职店员", "兼职店员", "实习生", "合作厂商", "其他"])
                 c3, c4, c5 = st.columns(3)
                 e_wage = c3.number_input("时薪 ($/小时, 厂商填0)", min_value=0.0, step=0.5, value=12.0, format="%.2f")
@@ -1378,7 +1381,8 @@ elif is_admin:
                 c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
                 c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
-    # ================= 🚀 Tab 5: 净利润 =================
+# ================= 🚀 Tab 5-8: 仅 Admin 可见的核心管理层 =================
+if is_admin:
     with t5:
         st.subheader(f"💎 真实净利润核算 (9% GST 剥离版)")
         
@@ -1843,7 +1847,6 @@ elif is_admin:
         else:
             st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
-    # ================= 🚀 Tab 8 战略矩阵：强制锁定档期 (不可修改) =================
     with t8:
         st.subheader(f"📈 选品与战略决策盘 (锁定基准档期: {st.session_state.camp_name})")
         st.info(f"💡 为保证日均动销率的严谨性，此罗盘已强制锁定【{st.session_state.camp_start} 至 {st.session_state.camp_end}】进行计算。气泡大小代表当下的实时库存。")
