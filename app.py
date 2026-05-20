@@ -753,8 +753,28 @@ def render_pos_engine(role_prefix):
                     
                     st.markdown(f"**{t('🛍️ 本单共计:', '🛍️ Total Qty:')}** `{cart_total_qty}` &nbsp;&nbsp;|&nbsp;&nbsp; **{t('💰 合计应收:', '💰 Total Pay:')}** ` ${cart_total_amt:.2f}`")
                     
-                    co_col1, co_col2 = st.columns([2, 1])
-                    s_d = co_col1.date_input(t("交易日期 (可补录)", "Transaction Date"), value=datetime.now(), key=f"pos_date_{role_prefix}")
+                    if role_prefix == "admin":
+                        co_col1, co_col_staff, co_col2 = st.columns([1.1, 1.4, 1])
+                        s_d = co_col1.date_input(t("交易日期 (可补录)", "Transaction Date"), value=datetime.now(), key=f"pos_date_{role_prefix}")
+
+                        cashier_options = ["店长"]
+                        if not df_employee.empty:
+                            active_staff_df = df_employee[df_employee['状态'].fillna('').astype(str).str.strip() != '离职'].copy()
+                            if '职位' in active_staff_df.columns:
+                                active_staff_df = active_staff_df[active_staff_df['职位'].fillna('').astype(str).str.strip() != '合作厂商']
+                            staff_names = active_staff_df['员工姓名'].fillna('').astype(str).str.strip().tolist()
+                            cashier_options += [name for name in staff_names if name and name not in cashier_options]
+
+                        curr_user = co_col_staff.selectbox(
+                            t("实际销售员工", "Actual salesperson"),
+                            cashier_options,
+                            key=f"pos_cashier_{role_prefix}",
+                            help=t("管理员代录销售时，这里选择真正完成销售的员工。", "When admin records a sale, choose the employee who actually made the sale."),
+                        )
+                    else:
+                        co_col1, co_col2 = st.columns([2, 1])
+                        s_d = co_col1.date_input(t("交易日期 (可补录)", "Transaction Date"), value=datetime.now(), key=f"pos_date_{role_prefix}")
+                        curr_user = st.session_state.get("current_user", "Unknown")
                     
                     if co_col2.button(t("🗑️ 清空购物车", "🗑️ Clear Cart"), use_container_width=True, key=f"btn_clear_cart_{role_prefix}"):
                         st.session_state.pos_cart = []
@@ -766,7 +786,6 @@ def render_pos_engine(role_prefix):
                         
                         order_id = "ORD-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                         order_date = s_d.strftime("%Y/%m/%d")
-                        curr_user = st.session_state.get("current_user", "Unknown")
                         
                         new_rows = []
                         stock_errors = []
