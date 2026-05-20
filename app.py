@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, time
 import gspread 
 from gspread.exceptions import WorksheetNotFound
 import json
+import hmac
 import plotly.express as px
 
-# ================= 1. 配置与云端数据库初始化 =================
+# --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 
 try:
@@ -17,7 +18,74 @@ except Exception as e:
     st.error(f"🔴 数据库连接失败 Database connection failed! Error: {e}")
     st.stop()
 
-# ================= 2. 数据定义与初始化 =================
+# ================= 🚀 国际化 (i18n) 双语翻译引擎 =================
+if "lang" not in st.session_state:
+    st.session_state.lang = "cn"
+
+def t(cn_text, en_text):
+    return cn_text if st.session_state.lang == "cn" else en_text
+
+col_map = {
+    '商品名称': 'Product', '颜色': 'Variant', '进价成本': 'Cost', '售卖价格': 'Price',
+    '应收到数量': 'Expected', '展示数量': 'Display', '货柜数量': 'Cabinet', '储物间数量': 'Storage', 
+    '坏货数量': 'Damaged', '已售出数量': 'Total Sold', '总库存': 'Total Stock', '期间售出': 'Period Sales',
+    '订单号': 'Order ID', '日期': 'Date', '收银员': 'Cashier', '销售数量': 'Qty', '成交单价': 'Unit Price', 
+    '总营业额': 'Total Amount', '小计': 'Subtotal', '有效客流': 'Traffic',
+    '员工姓名': 'Staff Name', '职位': 'Role', '时薪': 'Hourly Wage', '状态': 'Status',
+    '创建日期': 'Create Date', '客户名称': 'Client', '采购数量': 'Purchase Qty', 'B2B单价': 'B2B Price',
+    '总计应收': 'Total Recv.', '已收定金': 'Deposit', '待收尾款': 'Balance', '约定交期': 'Deadline', '订单状态': 'Order Status', '备注': 'Notes',
+    '记录日期': 'Log Date', '操作类型': 'Operation', '变动数量': 'Change Qty', '库位详情': 'Location Det.',
+    '开始时间': 'Start Time', '结束时间': 'End Time', '工作时长': 'Hours', '核算薪资': 'Est. Wage'
+}
+
+val_map_cn_to_en = {
+    "黑": "Black", "金缮": "Kintsugi", "墨金": "Ink Gold", "银霜": "Silver", "黑玉": "Black Jade",
+    "陨星黑": "Meteorite Black", "陨星": "Meteorite", "天蓝": "Sky Blue", 
+    "金色": "Gold", "蓝色": "Blue", "灰色": "Grey", "银色": "Silver", "黑色": "Black", "默认": "Default", "多件混装": "Mixed Combo",
+    "粉色": "Pink", "绿色": "Green", "紫色": "Purple", "枫叶红": "Maple Red",
+    "口红杯": "Lipstick Cup", "咖啡吸管杯 480ml": "Coffee Cup With Straw 480 ML", "臻享 焖茶壶": "Brew Bottle", "冲锋壶680ML": "Canteen Bottle 680ML",
+    "焖茶杯": "Brew Bottle", "纯钛酒壶": "Pure Ti Wine Flask", "直滤杯": "Flat Bottom", "冲锋壶": "Canteen",
+    "咖啡杯": "Coffee Cup With Straw", "口袋杯": "Pocket Cup", "筷子": "Chopstick", "保温壶": "Thermal Flask",
+    "托盘": "Tray", "盘子": "Plate", "叶碟": "Leaf Plate", "随心杯": "Easy Cup", "主人杯": "Host Cup",
+    "迷你杯": "Mini Cup", "钛艺T杯": "Ti Artisan Bottle", "圆融杯": "Round cup",
+    "钛杯": "Titanium Cup", "常规水杯": "Standard Cup", "低价配件": "Accessories", "T杯": "T-Cup", "钛碗": "Titanium Bowl",
+    "在职": "Active", "离职": "Resigned", "店长": "Manager", "全职店员": "Full-time", "兼职店员": "Part-time", "实习生": "Intern", "合作厂商": "Supplier", "其他": "Other",
+    "意向/沟通中": "In Communication", "已付定金/备货中": "Deposit Paid", "已发货/待结尾款": "Shipped/Pending", "✅ 订单已完成": "✅ Completed",
+    "入库": "Inbound", "调拨": "Transfer", "盘盈": "Surplus (+)", "盘亏": "Shortage (-)", "初始建档": "Initial Setup"
+}
+val_map_en_to_cn = {v: k for k, v in val_map_cn_to_en.items()}
+
+def t_val(val, to_lang):
+    if pd.isna(val): return ""
+    val_str = str(val).strip()
+    if to_lang == 'en': return val_map_cn_to_en.get(val_str, val_str)
+    else: return val_map_en_to_cn.get(val_str, val_str)
+
+def translate_series(series):
+    if st.session_state.lang == 'en':
+        return series.fillna('').astype(str).map(lambda x: val_map_cn_to_en.get(x.strip(), x.strip()))
+    return series.fillna('').astype(str)
+
+# ---------- 稳定性工具函数：避免 Google Sheet 空值/非法数字导致 ValueError ----------
+def to_int(value, default=0):
+    v = pd.to_numeric(value, errors='coerce')
+    return int(v) if pd.notna(v) else default
+
+def to_float(value, default=0.0):
+    v = pd.to_numeric(value, errors='coerce')
+    return float(v) if pd.notna(v) else default
+
+def recalc_total_stock(df, idx):
+    return sum(to_int(df.at[idx, col]) for col in ['展示数量', '货柜数量', '储物间数量'])
+
+def split_sku_label(label):
+    label = str(label)
+    if " (" not in label:
+        return label.strip(), ""
+    name, color = label.rsplit(" (", 1)
+    return name.strip(), color.replace(")", "").strip()
+
+# ================= 🚀 数据定义与初始化 =================
 STOCK_SHEET, SALES_SHEET, EMP_SHEET = "Stock", "Sales", "Employee"
 ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET = "Attendance", "B2B_Orders", "Feedback"
 RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET = "Restock_Log", "Traffic_Log", "Campaigns"
@@ -37,10 +105,7 @@ all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBAC
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {s: 0 for s in all_sheets}
 
-if "pos_cart" not in st.session_state:
-    st.session_state.pos_cart = []
-
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def load_raw_data(sheet_name, version):
     try:
         worksheet = sh.worksheet(sheet_name)
@@ -48,8 +113,13 @@ def load_raw_data(sheet_name, version):
         if not records:
             return pd.DataFrame()
         return pd.DataFrame(records)
-    except Exception as e:
+    except WorksheetNotFound:
+        # 新表允许为空；保存时会自动创建
         return pd.DataFrame()
+    except Exception as e:
+        # 重要：不要把网络/API错误伪装成空表，否则下一次保存可能覆盖掉真实数据
+        st.error(f"🔴 读取 {sheet_name} 失败，请刷新重试或检查 Google Sheet 权限。Error: {e}")
+        st.stop()
 
 def load_data(sheet_name, columns):
     ver = st.session_state.sheet_versions.get(sheet_name, 0)
@@ -66,13 +136,32 @@ def save_data(df, sheet_name):
         worksheet = sh.worksheet(sheet_name)
     except WorksheetNotFound:
         worksheet = sh.add_worksheet(title=sheet_name, rows="1000", cols="20")
-        
-    worksheet.clear() 
+
     df_safe = df.fillna("").astype(str)
     data_to_upload = [df_safe.columns.values.tolist()] + df_safe.values.tolist()
-    worksheet.update(values=data_to_upload, range_name='A1')
-    
-    st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
+
+    try:
+        # 先扩容再写入；绝对不要先 worksheet.clear()，否则网络中断会留下空表
+        min_rows = max(1000, len(data_to_upload) + 100)
+        min_cols = max(20, len(df_safe.columns) + 5)
+        if worksheet.row_count < min_rows or worksheet.col_count < min_cols:
+            worksheet.resize(rows=max(worksheet.row_count, min_rows), cols=max(worksheet.col_count, min_cols))
+
+        worksheet.update(values=data_to_upload, range_name='A1')
+
+        # 写入成功后再清理旧数据尾巴；即使清理失败，也不会丢失新数据
+        next_row = len(data_to_upload) + 1
+        if worksheet.row_count >= next_row:
+            worksheet.batch_clear([f"A{next_row}:ZZ{worksheet.row_count}"])
+
+        st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
+        try:
+            load_raw_data.clear()
+        except Exception:
+            pass
+    except Exception as e:
+        st.error(f"🔴 保存 {sheet_name} 失败，数据没有被清空。请检查网络/Google Sheet权限后重试。Error: {e}")
+        st.stop()
 
 def clean_date_col(df, col_name):
     if not df.empty and col_name in df.columns:
@@ -98,7 +187,10 @@ def load_safe_emp():
     return df
 
 def JIT_fetch(sheets_to_fetch):
-    st.cache_data.clear() 
+    try:
+        load_raw_data.clear()
+    except Exception:
+        pass
     res = {}
     if STOCK_SHEET in sheets_to_fetch: res[STOCK_SHEET] = load_data(STOCK_SHEET, STOCK_COLS)
     if SALES_SHEET in sheets_to_fetch: res[SALES_SHEET] = load_safe_sales()
@@ -131,40 +223,42 @@ if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0
 if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 
 if "fb_reset_key" not in st.session_state: st.session_state.fb_reset_key = 0 
 
-manager_password = "taka888"
+def clear_stock(): st.session_state.stock_reset_key += 1
+def clear_sales(): st.session_state.sales_reset_key += 1
+def clear_emp(): st.session_state.emp_reset_key += 1
+def clear_att(): st.session_state.att_reset_key += 1
+def clear_b2b(): st.session_state.b2b_reset_key += 1
+def clear_fb(): st.session_state.fb_reset_key += 1
 
-# ================= 3. 门禁系统角色解析 =================
+manager_password = str(st.secrets.get("manager_password", "")).strip()
+if not manager_password:
+    st.error("🔴 缺少 Streamlit Secret：manager_password。请在 Streamlit Cloud 的 Secrets 中设置管理员密码。")
+    st.stop()
+
+# 🚀 门禁系统角色解析
+# 安全修复：不要再通过 ?role=admin 或 ?role=employee&user=xxx 自动登录。
+# 之前的写法任何人改 URL 都可能绕过密码/PIN。
 if "role" not in st.session_state:
-    query_role = st.query_params.get("role")
-    query_user = st.query_params.get("user")
-    
-    if query_role == "admin":
-        st.session_state.role = "admin"
-        st.session_state.current_user = "店长"
-    elif query_role in ["employee", "supplier"] and query_user:
-        st.session_state.role = query_role
-        st.session_state.current_user = query_user
-    else:
-        st.session_state.role = None
-        st.session_state.current_user = None
+    st.session_state.role = None
+    st.session_state.current_user = None
 
-# 全局档期状态初始化
+# 🚀 全局档期状态初始化
 if "camp_start" not in st.session_state: st.session_state.camp_start = datetime(2026, 3, 26).date()
 if "camp_end" not in st.session_state: st.session_state.camp_end = datetime.now().date()
 if "camp_name" not in st.session_state: st.session_state.camp_name = "默认全局"
 
-# ================= 4. 侧边栏 =================
+# ================= 🚀 侧边栏 =================
 with st.sidebar:
-    st.header("🔐 系统门禁")
+    st.header(t("🔐 系统门禁", "🔐 System Access"))
     
     if st.session_state.role is not None:
         if st.session_state.role == "admin": user_emoji = "👑"
         elif st.session_state.role == "supplier": user_emoji = "🏭"
         else: user_emoji = "🧑‍💼"
         
-        st.success(f"{user_emoji} 欢迎回来：{st.session_state.current_user}")
+        st.success(t(f"{user_emoji} 欢迎回来：{st.session_state.current_user}", f"{user_emoji} Welcome back: {st.session_state.current_user}"))
         
-        if st.button("🚪 退出系统 (交接班)", use_container_width=True):
+        if st.button(t("🚪 退出系统 (交接班)", "🚪 Logout (Handover)"), use_container_width=True):
             st.session_state.role = None
             st.session_state.current_user = None
             st.query_params.clear()
@@ -173,36 +267,35 @@ with st.sidebar:
         is_admin = (st.session_state.role == "admin")
         
         st.divider()
+        st.header("🎯 全局时间控制器")
+        st.info("💡 选择时间并应用，右侧看板将瞬间同步该时段的数据，告别卡顿！")
+        
+        camp_options = df_camp['档期名称'].dropna().unique().tolist() if not df_camp.empty else []
+        sel_camp = st.selectbox("📌 预设档期", ["手动自定义区间"] + camp_options, index=0)
+        
+        c_start_col, c_end_col = st.columns(2)
+        man_start = c_start_col.date_input("开始日期", value=st.session_state.camp_start)
+        man_end = c_end_col.date_input("结束日期", value=st.session_state.camp_end)
+        
+        if st.button("🚀 应用此全局时间", type="primary", use_container_width=True):
+            if sel_camp != "手动自定义区间" and not df_camp.empty:
+                row = df_camp[df_camp['档期名称'] == sel_camp].iloc[0]
+                try:
+                    st.session_state.camp_start = pd.to_datetime(row['开始日期']).date()
+                    st.session_state.camp_end = pd.to_datetime(row['结束日期']).date()
+                    st.session_state.camp_name = sel_camp
+                except:
+                    pass
+            else:
+                st.session_state.camp_start, st.session_state.camp_end, st.session_state.camp_name = man_start, man_end, "手动自定义区间"
+            st.rerun()
+            
+        st.success(f"**当前全局时间锁定为:**\n\n`{st.session_state.camp_start}` 至 `{st.session_state.camp_end}`")
+            
         if is_admin:
-            st.header("🎯 全局预设档期")
-            st.info("💡 选定档期后，右侧报表日历会自动跳转到该区间，但你仍可独立调整各个面板的时间。")
-            
-            camp_options = df_camp['档期名称'].dropna().unique().tolist() if not df_camp.empty else []
-            
-            def on_camp_change():
-                sel = st.session_state.camp_selector
-                if sel != "手动自定义区间" and not df_camp.empty:
-                    row = df_camp[df_camp['档期名称'] == sel].iloc[0]
-                    try:
-                        st.session_state.camp_start = pd.to_datetime(row['开始日期']).date()
-                        st.session_state.camp_end = pd.to_datetime(row['结束日期']).date()
-                        st.session_state.camp_name = sel
-                    except:
-                        pass
-                else:
-                    st.session_state.camp_name = "手动自定义区间"
-            
-            st.selectbox("📌 选择基准档期", ["手动自定义区间"] + camp_options, key="camp_selector", on_change=on_camp_change)
-            st.write(f"**当前参考区间:** `{st.session_state.camp_start}` 至 `{st.session_state.camp_end}`")
-                
-            with st.expander("⚙️ 管理/自建档期名录", expanded=False):
-                v_camp = df_camp.copy()
-                if v_camp.empty:
-                    v_camp = pd.DataFrame(columns=CAMP_COLS)
-                
-                # 纯文本编辑器防止格式错误报错
+            with st.expander("⚙️ 管理/自建预设档期", expanded=False):
+                v_camp = df_camp.copy() if not df_camp.empty else pd.DataFrame(columns=CAMP_COLS)
                 edited_camp = st.data_editor(v_camp, num_rows="dynamic", use_container_width=True)
-                
                 if st.button("💾 保存档期名录", type="primary", use_container_width=True):
                     edited_camp['开始日期'] = pd.to_datetime(edited_camp['开始日期'], errors='coerce').dt.strftime('%Y/%m/%d').fillna('')
                     edited_camp['结束日期'] = pd.to_datetime(edited_camp['结束日期'], errors='coerce').dt.strftime('%Y/%m/%d').fillna('')
@@ -212,7 +305,6 @@ with st.sidebar:
                     st.rerun()
             
             st.divider()
-            
             st.header("🛠️ 核心管理")
             with st.expander("➕ 新增产品建档 (Add SKU)"):
                 with st.form("new_sku"):
@@ -222,66 +314,59 @@ with st.sidebar:
                     n_cost = c1.number_input("进价", format="%.2f")
                     n_price = c2.number_input("售价", format="%.2f")
                     n_expect = c3.number_input("应收")
-                    
                     i1, i2, i3, i4 = st.columns(4)
                     n_disp = i1.number_input("展示")
                     n_shelf = i2.number_input("货柜")
                     n_stor = i3.number_input("储物")
                     n_dmg = i4.number_input("坏货")
-                    
                     if st.form_submit_button("确认建档"):
                         if n_name and n_color:
                             fresh = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
-                            latest_stock = fresh[STOCK_SHEET]
-                            latest_restock = fresh[RESTOCK_SHEET]
-                            
+                            latest_stock, latest_restock = fresh[STOCK_SHEET], fresh[RESTOCK_SHEET]
                             total = n_disp + n_shelf + n_stor 
                             new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
                             latest_stock = pd.concat([latest_stock, new_r], ignore_index=True)
-                            
                             if total > 0 or n_dmg > 0:
                                 log_date = datetime.now().strftime("%Y/%m/%d")
                                 init_log = pd.DataFrame([[log_date, "初始建档", n_name, n_color, total+n_dmg, "多库位", n_cost, "系统建档"]], columns=RESTOCK_COLS)
                                 latest_restock = pd.concat([init_log, latest_restock], ignore_index=True)
                                 save_data(latest_restock, RESTOCK_SHEET)
-                                
                             save_data(latest_stock, STOCK_SHEET) 
                             st.success("✅ 云端建档成功！")
                             st.rerun()
     
     else:
-        login_type = st.radio("请选择您的身份", ["🧑‍💼 门店店员 / 🏭 合作厂商", "👑 店长/管理员"], horizontal=True)
+        login_type = st.radio(t("请选择您的身份", "Select Role"), [t("🧑‍💼 门店店员 / 🏭 合作厂商", "🧑‍💼 Staff / 🏭 Supplier"), t("👑 店长/管理员", "👑 Admin")], horizontal=True)
         
-        if login_type == "👑 店长/管理员":
-            pwd_input = st.text_input("输入授权密码", type="password")
-            if st.button("🔓 登录后台", use_container_width=True):
-                if pwd_input == manager_password:
+        if login_type == t("👑 店长/管理员", "👑 Admin"):
+            pwd_input = st.text_input(t("输入授权密码", "Enter Admin Password"), type="password")
+            if st.button(t("🔓 登录后台", "🔓 Login"), use_container_width=True):
+                if hmac.compare_digest(str(pwd_input), str(manager_password)):
                     st.session_state.role = "admin"
                     st.session_state.current_user = "店长"
                     st.query_params["role"] = "admin"
                     st.rerun()
                 else:
-                    st.error("❌ 密码错误！")
+                    st.error(t("❌ 密码错误！", "❌ Incorrect Password!"))
         else:
             if df_employee.empty:
-                st.warning("⚠️ 系统内暂无人员档案。请联系店长添加。")
+                st.warning(t("⚠️ 系统内暂无人员档案。请联系店长添加。", "⚠️ No staff records found. Contact Admin."))
             else:
                 active_emps = df_employee[df_employee['状态'] != '离职']['员工姓名'].tolist()
-                
                 if not active_emps:
-                    st.warning("⚠️ 系统中无在职人员。")
+                    st.warning(t("⚠️ 系统中无在职人员。", "⚠️ No active staff found."))
                 else:
-                    emp_sel = st.selectbox("选择您的名字", active_emps)
+                    emp_sel = st.selectbox(t("选择您的名字", "Select your name"), active_emps)
                     emp_row = df_employee[df_employee['员工姓名'] == emp_sel].iloc[0]
                     emp_pwd = str(emp_row['登录密码']).strip()
                     assigned_role = "supplier" if str(emp_row.get('职位', '')).strip() == '合作厂商' else "employee"
                     
                     if emp_pwd == "":
-                        st.info("🌟 系统检测到您是首次登录，请设置专属 PIN 码。")
-                        new_pwd = st.text_input("设置我的登录密码", type="password")
-                        if st.button("💾 保存并进入系统", use_container_width=True):
+                        st.info(t("🌟 系统检测到您是首次登录，请设置专属 PIN 码。", "🌟 First time login. Please set your PIN."))
+                        new_pwd = st.text_input(t("设置我的登录密码", "Set PIN"), type="password")
+                        if st.button(t("💾 保存并进入系统", "💾 Save & Login"), use_container_width=True):
                             if new_pwd.strip() == "":
-                                st.warning("密码不能为空哦！")
+                                st.warning(t("密码不能为空哦！", "PIN cannot be empty!"))
                             else:
                                 fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
                                 e_idx = fresh_emp[fresh_emp['员工姓名'].astype(str).str.strip() == str(emp_sel).strip()].index
@@ -297,8 +382,8 @@ with st.sidebar:
                                 else:
                                     st.error("⚠️ 未找到人员档案，无法设置密码。")
                     else:
-                        emp_pwd_input = st.text_input("输入您的 PIN 码", "Enter PIN", type="password")
-                        if st.button("🔑 打卡/登录", use_container_width=True):
+                        emp_pwd_input = st.text_input(t("输入您的 PIN 码", "Enter PIN"), type="password")
+                        if st.button(t("🔑 打卡/登录", "🔑 Login"), use_container_width=True):
                             if emp_pwd_input == emp_pwd:
                                 st.session_state.role = assigned_role
                                 st.session_state.current_user = emp_sel
@@ -306,22 +391,38 @@ with st.sidebar:
                                 st.query_params["user"] = emp_sel
                                 st.rerun()
                             else:
-                                st.error("❌ 密码不匹配！")
+                                st.error(t("❌ 密码不匹配！", "❌ Incorrect PIN!"))
 
 if st.session_state.role is None:
-    st.title("🏙️ Takashimaya 零售管理系统")
-    st.info("👈 请在左侧选择您的身份并完成登录。")
+    col_t, col_l = st.columns([8, 2])
+    with col_t:
+        st.title(t("🏙️ Takashimaya 零售管理系统", "🏙️ Takashimaya Retail System"))
+    with col_l:
+        lang_choice = st.radio("🌐 Language", ["中文", "English"], index=0 if st.session_state.lang == 'cn' else 1, horizontal=True)
+        if (lang_choice == "中文" and st.session_state.lang != "cn") or (lang_choice == "English" and st.session_state.lang != "en"):
+            st.session_state.lang = 'cn' if lang_choice == "中文" else 'en'
+            st.rerun()
+    st.info(t("👈 请在左侧选择您的身份并完成登录。", "👈 Please select your role on the left menu to login."))
     st.stop()  
 
-# ================= 5. 主界面布局 =================
-st.title("🏙️ Takashimaya 零售管理系统 (云端同步版)")
-q = st.text_input("🔍 全局筛查 (输入单号/客户/商品，自动过滤所有看板)...", placeholder="搜商品/单号/客户...")
+# ================= 🚀 主界面布局 =================
+col_title, col_lang = st.columns([8, 2])
+with col_title:
+    st.title(t("🏙️ Takashimaya 零售管理系统 (云端同步版)", "🏙️ Takashimaya Retail System (Cloud Sync)"))
+with col_lang:
+    lang_choice = st.radio("🌐 Language", ["中文", "English"], index=0 if st.session_state.lang == 'cn' else 1, horizontal=True)
+    if (lang_choice == "中文" and st.session_state.lang != "cn") or (lang_choice == "English" and st.session_state.lang != "en"):
+        st.session_state.lang = 'cn' if lang_choice == "中文" else 'en'
+        st.rerun()
 
-def get_f(df, kw):
-    if kw and not df.empty:
+q = st.text_input(t("🔍 全局筛查 (输入单号/客户/商品，过滤所有看板)...", "🔍 Quick Search..."), placeholder=t("搜商品/单号/客户...", "Search items/orders/customers..."))
+
+def get_f(df, q):
+    if q and not df.empty:
         mask = pd.Series(False, index=df.index)
+        q_cn = t_val(q, 'cn')
         for col in df.columns:
-            mask = mask | df[col].fillna('').astype(str).str.contains(kw, case=False, regex=False)
+            mask = mask | df[col].fillna('').astype(str).str.contains(q, case=False, regex=False) | df[col].fillna('').astype(str).str.contains(q_cn, case=False, regex=False)
         return df[mask]
     return df
 
@@ -330,11 +431,391 @@ is_supplier = st.session_state.role == "supplier"
 is_employee = st.session_state.role == "employee"
 
 if is_admin:
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(["📊 库存", "💰 销售", "📈 毛利", "👥 考勤", "💎 净利润", "🤝 B2B订单", "🗣️ 客户反馈", "🧠 战略(BI)"])
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([t("📊 库存", "📊 Inventory"), t("💰 销售", "💰 Sales"), t("📈 毛利", "📈 Margin"), t("👥 考勤", "👥 Staff"), t("💎 净利润", "💎 Net Profit"), t("🤝 B2B订单", "🤝 B2B"), t("🗣️ 客户反馈", "🗣️ Feedback"), t("🧠 战略(BI)", "🧠 BI")])
 elif is_supplier:
-    t1, t2, t3, t4 = st.tabs(["📊 实时库存快照", "💰 销售报表对账", "📦 进货对账 (ERP流水)", "🤝 B2B订单对账"])
+    t1, t2, t3, t4 = st.tabs([t("📊 实时库存快照", "📊 Inventory Snapshot"), t("💰 销售报表对账", "💰 Sales Report"), t("📦 进货对账 (ERP流水)", "📦 Inbound Records"), t("🤝 B2B订单对账", "🤝 B2B Orders")])
 else:
-    t1, t2, t3 = st.tabs(["📊 实时库存查询", "🛒 智能POS收银台", "⏰ 考勤打卡"])
+    t1, t2, t3 = st.tabs([t("📊 实时库存查询", "📊 Inventory Snapshot"), t("🛒 智能POS收银台", "🛒 Smart POS"), t("⏰ 考勤打卡", "⏰ Timeclock")])
+
+# ================= 🚀 公共核心组件函数化 (防丢利器) =================
+
+def render_inventory_snapshot(role_prefix):
+    st.subheader(t(f"📊 实时库存与期间动销快照", f"📊 Real-time Inventory & Sales Snapshot"))
+    
+    t1_start = st.session_state.camp_start
+    t1_end = st.session_state.camp_end
+    st.info(f"📅 此看板的【期间售出】已随左侧全局控制器锁定在：**{t1_start}** 至 **{t1_end}**")
+        
+    f_stock = get_f(df_stock, q)
+    if not f_stock.empty:
+        v_df = f_stock.copy()
+        
+        period_sales = pd.DataFrame()
+        if not df_sales.empty:
+            df_s_t1 = df_sales.copy()
+            df_s_t1['日期_dt'] = pd.to_datetime(df_s_t1['日期'], errors='coerce')
+            f_s_t1 = df_s_t1[(df_s_t1['日期_dt'] >= pd.Timestamp(t1_start)) & (df_s_t1['日期_dt'] <= pd.Timestamp(t1_end))]
+            if not f_s_t1.empty:
+                f_s_t1['销售数量'] = pd.to_numeric(f_s_t1['销售数量'], errors='coerce').fillna(0)
+                period_sales = f_s_t1.groupby(['商品名称', '颜色'])['销售数量'].sum().reset_index()
+                period_sales.rename(columns={'销售数量': '期间售出'}, inplace=True)
+        
+        if not period_sales.empty:
+            v_df = v_df.merge(period_sales, on=['商品名称', '颜色'], how='left')
+        else:
+            v_df['期间售出'] = 0
+            
+        v_df['期间售出'] = v_df['期间售出'].fillna(0).astype(int)
+        
+        int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '期间售出']
+        for col in int_cols: 
+            if col in v_df.columns:
+                v_df[col] = pd.to_numeric(v_df[col], errors='coerce').fillna(0).astype(int)
+                
+        v_df['进价成本'] = pd.to_numeric(v_df['进价成本'], errors='coerce').fillna(0.0)
+        v_df['售卖价格'] = pd.to_numeric(v_df['售卖价格'], errors='coerce').fillna(0.0)
+        
+        def calc_margin(row):
+            price = row['售卖价格']
+            cost = row['进价成本']
+            if price > 0:
+                return f"{((price - cost) / price * 100):.1f}%"
+            return "0.0%"
+            
+        v_df['单品毛利率'] = v_df.apply(calc_margin, axis=1)
+        v_df.insert(0, "选择", False)
+        
+        v_df['商品名称'] = translate_series(v_df['商品名称'])
+        v_df['颜色'] = translate_series(v_df['颜色'])
+        
+        if role_prefix in ['supplier', 'employee']:
+            display_cols = ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格'] if role_prefix == 'supplier' else ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '售卖价格']
+            df_disp = v_df[display_cols].copy()
+            if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
+            p_col = 'Price' if st.session_state.lang == 'en' else '售卖价格'
+            st.dataframe(df_disp.style.format({p_col: '${:.2f}'}), use_container_width=True, hide_index=True)
+            
+        elif role_prefix == 'admin':
+            display_cols = ['选择', '商品名称', '颜色', '期间售出', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '单品毛利率']
+            df_disp = v_df[display_cols].copy()
+            if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
+            
+            p_col = 'Price' if st.session_state.lang == 'en' else '售卖价格'
+            c_col = 'Cost' if st.session_state.lang == 'en' else '进价成本'
+            stk_col = 'Total Stock' if st.session_state.lang == 'en' else '总库存'
+            sel_col_name = "Sel" if st.session_state.lang == 'en' else "选择"
+            
+            def highlight_low_stock(row):
+                try:
+                    if int(row[stk_col]) <= 2: return ['background-color: #ffe6e6; color: #cc0000; font-weight: bold;'] * len(row)
+                except: pass
+                return [''] * len(row)
+                
+            styled_df = df_disp.style.format({c_col: '${:.2f}', p_col: '${:.2f}'}).apply(highlight_low_stock, axis=1)
+            d_disable = [c for c in df_disp.columns if c not in ["选择", "Sel"]]
+            
+            edited_stock = st.data_editor(
+                styled_df,
+                column_config={sel_col_name: st.column_config.CheckboxColumn(sel_col_name, default=False)},
+                disabled=d_disable,
+                use_container_width=True, hide_index=True, 
+                key=f"stock_editor_{st.session_state.stock_reset_key}"
+            )
+            
+            selected_stock = edited_stock[edited_stock[sel_col_name] == True] if sel_col_name in edited_stock.columns else pd.DataFrame()
+            
+            if len(selected_stock) == 1:
+                st.markdown("### ⚙️ SKU 档案修改机")
+                
+                orig_disp_name = str(selected_stock.iloc[0]['Product' if st.session_state.lang == 'en' else '商品名称'])
+                orig_disp_color = str(selected_stock.iloc[0]['Variant' if st.session_state.lang == 'en' else '颜色'])
+                
+                real_orig_name = t_val(orig_disp_name, 'cn')
+                real_orig_color = t_val(orig_disp_color, 'cn')
+                
+                raw_cost = str(selected_stock.iloc[0][c_col]).replace('$', '').replace(',', '')
+                raw_price = str(selected_stock.iloc[0][p_col]).replace('$', '').replace(',', '')
+                orig_cost = float(raw_cost) if raw_cost else 0.0
+                orig_price = float(raw_price) if raw_price else 0.0
+
+                with st.form("edit_base_info"):
+                    ec1, ec2 = st.columns([1.5, 1.5])
+                    e_name = ec1.text_input("Product Name (CN)", value=real_orig_name)
+                    e_color = ec2.text_input("Variant/Color (CN)", value=real_orig_color)
+                    ec4, ec5 = st.columns([1.5, 1.5])
+                    e_cost = ec4.number_input("Cost ($)", value=orig_cost, format="%.2f")
+                    e_price = ec5.number_input("Price ($)", value=orig_price, format="%.2f")
+                    
+                    if st.form_submit_button("💾 Save Changes", type="primary"):
+                        fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET, B2B_SHEET, RESTOCK_SHEET])
+                        latest_stock = fresh[STOCK_SHEET]
+                        latest_sales = fresh[SALES_SHEET]
+                        latest_b2b = fresh[B2B_SHEET]
+                        latest_restock = fresh[RESTOCK_SHEET]
+                        
+                        m_idx = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_orig_color).strip())].index
+                        if not m_idx.empty:
+                            idx = m_idx[0]
+                            latest_stock.loc[idx, ['商品名称', '颜色', '进价成本', '售卖价格']] = [e_name, e_color, e_cost, e_price]
+                            
+                            if e_name != real_orig_name or e_color != real_orig_color:
+                                if not latest_sales.empty:
+                                    latest_sales.loc[(latest_sales['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_sales['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
+                                    save_data(latest_sales, SALES_SHEET)
+                                if not latest_restock.empty:
+                                    latest_restock.loc[(latest_restock['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_restock['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
+                                    save_data(latest_restock, RESTOCK_SHEET)
+                                if not latest_b2b.empty:
+                                    latest_b2b.loc[(latest_b2b['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_b2b['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
+                                    save_data(latest_b2b, B2B_SHEET)
+                            
+                            save_data(latest_stock, STOCK_SHEET)
+                            st.session_state.stock_reset_key += 1
+                            st.success(f"✅ Product updated!")
+                            st.rerun()
+                        else:
+                            st.error(f"⚠️ 在云端找不到商品档案，可能含有隐藏空格或已被删除。")
+
+                if not selected_stock.empty:
+                    col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
+                    with col_btn1:
+                        if st.button("🗑️ 危险：彻底删档选中 (Delete)", type="primary", key="del_stock"):
+                            fresh_stock = JIT_fetch([STOCK_SHEET])[STOCK_SHEET]
+                            for _, row in selected_stock.iterrows():
+                                d_n = row['Product' if st.session_state.lang == 'en' else '商品名称']
+                                d_c = row['Variant' if st.session_state.lang == 'en' else '颜色']
+                                fresh_stock = fresh_stock[~((fresh_stock['商品名称'].astype(str).str.strip() == t_val(d_n, 'cn').strip()) & (fresh_stock['颜色'].astype(str).str.strip() == t_val(d_c, 'cn').strip()))]
+                            save_data(fresh_stock, STOCK_SHEET) 
+                            st.session_state.stock_reset_key += 1 
+                            st.rerun()
+                    with col_btn2: 
+                        st.button("🔄 取消选中", key="btn_cancel_stock", on_click=clear_stock)
+
+
+def render_pos_engine(role_prefix):
+    st.subheader(t("🛒 智能 POS 收银台 (多件合并结账)", "🛒 Smart POS Cashier"))
+    
+    pos_col1, pos_col2 = st.columns([1.2, 1.5])
+    
+    f_opts = get_f(df_stock, "").copy() 
+    if not f_opts.empty:
+        f_opts['disp_name'] = translate_series(f_opts['商品名称']).fillna('').astype(str)
+        f_opts['disp_color'] = translate_series(f_opts['颜色']).fillna('').astype(str)
+        f_opts['label'] = f_opts['disp_name'] + " (" + f_opts['disp_color'] + ")" 
+        
+        with pos_col1:
+            with st.container(border=True):
+                st.markdown(t("#### 1️⃣ 扫码/点单区", "#### 1️⃣ Scan / Order"))
+                
+                search_kw = st.text_input(t("🔍 键盘输入搜商品 (自动过滤下拉菜单)", "🔍 Type to search item"), key=f"pos_search_{role_prefix}")
+                filtered_opts = f_opts[f_opts['label'].str.contains(search_kw, case=False, na=False)] if search_kw else f_opts
+                
+                if not filtered_opts.empty:
+                    s_l = st.selectbox(t("选择商品", "Select Item"), filtered_opts['label'], key=f"pos_item_{role_prefix}")
+                    selected_row = filtered_opts[filtered_opts['label'] == s_l].iloc[0]
+                    base_price = to_float(selected_row['售卖价格'])
+                    
+                    c_q, c_d = st.columns(2)
+                    s_q = c_q.number_input(t("销售数量", "Qty"), min_value=1, value=1, step=1, key=f"pos_qty_{role_prefix}")
+                    d_opts = {"无折扣 (原价)": 1.0, "95折": 0.95, "9折": 0.90, "85折": 0.85, "8折": 0.80, "75折": 0.75, "7折": 0.70, "5折 (半价)": 0.50} if st.session_state.lang == 'cn' else {"No Discount": 1.0, "5% Off": 0.95, "10% Off": 0.90, "15% Off": 0.85, "20% Off": 0.80, "25% Off": 0.75, "30% Off": 0.70, "50% Off": 0.50}
+                    s_discount = c_d.selectbox(t("快捷折扣", "Discount"), list(d_opts.keys()), key=f"pos_disc_{role_prefix}")
+                    
+                    auto_calc_price = base_price * d_opts[s_discount]
+                    s_p = st.number_input(t("此单品最终成交价 ($)", "Final Price per item ($)"), value=float(auto_calc_price), format="%.2f", key=f"pos_final_p_{role_prefix}")
+                    
+                    if st.button(t("➕ 加入当前购物车", "➕ Add to Cart"), use_container_width=True, key=f"btn_add_cart_{role_prefix}"):
+                        if "pos_cart" not in st.session_state:
+                            st.session_state.pos_cart = []
+                        st.session_state.pos_cart.append({
+                            "real_name": str(selected_row['商品名称']),
+                            "real_color": str(selected_row['颜色']),
+                            "disp_name": str(selected_row['disp_name']),
+                            "disp_color": str(selected_row['disp_color']),
+                            "数量": s_q,
+                            "单价": s_p,
+                            "小计": s_q * s_p
+                        })
+                        st.rerun()
+                else:
+                    st.warning(t("未找到符合条件的商品。", "No item found."))
+
+        with pos_col2:
+            with st.container(border=True):
+                st.markdown(t("#### 2️⃣ 当前购物车", "#### 2️⃣ Current Cart"))
+                if not st.session_state.get("pos_cart"):
+                    st.info(t("🛒 购物车空空如也。", "🛒 Cart is empty."))
+                else:
+                    cart_df = pd.DataFrame(st.session_state.pos_cart)
+                    df_disp = cart_df[['disp_name', 'disp_color', '数量', '单价', '小计']].copy()
+                    df_disp.columns = ['商品名称', '颜色', '数量', '单价', '小计']
+                    if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
+                    u_col = 'Unit Price' if st.session_state.lang == 'en' else '单价'
+                    s_col = 'Subtotal' if st.session_state.lang == 'en' else '小计'
+                    st.dataframe(df_disp.style.format({u_col: '${:.2f}', s_col: '${:.2f}'}), use_container_width=True, hide_index=True)
+                    
+                    cart_total_qty = cart_df['数量'].sum()
+                    cart_total_amt = cart_df['小计'].sum()
+                    
+                    st.markdown(f"**{t('🛍️ 本单共计:', '🛍️ Total Qty:')}** `{cart_total_qty}` &nbsp;&nbsp;|&nbsp;&nbsp; **{t('💰 合计应收:', '💰 Total Pay:')}** ` ${cart_total_amt:.2f}`")
+                    
+                    co_col1, co_col2 = st.columns([2, 1])
+                    s_d = co_col1.date_input(t("交易日期 (可补录)", "Transaction Date"), value=datetime.now(), key=f"pos_date_{role_prefix}")
+                    
+                    if co_col2.button(t("🗑️ 清空购物车", "🗑️ Clear Cart"), use_container_width=True, key=f"btn_clear_cart_{role_prefix}"):
+                        st.session_state.pos_cart = []
+                        st.rerun()
+                        
+                    if st.button(t("💳 确认结账 (生成流水)", "💳 Checkout"), type="primary", use_container_width=True, key=f"btn_checkout_{role_prefix}"):
+                        fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
+                        latest_stock = fresh[STOCK_SHEET]
+                        latest_sales = fresh[SALES_SHEET]
+                        
+                        order_id = "ORD-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                        order_date = s_d.strftime("%Y/%m/%d")
+                        curr_user = st.session_state.get("current_user", "Unknown")
+                        
+                        new_rows = []
+                        stock_errors = []
+
+                        # 先统一校验库存，全部通过后再写入，避免半成功/负库存
+                        for item in st.session_state.pos_cart:
+                            real_n = item['real_name']
+                            real_c = item['real_color']
+                            idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
+                            if idx_p.empty:
+                                stock_errors.append(f"找不到商品：{real_n} ({real_c})")
+                                continue
+                            current_cabinet = to_int(latest_stock.at[idx_p[0], '货柜数量'])
+                            if current_cabinet < int(item['数量']):
+                                stock_errors.append(f"{real_n} ({real_c}) 货柜库存不足：现有 {current_cabinet}，需要 {item['数量']}")
+
+                        if stock_errors:
+                            st.error("⚠️ 无法结账：\n" + "\n".join(stock_errors))
+                            st.stop()
+
+                        for item in st.session_state.pos_cart:
+                            real_n = item['real_name']
+                            real_c = item['real_color']
+                            new_rows.append([order_id, order_date, curr_user, real_n, real_c, item['数量'], item['单价'], item['小计']])
+                            idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
+                            i_p = idx_p[0]
+                            latest_stock.at[i_p, '货柜数量'] = to_int(latest_stock.at[i_p, '货柜数量']) - int(item['数量'])
+                            latest_stock.at[i_p, '已售出数量'] = to_int(latest_stock.at[i_p, '已售出数量']) + int(item['数量'])
+                            latest_stock.at[i_p, '总库存'] = recalc_total_stock(latest_stock, i_p)
+                        
+                        new_sales_df = pd.DataFrame(new_rows, columns=SALES_COLS)
+                        latest_sales = pd.concat([new_sales_df, latest_sales], ignore_index=True)
+                        
+                        save_data(latest_sales, SALES_SHEET) 
+                        save_data(latest_stock, STOCK_SHEET) 
+                        
+                        st.session_state.pos_cart = []
+                        st.success(t(f"🎉 结账成功！流水号 {order_id}", f"🎉 Checkout Success! ID: {order_id}"))
+                        st.rerun()
+                        
+    else:
+        st.info(t("请先在库存中添加商品。", "Please add items to stock first."))
+
+    st.divider()
+    
+    with st.expander(t("🚶‍♂️ 录入/修正每日有效客流", "🚶‍♂️ Daily Traffic Log"), expanded=False):
+        with st.form(f"traffic_form_{role_prefix}"):
+            tc1, tc2 = st.columns(2)
+            tr_date = tc1.date_input(t("📅 客流日期", "📅 Date"), value=datetime.now())
+            tr_num = tc2.number_input(t("👁️ 有效咨询/看货人数", "👁️ Traffic Count"), min_value=0, step=1, value=0)
+            
+            if st.form_submit_button(t("💾 保存今日客流数据", "💾 Save Traffic Data"), type="primary", use_container_width=True):
+                fresh_traffic = JIT_fetch([TRAFFIC_SHEET])[TRAFFIC_SHEET]
+                tr_date_str = tr_date.strftime("%Y/%m/%d")
+                
+                idx = fresh_traffic[fresh_traffic['日期'].astype(str).str.strip() == tr_date_str].index
+                if not idx.empty:
+                    fresh_traffic.at[idx[0], '有效客流'] = tr_num
+                else:
+                    new_row = pd.DataFrame([[tr_date_str, tr_num]], columns=TRAFFIC_COLS)
+                    fresh_traffic = pd.concat([new_row, fresh_traffic], ignore_index=True)
+                
+                save_data(fresh_traffic, TRAFFIC_SHEET)
+                st.success("✅ Saved!")
+                st.rerun()
+
+    with st.expander(t("🔄 客户换货处理 (Exchange)", "🔄 Item Exchange"), expanded=False):
+        if not f_opts.empty:
+            xc1, xc2 = st.columns(2)
+            with xc1:
+                st.markdown(t("### 🔙 退回的商品 (入库)", "### 🔙 Return Item"))
+                ex_ret_l = st.selectbox("1. Return Item", f_opts['label'], key=f"ex_ret_sku_{role_prefix}")
+                ret_row = f_opts[f_opts['label'] == ex_ret_l].iloc[0]
+                ret_base_p = to_float(ret_row['售卖价格'])
+                ret_p = st.number_input("2. Return Value ($)", value=ret_base_p, format="%.2f", key=f"ret_val_{role_prefix}")
+                ret_dmg = st.checkbox(t("⚠️ 退回商品有瑕疵 (记入坏货)", "⚠️ Item Damaged"), value=False, key=f"dmg_{role_prefix}")
+
+            with xc2:
+                st.markdown(t("### 🆕 换购的商品 (出库)", "### 🆕 New Item"))
+                ex_new_l = st.selectbox("1. New Item", f_opts['label'], key=f"ex_new_sku_{role_prefix}")
+                new_row = f_opts[f_opts['label'] == ex_new_l].iloc[0]
+                new_base_p = to_float(new_row['售卖价格'])
+                new_p = st.number_input("2. New Item Price ($)", value=new_base_p, format="%.2f", key=f"new_val_{role_prefix}")
+
+            st.markdown("---")
+            
+            c_date, c_diff = st.columns(2)
+            with c_date:
+                ex_date_input = st.date_input("📅 Date", value=datetime.now(), key=f"ex_date_input_{role_prefix}")
+            
+            with c_diff:
+                diff = new_p - ret_p
+                if diff > 0:
+                    st.warning(t(f"💰 需补差价：${diff:.2f}", f"💰 Customer Pays: ${diff:.2f}"))
+                elif diff < 0:
+                    st.success(t(f"💸 需退差价：${abs(diff):.2f}", f"💸 Refund Customer: ${abs(diff):.2f}"))
+                else:
+                    st.info(t("🤝 等价交换", "🤝 Even Exchange"))
+
+            if st.button(t("🔄 确认执行换货", "🔄 Confirm Exchange"), type="primary", use_container_width=True, key=f"btn_exchange_{role_prefix}"):
+                fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
+                latest_stock = fresh[STOCK_SHEET]
+                latest_sales = fresh[SALES_SHEET]
+                
+                ex_date = ex_date_input.strftime("%Y/%m/%d")
+                ex_order_id = "EXC-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") 
+                curr_user = st.session_state.get("current_user", "Unknown")
+                
+                r_name = t_val(ret_row['disp_name'], 'cn')
+                r_col = t_val(ret_row['disp_color'], 'cn')
+                n_name = t_val(new_row['disp_name'], 'cn')
+                n_col = t_val(new_row['disp_color'], 'cn')
+                
+                idx_ret_list = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(r_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(r_col).strip())].index
+                idx_new_list = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(n_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(n_col).strip())].index
+                if idx_ret_list.empty or idx_new_list.empty:
+                    st.error("⚠️ 换货失败：退回或换购商品在最新库存表中不存在，请刷新后重试。")
+                    st.stop()
+                idx_ret = idx_ret_list[0]
+                idx_new = idx_new_list[0]
+                if to_int(latest_stock.at[idx_new, '货柜数量']) < 1:
+                    st.error(f"⚠️ 换货失败：{n_name} ({n_col}) 货柜库存不足。")
+                    st.stop()
+                s_ret = pd.DataFrame([[ex_order_id, ex_date, curr_user, latest_stock.at[idx_ret,'商品名称'], latest_stock.at[idx_ret,'颜色'], -1, ret_p, -1 * ret_p]], columns=SALES_COLS)
+                s_new = pd.DataFrame([[ex_order_id, ex_date, curr_user, latest_stock.at[idx_new,'商品名称'], latest_stock.at[idx_new,'颜色'], 1, new_p, 1 * new_p]], columns=SALES_COLS)
+                
+                latest_sales = pd.concat([s_new, s_ret, latest_sales], ignore_index=True)
+                
+                if ret_dmg:
+                    latest_stock.at[idx_ret, '坏货数量'] = to_int(latest_stock.at[idx_ret, '坏货数量']) + 1
+                else:
+                    latest_stock.at[idx_ret, '货柜数量'] = to_int(latest_stock.at[idx_ret, '货柜数量']) + 1
+                    latest_stock.at[idx_ret, '总库存'] = recalc_total_stock(latest_stock, idx_ret)
+                latest_stock.at[idx_ret, '已售出数量'] = to_int(latest_stock.at[idx_ret, '已售出数量']) - 1
+                
+                latest_stock.at[idx_new, '货柜数量'] = to_int(latest_stock.at[idx_new, '货柜数量']) - 1
+                latest_stock.at[idx_new, '已售出数量'] = to_int(latest_stock.at[idx_new, '已售出数量']) + 1
+                latest_stock.at[idx_new, '总库存'] = recalc_total_stock(latest_stock, idx_new)
+                
+                save_data(latest_sales, SALES_SHEET) 
+                save_data(latest_stock, STOCK_SHEET) 
+                st.success("✅ Exchange Success!")
+                st.rerun()
 
 # =========================================================================================
 # ================================== 🚀 Admin 专属代码 ======================================
@@ -344,7 +825,9 @@ if is_admin:
         f_opts_stk = df_stock.copy()
         stock_list_labels = []
         if not f_opts_stk.empty:
-            f_opts_stk['label'] = f_opts_stk['商品名称'].fillna('').astype(str) + " (" + f_opts_stk['颜色'].fillna('').astype(str) + ")"
+            f_opts_stk['disp_name'] = translate_series(f_opts_stk['商品名称']).fillna('').astype(str)
+            f_opts_stk['disp_color'] = translate_series(f_opts_stk['颜色']).fillna('').astype(str)
+            f_opts_stk['label'] = f_opts_stk['disp_name'] + " (" + f_opts_stk['disp_color'] + ")"
             stock_list_labels = f_opts_stk['label'].tolist()
             
         st.subheader("📦 专业 ERP 库存与货位管家")
@@ -368,15 +851,16 @@ if is_admin:
                         latest_stock = fresh[STOCK_SHEET]
                         latest_restock = fresh[RESTOCK_SHEET]
                         
-                        real_name = r_sku.rsplit(" (", 1)[0]
-                        real_color = r_sku.rsplit(" (", 1)[1].replace(")", "")
+                        sel_disp_name = r_sku.rsplit(" (", 1)[0]
+                        sel_disp_color = r_sku.rsplit(" (", 1)[1].replace(")", "")
+                        real_name = t_val(sel_disp_name, 'cn')
+                        real_color = t_val(sel_disp_color, 'cn')
                         
-                        # 剥壳匹配
                         match_idx = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_color).strip())].index
                         if not match_idx.empty:
                             idx = match_idx[0]
-                            latest_stock.at[idx, r_loc] = int(pd.to_numeric(latest_stock.at[idx, r_loc], errors='coerce') or 0) + r_qty
-                            latest_stock.at[idx, '总库存'] = sum([int(pd.to_numeric(latest_stock.at[idx, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                            latest_stock.at[idx, r_loc] = to_int(latest_stock.at[idx, r_loc]) + r_qty
+                            latest_stock.at[idx, '总库存'] = recalc_total_stock(latest_stock, idx)
                             if r_cost > 0: latest_stock.at[idx, '进价成本'] = r_cost 
                                 
                             new_log = pd.DataFrame([[
@@ -406,18 +890,20 @@ if is_admin:
                         latest_stock = fresh[STOCK_SHEET]
                         latest_restock = fresh[RESTOCK_SHEET]
                         
-                        real_name = t_sku.rsplit(" (", 1)[0]
-                        real_color = t_sku.rsplit(" (", 1)[1].replace(")", "")
+                        sel_disp_name = t_sku.rsplit(" (", 1)[0]
+                        sel_disp_color = t_sku.rsplit(" (", 1)[1].replace(")", "")
+                        real_name = t_val(sel_disp_name, 'cn')
+                        real_color = t_val(sel_disp_color, 'cn')
                         
                         match_idx = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_color).strip())].index
                         if not match_idx.empty:
                             idx = match_idx[0]
-                            curr_src_qty = int(pd.to_numeric(latest_stock.at[idx, t_src], errors='coerce') or 0)
+                            curr_src_qty = to_int(latest_stock.at[idx, t_src])
                             if curr_src_qty < t_qty:
                                 st.error(f"⚠️ {t_src.replace('数量','')} 库存不足！仅剩 {curr_src_qty} 件。")
                             else:
                                 latest_stock.at[idx, t_src] = curr_src_qty - t_qty
-                                latest_stock.at[idx, t_dst] = int(pd.to_numeric(latest_stock.at[idx, t_dst], errors='coerce') or 0) + t_qty
+                                latest_stock.at[idx, t_dst] = to_int(latest_stock.at[idx, t_dst]) + t_qty
                                 
                                 new_log = pd.DataFrame([[
                                     datetime.now().strftime("%Y/%m/%d"), "调拨", real_name, real_color, t_qty, 
@@ -453,15 +939,17 @@ if is_admin:
                         latest_stock = fresh[STOCK_SHEET]
                         latest_restock = fresh[RESTOCK_SHEET]
                         
-                        real_name = a_sku.rsplit(" (", 1)[0]
-                        real_color = a_sku.rsplit(" (", 1)[1].replace(")", "")
+                        sel_disp_name = a_sku.rsplit(" (", 1)[0]
+                        sel_disp_color = a_sku.rsplit(" (", 1)[1].replace(")", "")
+                        real_name = t_val(sel_disp_name, 'cn')
+                        real_color = t_val(sel_disp_color, 'cn')
                         
                         match_idx = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_color).strip())].index
                         if not match_idx.empty:
                             idx = match_idx[0]
-                            latest_stock.at[idx, a_loc] = int(pd.to_numeric(latest_stock.at[idx, a_loc], errors='coerce') or 0) + a_diff
+                            latest_stock.at[idx, a_loc] = to_int(latest_stock.at[idx, a_loc]) + a_diff
                             if a_loc != '坏货数量':
-                                latest_stock.at[idx, '总库存'] = sum([int(pd.to_numeric(latest_stock.at[idx, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                                latest_stock.at[idx, '总库存'] = recalc_total_stock(latest_stock, idx)
                             
                             adj_type = "盘盈" if a_diff > 0 else "盘亏"
                             new_log = pd.DataFrame([[
@@ -478,345 +966,21 @@ if is_admin:
                             st.error(f"⚠️ 找不到对应商品：{real_name} ({real_color})。")
         st.divider()
 
-        st.subheader(f"📊 实时库存与期间动销快照")
+        # 🔥 调用统一的库存快照引擎
+        render_inventory_snapshot('admin')
         
-        # 恢复独立日期选择器
-        sel_range_t1 = st.date_input(
-            "⏳ 选择要分析的销售区间 (默认基准档期)：", 
-            value=[st.session_state.camp_start, st.session_state.camp_end],
-            key="t1_date_picker"
-        )
-        if len(sel_range_t1) == 2:
-            t1_start, t1_end = sel_range_t1[0], sel_range_t1[1]
-        else:
-            t1_start, t1_end = sel_range_t1[0], sel_range_t1[0]
-            
-        f_stock = get_f(df_stock, q)
-        if not f_stock.empty:
-            v_df = f_stock.copy()
-            
-            period_sales = pd.DataFrame()
-            if not df_sales.empty:
-                df_s_t1 = df_sales.copy()
-                df_s_t1['日期_dt'] = pd.to_datetime(df_s_t1['日期'], errors='coerce')
-                f_s_t1 = df_s_t1[(df_s_t1['日期_dt'] >= pd.Timestamp(t1_start)) & (df_s_t1['日期_dt'] <= pd.Timestamp(t1_end))]
-                if not f_s_t1.empty:
-                    f_s_t1['销售数量'] = pd.to_numeric(f_s_t1['销售数量'], errors='coerce').fillna(0)
-                    period_sales = f_s_t1.groupby(['商品名称', '颜色'])['销售数量'].sum().reset_index()
-                    period_sales.rename(columns={'销售数量': '期间售出'}, inplace=True)
-            
-            if not period_sales.empty:
-                v_df = v_df.merge(period_sales, on=['商品名称', '颜色'], how='left')
-            else:
-                v_df['期间售出'] = 0
-                
-            v_df['期间售出'] = v_df['期间售出'].fillna(0).astype(int)
-            
-            int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '期间售出']
-            for col in int_cols: 
-                if col in v_df.columns:
-                    v_df[col] = pd.to_numeric(v_df[col], errors='coerce').fillna(0).astype(int)
-                    
-            v_df['进价成本'] = pd.to_numeric(v_df['进价成本'], errors='coerce').fillna(0.0)
-            v_df['售卖价格'] = pd.to_numeric(v_df['售卖价格'], errors='coerce').fillna(0.0)
-            
-            def calc_margin(row):
-                price = row['售卖价格']
-                cost = row['进价成本']
-                if price > 0:
-                    return f"{((price - cost) / price * 100):.1f}%"
-                return "0.0%"
-                
-            v_df['单品毛利率'] = v_df.apply(calc_margin, axis=1)
-            
-            display_cols = ['商品名称', '颜色', '期间售出', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '单品毛利率']
-            df_disp = v_df[display_cols].copy()
-            
-            df_disp.insert(0, "选择", False)
-            
-            def highlight_low_stock(row):
-                try:
-                    if int(row['总库存']) <= 2: return ['background-color: #ffe6e6; color: #cc0000; font-weight: bold;'] * len(row)
-                except: pass
-                return [''] * len(row)
-                
-            styled_df = df_disp.style.format({'进价成本': '${:.2f}', '售卖价格': '${:.2f}'}).apply(highlight_low_stock, axis=1)
-            
-            d_disable = [c for c in df_disp.columns if c != "选择"]
-            
-            edited_stock = st.data_editor(
-                styled_df,
-                column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
-                disabled=d_disable,
-                use_container_width=True, hide_index=True, 
-                key=f"stock_editor_{st.session_state.stock_reset_key}"
-            )
-            
-            selected_stock = edited_stock[edited_stock["选择"] == True] if "选择" in edited_stock.columns else pd.DataFrame()
-            
-            if len(selected_stock) == 1:
-                st.markdown("### ⚙️ SKU 档案修改机")
-                
-                orig_disp_name = str(selected_stock.iloc[0]['商品名称'])
-                orig_disp_color = str(selected_stock.iloc[0]['颜色'])
-                
-                raw_cost = str(selected_stock.iloc[0]['进价成本']).replace('$', '').replace(',', '')
-                raw_price = str(selected_stock.iloc[0]['售卖价格']).replace('$', '').replace(',', '')
-                orig_cost = float(raw_cost) if raw_cost else 0.0
-                orig_price = float(raw_price) if raw_price else 0.0
-
-                with st.form("edit_base_info"):
-                    ec1, ec2 = st.columns([1.5, 1.5])
-                    e_name = ec1.text_input("产品名称", value=orig_disp_name)
-                    e_color = ec2.text_input("颜色", value=orig_disp_color)
-                    ec4, ec5 = st.columns([1.5, 1.5])
-                    e_cost = ec4.number_input("进价成本 ($)", value=orig_cost, format="%.2f")
-                    e_price = ec5.number_input("售卖价格 ($)", value=orig_price, format="%.2f")
-                    
-                    if st.form_submit_button("💾 保存修改", type="primary"):
-                        fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET, B2B_SHEET, RESTOCK_SHEET])
-                        latest_stock = fresh[STOCK_SHEET]
-                        latest_sales = fresh[SALES_SHEET]
-                        latest_b2b = fresh[B2B_SHEET]
-                        latest_restock = fresh[RESTOCK_SHEET]
-                        
-                        m_idx = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(orig_disp_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(orig_disp_color).strip())].index
-                        if not m_idx.empty:
-                            idx = m_idx[0]
-                            latest_stock.loc[idx, ['商品名称', '颜色', '进价成本', '售卖价格']] = [e_name, e_color, e_cost, e_price]
-                            
-                            if e_name != orig_disp_name or e_color != orig_disp_color:
-                                if not latest_sales.empty:
-                                    latest_sales.loc[(latest_sales['商品名称'].astype(str).str.strip() == str(orig_disp_name).strip()) & (latest_sales['颜色'].astype(str).str.strip() == str(orig_disp_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
-                                    save_data(latest_sales, SALES_SHEET)
-                                if not latest_restock.empty:
-                                    latest_restock.loc[(latest_restock['商品名称'].astype(str).str.strip() == str(orig_disp_name).strip()) & (latest_restock['颜色'].astype(str).str.strip() == str(orig_disp_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
-                                    save_data(latest_restock, RESTOCK_SHEET)
-                                if not latest_b2b.empty:
-                                    latest_b2b.loc[(latest_b2b['商品名称'].astype(str).str.strip() == str(orig_disp_name).strip()) & (latest_b2b['颜色'].astype(str).str.strip() == str(orig_disp_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
-                                    save_data(latest_b2b, B2B_SHEET)
-                            
-                            save_data(latest_stock, STOCK_SHEET)
-                            st.session_state.stock_reset_key += 1
-                            st.success(f"✅ 修改成功!")
-                            st.rerun()
-                        else:
-                            st.error(f"⚠️ 在云端找不到商品档案，可能已被删除。")
-
-                if not selected_stock.empty:
-                    col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
-                    with col_btn1:
-                        if st.button("🗑️ 危险：彻底删档选中", type="primary", key="del_stock"):
-                            fresh_stock = JIT_fetch([STOCK_SHEET])[STOCK_SHEET]
-                            for _, row in selected_stock.iterrows():
-                                d_n = row['商品名称']
-                                d_c = row['颜色']
-                                fresh_stock = fresh_stock[~((fresh_stock['商品名称'].astype(str).str.strip() == str(d_n).strip()) & (fresh_stock['颜色'].astype(str).str.strip() == str(d_c).strip()))]
-                            save_data(fresh_stock, STOCK_SHEET) 
-                            st.session_state.stock_reset_key += 1 
-                            st.rerun()
-                    with col_btn2: 
-                        st.button("🔄 取消选中", key="btn_cancel_stock", on_click=clear_stock)
-            
-            with st.expander("📜 ERP底单：查看所有出入库/平账流水账", expanded=False):
-                df_r_disp = get_f(df_restock, q).copy()
-                st.dataframe(df_r_disp, use_container_width=True)
+        with st.expander("📜 ERP底单：查看所有出入库/平账流水账", expanded=False):
+            df_r_disp = get_f(df_restock, q).copy()
+            df_r_disp['操作类型'] = translate_series(df_r_disp['操作类型'])
+            df_r_disp['商品名称'] = translate_series(df_r_disp['商品名称'])
+            df_r_disp['颜色'] = translate_series(df_r_disp['颜色'])
+            if st.session_state.lang == 'en': df_r_disp.rename(columns=col_map, inplace=True)
+            st.dataframe(df_r_disp, use_container_width=True)
 
     with t2:
-        st.subheader("🛒 智能 POS 收银台 (多件合并结账)")
+        # 🔥 调用统一的 POS 收银引擎
+        render_pos_engine('admin')
         
-        pos_col1, pos_col2 = st.columns([1.2, 1.5])
-        
-        f_opts = get_f(df_stock, "").copy() 
-        if not f_opts.empty:
-            f_opts['label'] = f_opts['商品名称'].fillna('').astype(str) + " (" + f_opts['颜色'].fillna('').astype(str) + ")" 
-            
-            with pos_col1:
-                with st.container(border=True):
-                    st.markdown("#### 1️⃣ 扫码/点单区")
-                    
-                    search_kw_admin = st.text_input("🔍 键盘输入搜商品 (自动过滤下拉菜单)", key="pos_search_admin")
-                    filtered_opts_admin = f_opts[f_opts['label'].str.contains(search_kw_admin, case=False, na=False)] if search_kw_admin else f_opts
-                    
-                    if not filtered_opts_admin.empty:
-                        s_l = st.selectbox("选择售出商品", filtered_opts_admin['label'], key="pos_item_admin")
-                        selected_row = filtered_opts_admin[filtered_opts_admin['label'] == s_l].iloc[0]
-                        base_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
-                        
-                        c_q, c_d = st.columns(2)
-                        s_q = c_q.number_input("销售数量", min_value=1, value=1, step=1, key="pos_qty_admin")
-                        
-                        d_opts = {"无折扣 (原价)": 1.0, "95折": 0.95, "9折": 0.90, "85折": 0.85, "8折": 0.80, "75折": 0.75, "7折": 0.70, "5折 (半价)": 0.50}
-                        s_discount = c_d.selectbox("快捷折扣", list(d_opts.keys()), key="pos_disc_admin")
-                        
-                        auto_calc_price = base_price * d_opts[s_discount]
-                        
-                        # 🔥 修复 POS 价格不动态更新：给 key 加上所选项变量强制重绘
-                        s_p = st.number_input("此单品最终成交价 ($)", value=float(auto_calc_price), format="%.2f", key=f"p_{s_l}_{s_discount}_admin")
-                        
-                        if st.button("➕ 加入当前购物车", use_container_width=True, key="btn_add_cart_admin"):
-                            item_dict = {
-                                "商品名称": str(selected_row['商品名称']),
-                                "颜色": str(selected_row['颜色']),
-                                "数量": s_q,
-                                "单价": s_p,
-                                "小计": s_q * s_p
-                            }
-                            st.session_state.pos_cart.append(item_dict)
-                            st.rerun()
-                    else:
-                        st.warning("未找到符合条件的商品。")
-
-            with pos_col2:
-                with st.container(border=True):
-                    st.markdown("#### 2️⃣ 当前购物车")
-                    if not st.session_state.pos_cart:
-                        st.info("🛒 购物车空空如也。")
-                    else:
-                        cart_df = pd.DataFrame(st.session_state.pos_cart)
-                        df_disp = cart_df[['商品名称', '颜色', '数量', '单价', '小计']].copy()
-                        st.dataframe(df_disp.style.format({'单价': '${:.2f}', '小计': '${:.2f}'}), use_container_width=True, hide_index=True)
-                        
-                        cart_total_qty = cart_df['数量'].sum()
-                        cart_total_amt = cart_df['小计'].sum()
-                        
-                        st.markdown(f"**🛍️ 本单共计:** `{cart_total_qty}` &nbsp;&nbsp;|&nbsp;&nbsp; **💰 合计应收:** ` ${cart_total_amt:.2f}`")
-                        
-                        co_col1, co_col2 = st.columns([2, 1])
-                        s_d = co_col1.date_input("交易日期 (可补录)", value=datetime.now(), key="pos_date_admin")
-                        
-                        if co_col2.button("🗑️ 清空购物车", use_container_width=True, key="btn_clear_cart_admin"):
-                            st.session_state.pos_cart = []
-                            st.rerun()
-                            
-                        if st.button("💳 确认结账 (生成流水)", type="primary", use_container_width=True, key="btn_checkout_admin"):
-                            fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
-                            latest_stock = fresh[STOCK_SHEET]
-                            latest_sales = fresh[SALES_SHEET]
-                            
-                            order_id = "ORD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
-                            order_date = s_d.strftime("%Y/%m/%d")
-                            curr_user = st.session_state.get("current_user", "Unknown")
-                            
-                            new_rows = []
-                            for item in st.session_state.pos_cart:
-                                real_n = item['商品名称']
-                                real_c = item['颜色']
-                                new_rows.append([order_id, order_date, curr_user, real_n, real_c, item['数量'], item['单价'], item['小计']])
-                                idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
-                                if not idx_p.empty:
-                                    i_p = idx_p[0]
-                                    latest_stock.at[i_p, '货柜数量'] = int(pd.to_numeric(latest_stock.at[i_p, '货柜数量'], errors='coerce') or 0) - item['数量']
-                                    latest_stock.at[i_p, '已售出数量'] = int(pd.to_numeric(latest_stock.at[i_p, '已售出数量'], errors='coerce') or 0) + item['数量']
-                                    latest_stock.at[i_p, '总库存'] = sum([int(pd.to_numeric(latest_stock.at[i_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
-                            
-                            new_sales_df = pd.DataFrame(new_rows, columns=SALES_COLS)
-                            latest_sales = pd.concat([new_sales_df, latest_sales], ignore_index=True)
-                            
-                            save_data(latest_sales, SALES_SHEET) 
-                            save_data(latest_stock, STOCK_SHEET) 
-                            
-                            st.session_state.pos_cart = []
-                            st.success(f"🎉 结账成功！流水号 {order_id}")
-                            st.rerun()
-                            
-        else:
-            st.info("请先在库存中添加商品。")
-
-        st.divider()
-        
-        with st.expander("🚶‍♂️ 录入/修正每日有效客流", expanded=False):
-            with st.form("traffic_form_admin"):
-                tc1, tc2 = st.columns(2)
-                tr_date = tc1.date_input("📅 客流日期", value=datetime.now())
-                tr_num = tc2.number_input("👁️ 有效咨询/看货人数", min_value=0, step=1, value=0)
-                
-                if st.form_submit_button("💾 保存今日客流数据", type="primary", use_container_width=True):
-                    fresh_traffic = JIT_fetch([TRAFFIC_SHEET])[TRAFFIC_SHEET]
-                    tr_date_str = tr_date.strftime("%Y/%m/%d")
-                    
-                    idx = fresh_traffic[fresh_traffic['日期'].astype(str).str.strip() == tr_date_str].index
-                    if not idx.empty:
-                        fresh_traffic.at[idx[0], '有效客流'] = tr_num
-                    else:
-                        new_row = pd.DataFrame([[tr_date_str, tr_num]], columns=TRAFFIC_COLS)
-                        fresh_traffic = pd.concat([new_row, fresh_traffic], ignore_index=True)
-                    
-                    save_data(fresh_traffic, TRAFFIC_SHEET)
-                    st.success("✅ 保存成功!")
-                    st.rerun()
-
-        with st.expander("🔄 客户换货处理 (Exchange)", expanded=False):
-            if not f_opts.empty:
-                xc1, xc2 = st.columns(2)
-                with xc1:
-                    st.markdown("### 🔙 退回的商品 (入库)")
-                    ex_ret_l = st.selectbox("1. 退回商品", f_opts['label'], key="ex_ret_sku_admin")
-                    ret_row = f_opts[f_opts['label'] == ex_ret_l].iloc[0]
-                    ret_base_p = float(pd.to_numeric(ret_row['售卖价格'], errors='coerce') or 0)
-                    ret_p = st.number_input("2. 折算退款金额 ($)", value=ret_base_p, format="%.2f", key="ret_val_admin")
-                    ret_dmg = st.checkbox("⚠️ 退回商品有瑕疵 (记入坏货)", value=False, key="dmg_admin")
-
-                with xc2:
-                    st.markdown("### 🆕 换购的商品 (出库)")
-                    ex_new_l = st.selectbox("1. 新换商品", f_opts['label'], key="ex_new_sku_admin")
-                    new_row = f_opts[f_opts['label'] == ex_new_l].iloc[0]
-                    new_base_p = float(pd.to_numeric(new_row['售卖价格'], errors='coerce') or 0)
-                    new_p = st.number_input("2. 新换商品结算价 ($)", value=new_base_p, format="%.2f", key="new_val_admin")
-
-                st.markdown("---")
-                
-                c_date, c_diff = st.columns(2)
-                with c_date:
-                    ex_date_input = st.date_input("📅 处理日期", value=datetime.now(), key="ex_date_input_admin")
-                
-                with c_diff:
-                    diff = new_p - ret_p
-                    if diff > 0:
-                        st.warning(f"💰 顾客需补差价：${diff:.2f}")
-                    elif diff < 0:
-                        st.success(f"💸 门店需退差价：${abs(diff):.2f}")
-                    else:
-                        st.info("🤝 等价交换，无需补退款")
-
-                if st.button("🔄 确认执行换货", type="primary", use_container_width=True, key="btn_exchange_admin"):
-                    fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
-                    latest_stock = fresh[STOCK_SHEET]
-                    latest_sales = fresh[SALES_SHEET]
-                    
-                    ex_date = ex_date_input.strftime("%Y/%m/%d")
-                    ex_order_id = "EXC-" + datetime.now().strftime("%Y%m%d-%H%M%S") 
-                    curr_user = st.session_state.get("current_user", "Unknown")
-                    
-                    r_name = str(ret_row['商品名称'])
-                    r_col = str(ret_row['颜色'])
-                    n_name = str(new_row['商品名称'])
-                    n_col = str(new_row['颜色'])
-                    
-                    idx_ret = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(r_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(r_col).strip())].index[0]
-                    s_ret = pd.DataFrame([[ex_order_id, ex_date, curr_user, latest_stock.at[idx_ret,'商品名称'], latest_stock.at[idx_ret,'颜色'], -1, ret_p, -1 * ret_p]], columns=SALES_COLS)
-                    
-                    idx_new = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(n_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(n_col).strip())].index[0]
-                    s_new = pd.DataFrame([[ex_order_id, ex_date, curr_user, latest_stock.at[idx_new,'商品名称'], latest_stock.at[idx_new,'颜色'], 1, new_p, 1 * new_p]], columns=SALES_COLS)
-                    
-                    latest_sales = pd.concat([s_new, s_ret, latest_sales], ignore_index=True)
-                    
-                    if ret_dmg:
-                        latest_stock.at[idx_ret, '坏货数量'] = int(pd.to_numeric(latest_stock.at[idx_ret, '坏货数量'], errors='coerce') or 0) + 1
-                    else:
-                        latest_stock.at[idx_ret, '货柜数量'] = int(pd.to_numeric(latest_stock.at[idx_ret, '货柜数量'], errors='coerce') or 0) + 1
-                        latest_stock.at[idx_ret, '总库存'] = sum([int(pd.to_numeric(latest_stock.at[idx_ret, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
-                    latest_stock.at[idx_ret, '已售出数量'] = int(pd.to_numeric(latest_stock.at[idx_ret, '已售出数量'], errors='coerce') or 0) - 1
-                    
-                    latest_stock.at[idx_new, '货柜数量'] = int(pd.to_numeric(latest_stock.at[idx_new, '货柜数量'], errors='coerce') or 0) - 1
-                    latest_stock.at[idx_new, '已售出数量'] = int(pd.to_numeric(latest_stock.at[idx_new, '已售出数量'], errors='coerce') or 0) + 1
-                    latest_stock.at[idx_new, '总库存'] = sum([int(pd.to_numeric(latest_stock.at[idx_new, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
-                    
-                    save_data(latest_sales, SALES_SHEET) 
-                    save_data(latest_stock, STOCK_SHEET) 
-                    st.success("✅ 换货执行成功！")
-                    st.rerun()
-
         st.divider()
         st.markdown("### 📝 销售流水编辑与防飞单机制")
         f_sl = get_f(df_sales, q)
@@ -826,21 +990,30 @@ if is_admin:
             f_sl_sel['成交单价'] = pd.to_numeric(f_sl_sel['成交单价'], errors='coerce').fillna(0.0)
             f_sl_sel['总营业额'] = pd.to_numeric(f_sl_sel['总营业额'], errors='coerce').fillna(0.0)
             
-            f_sl_sel.insert(0, "选择", False)
+            f_sl_sel['商品名称'] = translate_series(f_sl_sel['商品名称'])
+            f_sl_sel['颜色'] = translate_series(f_sl_sel['颜色'])
             
-            styled_sl = f_sl_sel.style.format({'成交单价': '${:.2f}', '总营业额': '${:.2f}'})
+            sel_col_name = "Sel" if st.session_state.lang == 'en' else "选择"
+            f_sl_sel.insert(0, sel_col_name, False)
             
-            d_disable = [c for c in f_sl_sel.columns if c != "选择"]
+            if st.session_state.lang == 'en': f_sl_sel.rename(columns=col_map, inplace=True)
+            
+            u_col = 'Unit Price' if st.session_state.lang == 'en' else '成交单价'
+            t_col = 'Total Amount' if st.session_state.lang == 'en' else '总营业额'
+            
+            styled_sl = f_sl_sel.style.format({u_col: '${:.2f}', t_col: '${:.2f}'})
+            
+            d_disable = [c for c in f_sl_sel.columns if c != sel_col_name]
             
             edt = st.data_editor(
                 styled_sl, 
-                column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)}, 
+                column_config={sel_col_name: st.column_config.CheckboxColumn(sel_col_name, default=False)}, 
                 disabled=d_disable, 
                 use_container_width=True, hide_index=True, 
                 key=f"sales_editor_{st.session_state.sales_reset_key}"
             )
             
-            sel = edt[edt["选择"] == True] if "选择" in edt.columns else pd.DataFrame()
+            sel = edt[edt[sel_col_name] == True] if sel_col_name in edt.columns else pd.DataFrame()
             
             if not sel.empty:
                 sc1, sc2, _ = st.columns([1.5, 1.5, 4])
@@ -851,17 +1024,18 @@ if is_admin:
                         latest_sales = fresh[SALES_SHEET]
                         
                         for _, r in sel.iterrows():
-                            real_n = str(r['商品名称'])
-                            real_c = str(r['颜色'])
-                            q_val = int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
+                            real_n = t_val(r['Product' if st.session_state.lang == 'en' else '商品名称'], 'cn')
+                            real_c = t_val(r['Variant' if st.session_state.lang == 'en' else '颜色'], 'cn')
+                            q_val = to_int(r['Qty' if st.session_state.lang == 'en' else '销售数量'])
                             
                             m = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
                             if not m.empty:
-                                latest_stock.at[m[0], '货柜数量'] = int(pd.to_numeric(latest_stock.at[m[0], '货柜数量'], errors='coerce') or 0) + q_val
-                                latest_stock.at[m[0], '已售出数量'] = int(pd.to_numeric(latest_stock.at[m[0], '已售出数量'], errors='coerce') or 0) - q_val
-                                latest_stock.at[m[0], '总库存'] = sum([int(pd.to_numeric(latest_stock.at[m[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                                latest_stock.at[m[0], '货柜数量'] = to_int(latest_stock.at[m[0], '货柜数量']) + q_val
+                                latest_stock.at[m[0], '已售出数量'] = to_int(latest_stock.at[m[0], '已售出数量']) - q_val
+                                latest_stock.at[m[0], '总库存'] = recalc_total_stock(latest_stock, m[0])
                             
-                            o_id = str(r['订单号']).strip()
+                            o_id = str(r['Order ID' if st.session_state.lang == 'en' else '订单号']).strip()
+                            o_dt = str(r['Date' if st.session_state.lang == 'en' else '日期']).strip()
                             
                             cond = (latest_sales['订单号'].astype(str).str.strip() == o_id) & \
                                    (latest_sales['商品名称'].astype(str).str.strip() == str(real_n).strip()) & \
@@ -880,18 +1054,20 @@ if is_admin:
                 if len(sel) == 1:
                     st.markdown("### ⚙️ 修改此笔流水 (Edit Log)")
                     r = sel.iloc[0]
-                    real_n = str(r['商品名称'])
-                    real_c = str(r['颜色'])
-                    o_id = str(r['订单号']).strip()
-                    o_dt = str(r['日期']).strip()
-                    o_qty = int(pd.to_numeric(r['销售数量'], errors='coerce') or 0)
-                    o_prc = float(pd.to_numeric(r['成交单价'], errors='coerce') or 0.0)
+                    real_n = t_val(r['Product' if st.session_state.lang == 'en' else '商品名称'], 'cn')
+                    real_c = t_val(r['Variant' if st.session_state.lang == 'en' else '颜色'], 'cn')
+                    o_id = str(r['Order ID' if st.session_state.lang == 'en' else '订单号']).strip()
+                    o_dt = str(r['Date' if st.session_state.lang == 'en' else '日期']).strip()
+                    o_qty = to_int(r['Qty' if st.session_state.lang == 'en' else '销售数量'])
+                    o_prc = to_float(r['Unit Price' if st.session_state.lang == 'en' else '成交单价'])
 
                     f_opts_stk = df_stock.copy()
-                    f_opts_stk['label'] = f_opts_stk['商品名称'].fillna('').astype(str) + " (" + f_opts_stk['颜色'].fillna('').astype(str) + ")"
+                    f_opts_stk['dn'] = translate_series(f_opts_stk['商品名称']).fillna('').astype(str)
+                    f_opts_stk['dc'] = translate_series(f_opts_stk['颜色']).fillna('').astype(str)
+                    f_opts_stk['label'] = f_opts_stk['dn'] + " (" + f_opts_stk['dc'] + ")"
                     stk_lbls = f_opts_stk['label'].tolist()
                     
-                    curr_lbl = f"{real_n} ({real_c})"
+                    curr_lbl = f"{t_val(real_n, 'en' if st.session_state.lang == 'en' else 'cn')} ({t_val(real_c, 'en' if st.session_state.lang == 'en' else 'cn')})"
                     if curr_lbl not in stk_lbls: stk_lbls.insert(0, curr_lbl)
                     
                     with st.form("edit_sale_form_admin"):
@@ -899,12 +1075,12 @@ if is_admin:
                         try: parsed_date = pd.to_datetime(o_dt).date()
                         except: parsed_date = datetime.now().date()
                         
-                        e_date = e_c1.date_input("交易日期", value=parsed_date)
-                        e_prod = e_c2.selectbox("售出商品", stk_lbls, index=stk_lbls.index(curr_lbl))
-                        e_qty = e_c3.number_input("数量", value=o_qty, min_value=1)
-                        e_price = e_c4.number_input("单价 ($)", value=o_prc, format="%.2f")
+                        e_date = e_c1.date_input("交易日期 Date", value=parsed_date)
+                        e_prod = e_c2.selectbox("商品 Product", stk_lbls, index=stk_lbls.index(curr_lbl))
+                        e_qty = e_c3.number_input("数量 Qty", value=o_qty, min_value=1)
+                        e_price = e_c4.number_input("单价 Price ($)", value=o_prc, format="%.2f")
                         
-                        if st.form_submit_button("💾 保存修改", type="primary"):
+                        if st.form_submit_button("💾 保存修改 (Save)", type="primary"):
                             fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
                             latest_stock = fresh[STOCK_SHEET]
                             latest_sales = fresh[SALES_SHEET]
@@ -919,18 +1095,18 @@ if is_admin:
                                 t_idx = true_idx[0]
                                 m_old = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
                                 if not m_old.empty:
-                                    latest_stock.at[m_old[0], '货柜数量'] = int(pd.to_numeric(latest_stock.at[m_old[0], '货柜数量'], errors='coerce') or 0) + o_qty
-                                    latest_stock.at[m_old[0], '已售出数量'] = int(pd.to_numeric(latest_stock.at[m_old[0], '已售出数量'], errors='coerce') or 0) - o_qty
-                                    latest_stock.at[m_old[0], '总库存'] = sum([int(pd.to_numeric(latest_stock.at[m_old[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                                    latest_stock.at[m_old[0], '货柜数量'] = to_int(latest_stock.at[m_old[0], '货柜数量']) + o_qty
+                                    latest_stock.at[m_old[0], '已售出数量'] = to_int(latest_stock.at[m_old[0], '已售出数量']) - o_qty
+                                    latest_stock.at[m_old[0], '总库存'] = recalc_total_stock(latest_stock, m_old[0])
                                     
-                                new_n = e_prod.rsplit(" (", 1)[0]
-                                new_c = e_prod.rsplit(" (", 1)[1].replace(")", "")
+                                new_n = t_val(e_prod.rsplit(" (", 1)[0], 'cn')
+                                new_c = t_val(e_prod.rsplit(" (", 1)[1].replace(")", ""), 'cn')
                                 
                                 m_new = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(new_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(new_c).strip())].index
                                 if not m_new.empty:
-                                    latest_stock.at[m_new[0], '货柜数量'] = int(pd.to_numeric(latest_stock.at[m_new[0], '货柜数量'], errors='coerce') or 0) - e_qty
-                                    latest_stock.at[m_new[0], '已售出数量'] = int(pd.to_numeric(latest_stock.at[m_new[0], '已售出数量'], errors='coerce') or 0) + e_qty
-                                    latest_stock.at[m_new[0], '总库存'] = sum([int(pd.to_numeric(latest_stock.at[m_new[0], col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
+                                    latest_stock.at[m_new[0], '货柜数量'] = to_int(latest_stock.at[m_new[0], '货柜数量']) - e_qty
+                                    latest_stock.at[m_new[0], '已售出数量'] = to_int(latest_stock.at[m_new[0], '已售出数量']) + e_qty
+                                    latest_stock.at[m_new[0], '总库存'] = recalc_total_stock(latest_stock, m_new[0])
                                     
                                 latest_sales.at[t_idx, '日期'] = e_date.strftime("%Y/%m/%d")
                                 latest_sales.at[t_idx, '商品名称'] = new_n
@@ -951,16 +1127,9 @@ if is_admin:
     with t3:
         st.subheader("📊 财务与客流报表")
         
-        sel_range_t3 = st.date_input(
-            "⏳ 选择要分析的时间段 (默认跟随左侧基准档期，可自由修改)：", 
-            value=[st.session_state.camp_start, st.session_state.camp_end],
-            key="t3_date_picker"
-        )
-        
-        if len(sel_range_t3) == 2:
-            t3_start, t3_end = sel_range_t3[0], sel_range_t3[1]
-        else:
-            t3_start, t3_end = sel_range_t3[0], sel_range_t3[0]
+        t3_start = st.session_state.camp_start
+        t3_end = st.session_state.camp_end
+        st.info(f"📅 此看板的财务数据已随左侧全局控制器锁定在：**{t3_start}** 至 **{t3_end}**")
 
         if not df_sales.empty:
             df_sales['日期_dt'] = pd.to_datetime(df_sales['日期'], errors='coerce')
@@ -985,12 +1154,12 @@ if is_admin:
                     tot_margin = f_sales_range['具体毛利'].sum()
                     
                     valid_orders = f_sales_range[
-                        (~f_sales_range['订单号'].str.contains('历史单', na=False)) & 
-                        (~f_sales_range['订单号'].str.contains('EXC-', na=False))
+                        (~f_sales_range['订单号'].astype(str).str.contains('历史单', na=False)) & 
+                        (~f_sales_range['订单号'].astype(str).str.contains('EXC-', na=False))
                     ]
                     order_count = valid_orders['订单号'].nunique()
                     
-                    legacy_orders = f_sales_range[f_sales_range['订单号'].str.contains('历史单', na=False)]
+                    legacy_orders = f_sales_range[f_sales_range['订单号'].astype(str).str.contains('历史单', na=False)]
                     total_order_count = order_count + len(legacy_orders)
                     
                     df_traffic_clean = df_traffic.copy()
@@ -1014,7 +1183,7 @@ if is_admin:
                     
                     delta_days = (t3_end - t3_start).days + 1
                     
-                    st.markdown(f"### 🏬 核心客流漏斗矩阵 {f'(已过滤)' if q else ''}")
+                    st.markdown(f"### 🏬 核心客流漏斗矩阵 {f'(已过滤: {q})' if q else ''}")
                     m1, m2, m3 = st.columns(3)
                     m1.metric("👁️ 有效总客流 (选中期间)", f"{int(total_traffic)} 人")
                     m2.metric("💳 交易单数", f"{total_order_count} 单")
@@ -1057,13 +1226,13 @@ if is_admin:
                     
                     st.dataframe(summ.sort_values('周期', ascending=False).style.format({'总营业额':"${:.2f}", '具体毛利':"${:.2f}", '销售数量':"{:d}"}), use_container_width=True)
                 else:
-                    st.info("💡 在选定时间段内没有找到符合条件的记录。")
+                    st.info("💡 在选定时间段内没有找到符合搜索条件的销售记录。")
             else:
-                st.info("流水表中无有效数据。")
+                st.info("流水表中没有有效的日期数据。")
 
     with t4:
         st.subheader("👥 员工档案与门禁管理")
-        with st.expander("➕ 新增人员档案", expanded=False):
+        with st.expander("➕ 新增人员档案 (含合作厂商)", expanded=False):
             with st.form("add_employee"):
                 c1, c2 = st.columns(2)
                 e_name = c1.text_input("人员姓名")
@@ -1127,7 +1296,7 @@ if is_admin:
             if not selected_emp.empty:
                 col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
                 with col_btn1:
-                    if st.button("🗑️ 彻底删除人员", type="primary", key="del_emp"):
+                    if st.button("🗑️ 彻底删除人员 (不建议)", type="primary", key="del_emp"):
                         fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
                         for _, row in selected_emp.iterrows():
                             fresh_emp = fresh_emp[fresh_emp['员工姓名'].astype(str).str.strip() != str(row['员工姓名']).strip()]
@@ -1160,7 +1329,7 @@ if is_admin:
                         duration_hours = (dt_end - dt_start).total_seconds() / 3600.0
                         
                         wage_val = df_employee[df_employee['员工姓名'] == att_name]['时薪'].iloc[0]
-                        hourly_wage = float(pd.to_numeric(wage_val, errors='coerce') or 0.0)
+                        hourly_wage = to_float(wage_val)
                         total_wage = duration_hours * hourly_wage
                         
                         new_att = pd.DataFrame([[
@@ -1216,15 +1385,9 @@ if is_admin:
     with t5:
         st.subheader(f"💎 真实净利润核算 (9% GST 剥离版)")
         
-        sel_range_t5 = st.date_input(
-            "⏳ 选择要核算的时间段 (默认跟随左侧基准档期，可自由修改)：", 
-            value=[st.session_state.camp_start, st.session_state.camp_end],
-            key="t5_date_picker"
-        )
-        if len(sel_range_t5) == 2:
-            t5_start, t5_end = sel_range_t5[0], sel_range_t5[1]
-        else:
-            t5_start, t5_end = sel_range_t5[0], sel_range_t5[0]
+        t5_start = st.session_state.camp_start
+        t5_end = st.session_state.camp_end
+        st.info(f"📅 此看板的净利数据已随左侧全局控制器锁定在：**{t5_start}** 至 **{t5_end}**")
 
         if not df_sales.empty:
             df_s_np = df_sales.copy()
@@ -1256,12 +1419,12 @@ if is_admin:
                 if not fa.empty:
                     fa['核算薪资'] = pd.to_numeric(fa['核算薪资'], errors='coerce').fillna(0.0)
                     fa['日期_str'] = fa['日期_dt'].dt.strftime('%Y/%m/%d')
-                    daily_att = fa.groupby('日期_str').agg({'核算薪资': 'sum'}).reset_index().rename(columns={'核算薪资': '人工成本'})
+                    daily_att = fa.groupby('日期_str').agg({'核算薪资': 'sum'}).reset_index()
+                    daily_att.rename(columns={'核算薪资': '人工成本'}, inplace=True)
                 else:
                     daily_att = pd.DataFrame(columns=['日期_str', '人工成本'])
 
-                daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0)
-                daily_np = daily_np.sort_values('日期_str', ascending=False)
+                daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0).sort_values('日期_str', ascending=False)
 
                 daily_np['免税净营业额'] = daily_np['总营业额'] / 1.09
                 daily_np['代扣GST(9%)'] = daily_np['总营业额'] - daily_np['免税净营业额']
@@ -1391,7 +1554,9 @@ if is_admin:
                 f_opts_b2b = get_f(df_stock, "").copy() 
                 stock_list = []
                 if not f_opts_b2b.empty:
-                    f_opts_b2b['label'] = f_opts_b2b['商品名称'].fillna('').astype(str) + " (" + f_opts_b2b['颜色'].fillna('').astype(str) + ")" 
+                    f_opts_b2b['dn'] = translate_series(f_opts_b2b['商品名称']).fillna('').astype(str)
+                    f_opts_b2b['dc'] = translate_series(f_opts_b2b['颜色']).fillna('').astype(str)
+                    f_opts_b2b['label'] = f_opts_b2b['dn'] + " (" + f_opts_b2b['dc'] + ")" 
                     stock_list = f_opts_b2b['label'].tolist()
                     
                 col_sel, col_cust_name, col_cust_color = st.columns([2, 1.5, 1])
@@ -1412,8 +1577,10 @@ if is_admin:
                     final_color = b2b_custom_color.strip()
                 else:
                     if b2b_prod != "(不选择)":
-                        final_name = b2b_prod.rsplit(" (", 1)[0]
-                        final_color = b2b_prod.rsplit(" (", 1)[1].replace(")", "")
+                        sel_disp_name = b2b_prod.rsplit(" (", 1)[0]
+                        sel_disp_color = b2b_prod.rsplit(" (", 1)[1].replace(")", "")
+                        final_name = t_val(sel_disp_name, 'cn')
+                        final_color = t_val(sel_disp_color, 'cn')
                     else:
                         final_name = ""
 
@@ -1566,10 +1733,13 @@ if is_admin:
 
     with t7:
         st.subheader("🗣️ 新加坡本地客户产品反馈池")
-        
+        st.info("💡 收集一线真实声音：不论是产品性能还是非产品的本土化优化，都是下一步行动的数据支撑！")
+
         fb_type_options = [
-            "产品功能性", "产品优化", "保温保冷效能", "外观颜值 / 颜色", "材质手感 / 重量", 
-            "清洗 / 异味问题", "杯盖 / 密封性", "价格因素", "🌏 本土化优化 (非产品)", "夸奖 / 好评", "其他建议"
+            "产品功能性", "产品优化", 
+            "保温保冷效能", "外观颜值 / 颜色", "材质手感 / 重量", 
+            "清洗 / 异味问题", "杯盖 / 密封性", "价格因素", 
+            "🌏 本土化优化 (非产品)", "夸奖 / 好评", "其他建议"
         ]
         fb_customer_options = ["本地散客", "VIP / 老客复购", "送礼需求", "游客", "B2B企业客户"]
         fb_status_options = ["🚨 待处理 / 待评估", "📝 已记录 / 待反馈工厂", "✅ 已解决 / 已采纳"]
@@ -1589,6 +1759,7 @@ if is_admin:
                 fb_customer = c4.selectbox("客户画像", fb_customer_options)
 
                 fb_detail = st.text_area("🗣️ 客户原话或详细描述 (越具体越好)", placeholder="例如：客人觉得杯盖拧起来有点紧，或者希望包装袋能换成本地人更喜欢的材质...")
+
                 fb_status = st.selectbox("当前跟进状态", fb_status_options)
 
                 if st.form_submit_button("保存客户反馈", type="primary", use_container_width=True):
@@ -1605,16 +1776,20 @@ if is_admin:
                         st.rerun()
 
         st.divider()
+        
         f_fb = get_f(df_feedback, q)
         if not f_fb.empty:
             fb_c1, fb_c2 = st.columns(2)
             with fb_c1:
-                st.markdown("**📌 哪些痛点被疯狂吐槽？**")
-                st.bar_chart(f_fb['反馈类型'].value_counts())
+                st.markdown("**📌 哪些痛点被疯狂吐槽？(分类雷达)**")
+                type_counts = f_fb['反馈类型'].value_counts()
+                st.bar_chart(type_counts)
             with fb_c2:
-                st.markdown("**📌 哪款产品话题度最高？**")
-                st.bar_chart(f_fb['商品名称'].value_counts())
+                st.markdown("**📌 哪款产品话题度最高？(商品雷达)**")
+                prod_counts = f_fb['商品名称'].value_counts()
+                st.bar_chart(prod_counts)
 
+            st.markdown("### 📋 客户反馈追踪处理台 (可直接涂改所有项目)")
             v_fb = f_fb.copy()
             v_fb.insert(0, "选择", False)
 
@@ -1627,7 +1802,9 @@ if is_admin:
                     "反馈类型": st.column_config.SelectboxColumn("反馈类型", options=fb_type_options),
                     "客户画像": st.column_config.SelectboxColumn("客户画像", options=fb_customer_options)
                 },
-                disabled=[], use_container_width=True, hide_index=True, key=editor_key
+                disabled=[], 
+                use_container_width=True, hide_index=True,
+                key=editor_key
             )
 
             editor_state = st.session_state.get(editor_key, {})
@@ -1662,169 +1839,22 @@ if is_admin:
                         st.session_state.fb_reset_key += 1
                         st.rerun()
                 with fbc2: st.button("🔄 取消选中", key="btn_cancel_fb", on_click=clear_fb)
-
-    with t8:
-        st.subheader(f"📈 选品与战略决策盘")
-        
-        sel_range_t8 = st.date_input(
-            "⏳ 选择要分析的时间段 (默认基准档期)：", 
-            value=[st.session_state.camp_start, st.session_state.camp_end],
-            key="t8_date_picker"
-        )
-        if len(sel_range_t8) == 2:
-            t8_start, t8_end = sel_range_t8[0], sel_range_t8[1]
         else:
-            t8_start, t8_end = sel_range_t8[0], sel_range_t8[0]
+            st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
 
-        if not df_sales.empty and not df_stock.empty:
-            df_s_bi = df_sales.copy()
-            df_s_bi['日期_dt'] = pd.to_datetime(df_s_bi['日期'], errors='coerce')
-            df_s_bi = df_s_bi[(df_s_bi['日期_dt'] >= pd.Timestamp(t8_start)) & (df_s_bi['日期_dt'] <= pd.Timestamp(t8_end))]
-            
-            df_s_bi['销售数量'] = pd.to_numeric(df_s_bi['销售数量'], errors='coerce').fillna(0)
-            df_s_bi['总营业额'] = pd.to_numeric(df_s_bi['总营业额'], errors='coerce').fillna(0.0)
-
-            bi_sales = df_s_bi.groupby(['商品名称', '颜色']).agg({'销售数量': 'sum', '总营业额': 'sum'}).reset_index()
-
-            df_stk_bi = df_stock[['商品名称', '颜色', '进价成本', '总库存']].copy()
-            df_stk_bi['进价成本'] = pd.to_numeric(df_stk_bi['进价成本'], errors='coerce').fillna(0.0)
-            df_stk_bi['总库存'] = pd.to_numeric(df_stk_bi['总库存'], errors='coerce').fillna(0)
-
-            bi_df = pd.merge(df_stk_bi, bi_sales, on=['商品名称', '颜色'], how='left').fillna(0)
-            
-            today = datetime.now().date()
-            if today < t8_start:
-                days_in_period = 1
-            else:
-                calc_end = min(today, t8_end)
-                days_in_period = (calc_end - t8_start).days + 1
-                days_in_period = max(days_in_period, 1)
-            
-            bi_df['日均动销率'] = bi_df['销售数量'] / days_in_period
-            bi_df['总进价成本'] = bi_df['销售数量'] * bi_df['进价成本']
-            bi_df['具体毛利'] = bi_df['总营业额'] - bi_df['总进价成本']
-            bi_df['毛利率(%)'] = ((bi_df['具体毛利'] / bi_df['总营业额']) * 100).fillna(0.0)
-
-            def calc_cover(row):
-                if row['日均动销率'] > 0:
-                    return int(row['总库存'] / row['日均动销率'])
-                return 999 
-            bi_df['可售天数'] = bi_df.apply(calc_cover, axis=1)
-            
-            bi_df = bi_df.sort_values(by='总营业额', ascending=False)
-            total_revenue = bi_df['总营业额'].sum()
-            bi_df['累计营收占比'] = bi_df['总营业额'].cumsum() / total_revenue if total_revenue > 0 else 0
-            
-            def get_abc(pct):
-                if pct <= 0.7: return "👑 A类 (核心70%业绩)"
-                elif pct <= 0.9: return "🌟 B类 (中坚20%业绩)"
-                else: return "📦 C类 (尾部10%业绩)"
-            bi_df['ABC等级'] = bi_df['累计营收占比'].apply(get_abc)
-            
-            def get_health_light(row):
-                cover = row['可售天数']
-                stock = row['总库存']
-                if stock == 0 and row['销售数量'] > 0: return "⚫ 彻底断货 (流血中)"
-                elif cover <= 7 and stock > 0: return "🔴 濒临断货 (<7天)"
-                elif cover > 60 and stock > 0: return "🔴 严重积压 (>60天)"
-                elif 30 < cover <= 60: return "🟡 偏高预警 (30-60天)"
-                elif 7 < cover <= 15: return "🟡 偏低预警 (7-15天)"
-                else: return "🟢 健康周转 (15-30天)"
-            bi_df['风控灯'] = bi_df.apply(get_health_light, axis=1)
-
-            active_skus = bi_df[bi_df['销售数量'] > 0]
-            med_mar = active_skus['毛利率(%)'].median() if not active_skus.empty else 0.1
-
-            def get_tag(row):
-                vel = row['日均动销率']
-                mar = row['毛利率(%)']
-                stock = row['总库存']
-                cover = row['可售天数']
-
-                if stock <= 2 and row['销售数量'] > 0 and cover <= 7: return "🚨 爆款流血断货"
-                elif vel < 0.167 and cover > 30 and stock > 0: return "📦 严重积压套牢"
-                elif vel >= 0.33 and mar >= med_mar: return "⭐ 绝对明星"
-                elif vel >= 0.33 and mar < med_mar: return "🧲 引流走量款"
-                elif vel < 0.167 and mar >= med_mar: return "🐢 利润陷阱"
-                elif vel < 0.167 and mar < med_mar: return "☠️ 清仓废柴"
-                else: return "🚶 平庸常规款"
-
-            bi_df['诊断标签'] = bi_df.apply(get_tag, axis=1)
-            
-            # 强制转字符串
-            bi_df['商品规格'] = bi_df['商品名称'].fillna('').astype(str) + " (" + bi_df['颜色'].fillna('').astype(str) + ")"
-            bi_df['压货金额'] = bi_df['总库存'] * bi_df['进价成本']
-            bi_df['气泡视觉大小'] = bi_df['压货金额'].apply(lambda x: max(float(x), 10))
-
-            a_count = len(bi_df[bi_df['ABC等级'].str.contains('A类')])
-            dead_stock_val = bi_df[bi_df['风控灯'].str.contains('严重积压')]['压货金额'].sum()
-            
-            bc1, bc2 = st.columns(2)
-            bc1.metric(f"👑 档期内 A类印钞机", f"{a_count} 款")
-            bc2.metric("🔴 当前全店死库套牢资金 (>60天卖不掉)", f"${dead_stock_val:.2f}", delta_color="inverse")
-            
-            st.divider()
-            
-            fig = px.scatter(
-                bi_df, x='日均动销率', y='毛利率(%)', color='诊断标签', size='气泡视觉大小', hover_name='商品规格',
-                hover_data={'ABC等级': True, '风控灯': True, '日均动销率': ':.2f', '毛利率(%)': ':.1f', '总营业额': ':.2f', '可售天数': True, '总库存': True, '压货金额': ':.2f', '气泡视觉大小': False},
-                size_max=45, height=550, template="plotly_white"
-            )
-            
-            fig.add_vline(x=0.33, line_width=2, line_dash="dash", line_color="gray", annotation_text=" 及格销量线 (0.33件/天)", annotation_position="top right")
-            fig.add_hline(y=med_mar, line_width=2, line_dash="dash", line_color="gray", annotation_text=f" 档期中位毛利 ({med_mar:.1f}%)", annotation_position="bottom right")
-            
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown("### 📋 全景库存风控表")
-            
-            display_bi_df = bi_df[['商品规格', 'ABC等级', '风控灯', '日均动销率', '毛利率(%)', '总营业额', '可售天数', '总库存', '压货金额']]
-            st.dataframe(display_bi_df.style.format({'总营业额': '${:.2f}', '压货金额': '${:.2f}', '日均动销率': '{:.2f} 件/天', '毛利率(%)': '{:.1f}%', '可售天数': lambda x: '> 半年' if x == 999 else f"{x} 天"}), use_container_width=True, hide_index=True)
-
-# =========================================================================================
-# ================================== 🚀 Supplier 专属代码 ==================================
-# =========================================================================================
+# ================= 🚀 Tab 3/4: 厂商专属层 (Supplier) =================
 elif is_supplier:
     with t1:
-        st.subheader("📊 实时库存与期间动销快照")
-        sel_range_t1 = st.date_input("⏳ 选择要分析的销售区间 (默认基准档期)：", value=[st.session_state.camp_start, st.session_state.camp_end], key="t1_date_picker")
-        if len(sel_range_t1) == 2: t1_start, t1_end = sel_range_t1[0], sel_range_t1[1]
-        else: t1_start, t1_end = sel_range_t1[0], sel_range_t1[0]
-            
-        f_stock = get_f(df_stock, q)
-        if not f_stock.empty:
-            v_df = f_stock.copy()
-            period_sales = pd.DataFrame()
-            if not df_sales.empty:
-                df_s_t1 = df_sales.copy()
-                df_s_t1['日期_dt'] = pd.to_datetime(df_s_t1['日期'], errors='coerce')
-                f_s_t1 = df_s_t1[(df_s_t1['日期_dt'] >= pd.Timestamp(t1_start)) & (df_s_t1['日期_dt'] <= pd.Timestamp(t1_end))]
-                if not f_s_t1.empty:
-                    f_s_t1['销售数量'] = pd.to_numeric(f_s_t1['销售数量'], errors='coerce').fillna(0)
-                    period_sales = f_s_t1.groupby(['商品名称', '颜色'])['销售数量'].sum().reset_index()
-                    period_sales.rename(columns={'销售数量': '期间售出'}, inplace=True)
-            
-            if not period_sales.empty: v_df = v_df.merge(period_sales, on=['商品名称', '颜色'], how='left')
-            else: v_df['期间售出'] = 0
-                
-            v_df['期间售出'] = v_df['期间售出'].fillna(0).astype(int)
-            int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '期间售出']
-            for col in int_cols: 
-                if col in v_df.columns: v_df[col] = pd.to_numeric(v_df[col], errors='coerce').fillna(0).astype(int)
-                    
-            v_df['售卖价格'] = pd.to_numeric(v_df['售卖价格'], errors='coerce').fillna(0.0)
-            
-            display_cols = ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格']
-            df_disp = v_df[display_cols].copy()
-            st.dataframe(df_disp.style.format({'售卖价格': '${:.2f}'}), use_container_width=True, hide_index=True)
-
+        render_inventory_snapshot('supplier')
+        
     with t2:
-        st.subheader("💰 销售报表对账查询")
+        st.subheader(t("💰 销售报表对账查询", "💰 Sales Report Reconciliation"))
         if not df_sales.empty:
             df_s = df_sales.copy()
             df_s['日期_dt'] = pd.to_datetime(df_s['日期'], errors='coerce')
             df_s = df_s.dropna(subset=['日期_dt'])
             if not df_s.empty:
-                sel_range = st.date_input("📅 选择查询日期区间", value=[st.session_state.camp_start, st.session_state.camp_end], key="sup_sales_date")
+                sel_range = st.date_input(t("📅 选择查询日期区间", "📅 Select Date Range"), value=[st.session_state.camp_start, st.session_state.camp_end], key="sup_sales_date")
                 s_start, s_end = (sel_range[0], sel_range[1]) if len(sel_range) == 2 else (sel_range[0], sel_range[0])
                     
                 f_s = df_s[(df_s['日期_dt'].dt.date >= s_start) & (df_s['日期_dt'].dt.date <= s_end)]
@@ -1835,51 +1865,67 @@ elif is_supplier:
                     tot_qty, tot_rev = f_s['销售数量'].sum(), f_s['总营业额'].sum()
                     
                     c1, c2 = st.columns(2)
-                    c1.metric("📦 区间总售出件数", f"{int(tot_qty)}")
-                    c2.metric("💰 区间总含税营业额", f"${tot_rev:.2f}")
+                    c1.metric(t("📦 区间总售出件数", "📦 Total Items Sold"), f"{int(tot_qty)}")
+                    c2.metric(t("💰 区间总含税营业额", "💰 Total Sales Amount"), f"${tot_rev:.2f}")
+                    
+                    f_s['商品名称'] = translate_series(f_s['商品名称'])
+                    f_s['颜色'] = translate_series(f_s['颜色'])
                     
                     show_cols = ['订单号', '日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
                     df_disp = f_s[show_cols].copy()
-                    st.dataframe(df_disp.style.format({'成交单价': '${:.2f}', '总营业额': '${:.2f}'}), use_container_width=True, hide_index=True)
-                else: st.info("该区间内无符合条件的记录。")
+                    if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
+                    u_col, t_col = ('Unit Price', 'Total Amount') if st.session_state.lang == 'en' else ('成交单价', '总营业额')
+                    st.dataframe(df_disp.style.format({u_col: '${:.2f}', t_col: '${:.2f}'}), use_container_width=True, hide_index=True)
+                else: st.info(t("该区间内无符合条件的记录。", "No records found in this range."))
     
     with t3:
-        st.subheader("📦 进货与入库对账单 (ERP 底单)")
+        st.subheader(t("📦 进货与入库对账单 (ERP 底单)", "📦 Inbound Records"))
+        r_s = st.session_state.camp_start
+        r_e = st.session_state.camp_end
+        st.info(f"📅 此对账单已随左侧全局控制器锁定在：**{r_s}** 至 **{r_e}**")
+        
         if not df_restock.empty:
             dr = df_restock.copy()
             dr['dt'] = pd.to_datetime(dr['记录日期'], errors='coerce')
             dr = dr.dropna(subset=['dt'])
             if not dr.empty:
-                r_range = st.date_input("📅 选择对账日期区间", value=[st.session_state.camp_start, st.session_state.camp_end], key="sup_restock_date")
-                r_s, r_e = (r_range[0], r_range[1]) if len(r_range) == 2 else (r_range[0], r_range[0])
                 fr = dr[(dr['dt'].dt.date >= r_s) & (dr['dt'].dt.date <= r_e)]
                 fr = get_f(fr, q)
                 
                 if not fr.empty:
+                    fr['操作类型'] = translate_series(fr['操作类型'])
                     a_ops = [str(x) for x in fr['操作类型'].fillna('').unique().tolist() if str(x).strip() != '']
-                    s_defs = list(set([op for op in ["入库", "初始建档"] if op in a_ops]))
+                    s_defs = list(set([op for op in [t_val("入库", "en"), t_val("初始建档", "en"), "入库", "初始建档"] if op in a_ops]))
                     
-                    tf = st.multiselect("筛选操作类型", options=a_ops, default=s_defs)
+                    tf = st.multiselect(t("筛选操作类型", "Filter Ops"), options=a_ops, default=s_defs)
                     if tf:
                         fr = fr[fr['操作类型'].isin(tf)]
+                        fr['商品名称'] = translate_series(fr['商品名称'])
+                        fr['颜色'] = translate_series(fr['颜色'])
+                        
                         tot_i = fr['变动数量'].apply(lambda x: pd.to_numeric(x, errors='coerce')).fillna(0).sum()
-                        st.metric("🚛 筛选后累计变动数量", f"{int(tot_i)}")
+                        st.metric(t("🚛 筛选后累计变动数量", "🚛 Total Qty"), f"{int(tot_i)}")
                         
                         show_cols = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '备注']
                         df_disp = fr[show_cols].copy()
+                        if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
                         st.dataframe(df_disp, use_container_width=True, hide_index=True)
-                    else: st.info("无对应类型的记录。")
-                else: st.info("该区间无对账记录。")
+                    else:
+                        st.info(t("无对应类型的记录。", "No records matched."))
+                else:
+                    st.info(t("该区间无对账记录。", "No records in range."))
 
     with t4:
-        st.subheader("🤝 B2B 订单对账单")
+        st.subheader(t("🤝 B2B 订单对账单", "🤝 B2B Orders"))
+        b_s = st.session_state.camp_start
+        b_e = st.session_state.camp_end
+        st.info(f"📅 此对账单已随左侧全局控制器锁定在：**{b_s}** 至 **{b_e}**")
+        
         if not df_b2b.empty:
             db = df_b2b.copy()
             db['dt'] = pd.to_datetime(db['创建日期'], errors='coerce')
             db = db.dropna(subset=['dt'])
             if not db.empty:
-                s_r = st.date_input("📅 选择建单日期", value=[st.session_state.camp_start, st.session_state.camp_end], key="sup_b2b_date")
-                b_s, b_e = (s_r[0], s_r[1]) if len(s_r) == 2 else (s_r[0], s_r[0])
                 fb = db[(db['dt'].dt.date >= b_s) & (db['dt'].dt.date <= b_e)]
                 fb = get_f(fb, q)
                 
@@ -1889,151 +1935,29 @@ elif is_supplier:
                     fb['待收尾款'] = fb['总计应收'] - fb['已收定金']
                     
                     c1, c2 = st.columns(2)
-                    c1.metric("📦 B2B 总采购件数", f"{int(fb['采购数量'].sum())}")
-                    c2.metric("💰 B2B 总计应收金额", f"${fb['总计应收'].sum():.2f}")
+                    c1.metric(t("📦 B2B 总采购件数", "📦 Total B2B Qty"), f"{int(fb['采购数量'].sum())}")
+                    c2.metric(t("💰 B2B 总计应收金额", "💰 Total B2B Value"), f"${fb['总计应收'].sum():.2f}")
                     
-                    show_cols = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
-                    df_disp = fb[show_cols].copy()
-                    st.dataframe(df_disp.style.format({'B2B单价': '${:.2f}', '总计应收': '${:.2f}', '已收定金': '${:.2f}', '待收尾款': '${:.2f}'}), use_container_width=True, hide_index=True)
-                else: st.info("该区间无数据。")
+                    fb['商品名称'] = translate_series(fb['商品名称'])
+                    fb['颜色'] = translate_series(fb['颜色'])
+                    fb['订单状态'] = translate_series(fb['订单状态'])
+                    
+                    df_disp = fb[['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']].copy()
+                    if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
+                    uc, tc, dc, bc = ('B2B Price', 'Total Recv.', 'Deposit', 'Balance') if st.session_state.lang == 'en' else ('B2B单价', '总计应收', '已收定金', '待收尾款')
+                    st.dataframe(df_disp.style.format({uc: '${:.2f}', tc: '${:.2f}', dc: '${:.2f}', bc: '${:.2f}'}), use_container_width=True, hide_index=True)
+                else:
+                    st.info(t("该区间无数据。", "No records in range."))
 
-# =========================================================================================
-# ================================== 🚀 Employee 专属代码 ===================================
-# =========================================================================================
+# ================= 🚀 Tab 3: 员工打卡层 (Employee) =================
 elif is_employee:
     with t1:
-        st.subheader("📊 实时库存与期间动销快照")
-        sel_range_t1 = st.date_input("⏳ 选择要分析的销售区间 (默认基准档期)：", value=[st.session_state.camp_start, st.session_state.camp_end], key="t1_date_picker_emp")
-        if len(sel_range_t1) == 2: t1_start, t1_end = sel_range_t1[0], sel_range_t1[1]
-        else: t1_start, t1_end = sel_range_t1[0], sel_range_t1[0]
-            
-        f_stock = get_f(df_stock, q)
-        if not f_stock.empty:
-            v_df = f_stock.copy()
-            period_sales = pd.DataFrame()
-            if not df_sales.empty:
-                df_s_t1 = df_sales.copy()
-                df_s_t1['日期_dt'] = pd.to_datetime(df_s_t1['日期'], errors='coerce')
-                f_s_t1 = df_s_t1[(df_s_t1['日期_dt'] >= pd.Timestamp(t1_start)) & (df_s_t1['日期_dt'] <= pd.Timestamp(t1_end))]
-                if not f_s_t1.empty:
-                    f_s_t1['销售数量'] = pd.to_numeric(f_s_t1['销售数量'], errors='coerce').fillna(0)
-                    period_sales = f_s_t1.groupby(['商品名称', '颜色'])['销售数量'].sum().reset_index()
-                    period_sales.rename(columns={'销售数量': '期间售出'}, inplace=True)
-            
-            if not period_sales.empty: v_df = v_df.merge(period_sales, on=['商品名称', '颜色'], how='left')
-            else: v_df['期间售出'] = 0
-                
-            v_df['期间售出'] = v_df['期间售出'].fillna(0).astype(int)
-            int_cols = ['应收到数量', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '期间售出']
-            for col in int_cols: 
-                if col in v_df.columns: v_df[col] = pd.to_numeric(v_df[col], errors='coerce').fillna(0).astype(int)
-                    
-            v_df['售卖价格'] = pd.to_numeric(v_df['售卖价格'], errors='coerce').fillna(0.0)
-            
-            display_cols = ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '售卖价格']
-            df_disp = v_df[display_cols].copy()
-            st.dataframe(df_disp.style.format({'售卖价格': '${:.2f}'}), use_container_width=True, hide_index=True)
-            
+        render_inventory_snapshot('employee')
+        
     with t2:
-        st.subheader("🛒 智能 POS 收银台 (多件合并结账)")
-        
-        pos_col1, pos_col2 = st.columns([1.2, 1.5])
-        
-        f_opts = get_f(df_stock, "").copy() 
-        if not f_opts.empty:
-            f_opts['label'] = f_opts['商品名称'].fillna('').astype(str) + " (" + f_opts['颜色'].fillna('').astype(str) + ")" 
-            
-            with pos_col1:
-                with st.container(border=True):
-                    st.markdown("#### 1️⃣ 扫码/点单区")
-                    
-                    search_kw_emp = st.text_input("🔍 键盘输入搜商品 (自动过滤下拉菜单)", key="pos_search_emp")
-                    filtered_opts_emp = f_opts[f_opts['label'].str.contains(search_kw_emp, case=False, na=False)] if search_kw_emp else f_opts
-                    
-                    if not filtered_opts_emp.empty:
-                        s_l = st.selectbox("选择售出商品", filtered_opts_emp['label'], key="pos_item_emp")
-                        selected_row = filtered_opts_emp[filtered_opts_emp['label'] == s_l].iloc[0]
-                        base_price = float(pd.to_numeric(selected_row['售卖价格'], errors='coerce') or 0)
-                        
-                        c_q, c_d = st.columns(2)
-                        s_q = c_q.number_input("销售数量", min_value=1, value=1, step=1, key="pos_qty_emp")
-                        
-                        d_opts = {"无折扣 (原价)": 1.0, "95折": 0.95, "9折": 0.90, "85折": 0.85, "8折": 0.80, "75折": 0.75, "7折": 0.70, "5折 (半价)": 0.50}
-                        s_discount = c_d.selectbox("快捷折扣", list(d_opts.keys()), key="pos_disc_emp")
-                        
-                        auto_calc_price = base_price * d_opts[s_discount]
-                        
-                        # 🔥 折扣价格动态刷新
-                        s_p = st.number_input("此单品最终成交价 ($)", value=float(auto_calc_price), format="%.2f", key=f"p_{s_l}_{s_discount}_emp")
-                        
-                        if st.button("➕ 加入当前购物车", use_container_width=True, key="btn_add_cart_emp"):
-                            item_dict = {
-                                "商品名称": str(selected_row['商品名称']),
-                                "颜色": str(selected_row['颜色']),
-                                "数量": s_q,
-                                "单价": s_p,
-                                "小计": s_q * s_p
-                            }
-                            st.session_state.pos_cart.append(item_dict)
-                            st.rerun()
-                    else:
-                        st.warning("未找到符合条件的商品。")
-
-            with pos_col2:
-                with st.container(border=True):
-                    st.markdown("#### 2️⃣ 当前购物车")
-                    if not st.session_state.pos_cart:
-                        st.info("🛒 购物车空空如也。")
-                    else:
-                        cart_df = pd.DataFrame(st.session_state.pos_cart)
-                        df_disp = cart_df[['商品名称', '颜色', '数量', '单价', '小计']].copy()
-                        st.dataframe(df_disp.style.format({'单价': '${:.2f}', '小计': '${:.2f}'}), use_container_width=True, hide_index=True)
-                        
-                        cart_total_qty = cart_df['数量'].sum()
-                        cart_total_amt = cart_df['小计'].sum()
-                        
-                        st.markdown(f"**🛍️ 本单共计:** `{cart_total_qty}` &nbsp;&nbsp;|&nbsp;&nbsp; **💰 合计应收:** ` ${cart_total_amt:.2f}`")
-                        
-                        co_col1, co_col2 = st.columns([2, 1])
-                        s_d = co_col1.date_input("交易日期 (可补录)", value=datetime.now(), key="pos_date_emp")
-                        
-                        if co_col2.button("🗑️ 清空购物车", use_container_width=True, key="btn_clear_cart_emp"):
-                            st.session_state.pos_cart = []
-                            st.rerun()
-                            
-                        if st.button("💳 确认结账 (生成流水)", type="primary", use_container_width=True, key="btn_checkout_emp"):
-                            fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
-                            latest_stock = fresh[STOCK_SHEET]
-                            latest_sales = fresh[SALES_SHEET]
-                            
-                            order_id = "ORD-" + datetime.now().strftime("%Y%m%d-%H%M%S")
-                            order_date = s_d.strftime("%Y/%m/%d")
-                            curr_user = st.session_state.get("current_user", "Unknown")
-                            
-                            new_rows = []
-                            for item in st.session_state.pos_cart:
-                                real_n = item['商品名称']
-                                real_c = item['颜色']
-                                new_rows.append([order_id, order_date, curr_user, real_n, real_c, item['数量'], item['单价'], item['小计']])
-                                idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
-                                if not idx_p.empty:
-                                    i_p = idx_p[0]
-                                    latest_stock.at[i_p, '货柜数量'] = int(pd.to_numeric(latest_stock.at[i_p, '货柜数量'], errors='coerce') or 0) - item['数量']
-                                    latest_stock.at[i_p, '已售出数量'] = int(pd.to_numeric(latest_stock.at[i_p, '已售出数量'], errors='coerce') or 0) + item['数量']
-                                    latest_stock.at[i_p, '总库存'] = sum([int(pd.to_numeric(latest_stock.at[i_p, col], errors='coerce') or 0) for col in ['展示数量', '货柜数量', '储物间数量']])
-                            
-                            new_sales_df = pd.DataFrame(new_rows, columns=SALES_COLS)
-                            latest_sales = pd.concat([new_sales_df, latest_sales], ignore_index=True)
-                            
-                            save_data(latest_sales, SALES_SHEET) 
-                            save_data(latest_stock, STOCK_SHEET) 
-                            
-                            st.session_state.pos_cart = []
-                            st.success(f"🎉 结账成功！流水号 {order_id}")
-                            st.rerun()
-
+        render_pos_engine('employee')
         st.divider()
-        st.markdown("### 📝 今日流水 (只读)")
+        st.markdown(t("### 📝 今日流水 (只读)", "### 📝 Today's Logs (Read-only)"))
         f_sl = get_f(df_sales, q)
         if not f_sl.empty:
             today_str = datetime.now().strftime("%Y/%m/%d")
@@ -2041,35 +1965,43 @@ elif is_employee:
             if not today_sales.empty:
                 today_sales['成交单价'] = pd.to_numeric(today_sales['成交单价'], errors='coerce').fillna(0.0)
                 today_sales['总营业额'] = pd.to_numeric(today_sales['总营业额'], errors='coerce').fillna(0.0)
-                st.dataframe(today_sales.style.format({'成交单价': '${:.2f}', '总营业额': '${:.2f}'}), use_container_width=True, hide_index=True)
+                today_sales['商品名称'] = translate_series(today_sales['商品名称'])
+                today_sales['颜色'] = translate_series(today_sales['颜色'])
+                if st.session_state.lang == 'en': today_sales.rename(columns=col_map, inplace=True)
+                
+                u_col = 'Unit Price' if st.session_state.lang == 'en' else '成交单价'
+                t_col = 'Total Amount' if st.session_state.lang == 'en' else '总营业额'
+                st.dataframe(today_sales.style.format({u_col: '${:.2f}', t_col: '${:.2f}'}), use_container_width=True, hide_index=True)
             else:
-                st.write("今日尚未产生流水。")
+                st.write(t("今日尚未产生流水。", "No records for today."))
                 
     with t3:
-        st.subheader("⏰ 员工考勤打卡")
-        st.info("💡 请如实填报您的上下班时间，系统将自动核算工资。")
+        st.subheader(t("⏰ 员工考勤打卡", "⏰ Staff Timeclock"))
+        st.info(t("💡 请如实填报您的上下班时间，系统将自动核算工资。", "💡 Please log your daily working hours below. System will auto-calculate wage."))
         
         with st.form("emp_attendance_form"):
             emp_name = st.session_state.current_user
-            st.markdown(f"**当前打卡人:** `{emp_name}`")
+            st.markdown(f"**{t('当前打卡人', 'Current Staff')}:** `{emp_name}`")
             
-            att_date = st.date_input("工作日期", value=datetime.now())
+            att_date = st.date_input(t("工作日期", "Work Date"), value=datetime.now())
             
             c1, c2 = st.columns(2)
-            att_start = c1.time_input("上班时间", value=time(10, 0))
-            att_end = c2.time_input("下班时间", value=time(18, 0))
+            att_start = c1.time_input(t("上班时间", "Clock In Time"), value=time(10, 0))
+            att_end = c2.time_input(t("下班时间", "Clock Out Time"), value=time(18, 0))
             
-            if st.form_submit_button("✅ 确认打卡 (提交本班次)", type="primary", use_container_width=True):
+            if st.form_submit_button(t("✅ 确认打卡 (提交本班次)", "✅ Submit Time"), type="primary", use_container_width=True):
                 fresh_att = JIT_fetch([ATT_SHEET])[ATT_SHEET]
                 fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
                 
+                # 计算时长
                 dt_start = datetime.combine(att_date, att_start)
                 dt_end = datetime.combine(att_date, att_end)
                 if dt_end < dt_start: dt_end += timedelta(days=1)
                 duration_hours = (dt_end - dt_start).total_seconds() / 3600.0
                 
+                # 强转去空格防匹配报错
                 emp_rows = fresh_emp[fresh_emp['员工姓名'].astype(str).str.strip() == str(emp_name).strip()]
-                if not emp_rows.empty: hourly_wage = float(pd.to_numeric(emp_rows.iloc[0]['时薪'], errors='coerce') or 0.0)
+                if not emp_rows.empty: hourly_wage = to_float(emp_rows.iloc[0]['时薪'])
                 else: hourly_wage = 0.0
                 
                 total_wage = duration_hours * hourly_wage
@@ -2083,22 +2015,25 @@ elif is_employee:
                 fresh_att = pd.concat([new_att, fresh_att], ignore_index=True)
                 save_data(fresh_att, ATT_SHEET) 
                 
-                st.success(f"打卡成功！共计 {round(duration_hours, 1)} 小时。")
+                st.success(t(f"打卡成功！共计 {round(duration_hours, 1)} 小时。", f"Success! Total {round(duration_hours, 1)} hrs."))
                 st.rerun()
 
         st.divider()
-        st.markdown("### 📝 我的历史打卡记录 (只读)")
+        st.markdown(t("### 📝 我的历史打卡记录 (只读)", "### 📝 My Time Logs (Read-only)"))
         f_att = get_f(df_attendance, q)
         my_att = f_att[f_att['员工姓名'].astype(str).str.strip() == str(st.session_state.current_user).strip()].copy() if not f_att.empty else pd.DataFrame()
         
         if not my_att.empty:
             my_att['核算薪资'] = pd.to_numeric(my_att['核算薪资'], errors='coerce').fillna(0.0)
-            st.dataframe(my_att.style.format({'核算薪资': '${:.2f}'}), use_container_width=True, hide_index=True)
+            my_disp = my_att.copy()
+            if st.session_state.lang == 'en': my_disp.rename(columns=col_map, inplace=True)
+            w_col = 'Est. Wage' if st.session_state.lang == 'en' else '核算薪资'
+            st.dataframe(my_disp.style.format({w_col: '${:.2f}'}), use_container_width=True, hide_index=True)
             
             tot_h = pd.to_numeric(my_att['工作时长'], errors='coerce').fillna(0).sum()
             tot_w = my_att['核算薪资'].sum()
             c3, c4 = st.columns(2)
-            c3.metric("累积总工时", f"{tot_h:.1f}")
-            c4.metric("预估总薪资", f"${tot_w:.2f}")
+            c3.metric(t("累积总工时", "Total Hours"), f"{tot_h:.1f}")
+            c4.metric(t("预估总薪资", "Total Est. Wage"), f"${tot_w:.2f}")
         else:
-            st.info("暂无打卡记录。")
+            st.info(t("暂无打卡记录。", "No time logs found."))
