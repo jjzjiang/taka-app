@@ -40,7 +40,7 @@ if "sheet_versions" not in st.session_state:
 if "pos_cart" not in st.session_state:
     st.session_state.pos_cart = []
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def load_raw_data(sheet_name, version):
     try:
         worksheet = sh.worksheet(sheet_name)
