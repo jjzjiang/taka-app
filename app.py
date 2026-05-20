@@ -137,6 +137,25 @@ def filter_by_date_range(df, date_col, start_date, end_date):
     out = out[(out['_date_filter_dt'] >= start_date) & (out['_date_filter_dt'] <= end_date)]
     return out.drop(columns=['_date_filter_dt'])
 
+def sort_sales_latest_first(df):
+    """让最新 POS 流水显示在最上面。append_rows 会把新数据写到 Sheet 底部，
+    如果界面不排序，用户会误以为销售记录没有更新。"""
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    order_str = out['订单号'].fillna('').astype(str) if '订单号' in out.columns else pd.Series('', index=out.index)
+    # 支持 ORD-20260520-133803 和 ORD-20260520-133803-123456 两种格式。
+    extracted = order_str.str.extract(r'(\d{8}-\d{6})', expand=False)
+    out['_order_sort_dt'] = pd.to_datetime(extracted, format='%Y%m%d-%H%M%S', errors='coerce')
+    out['_date_sort_dt'] = pd.to_datetime(out['日期'], errors='coerce') if '日期' in out.columns else pd.NaT
+    out['_orig_sort_pos'] = range(len(out))
+    out = out.sort_values(
+        by=['_order_sort_dt', '_date_sort_dt', '_orig_sort_pos'],
+        ascending=[False, False, False],
+        na_position='last'
+    )
+    return out.drop(columns=['_order_sort_dt', '_date_sort_dt', '_orig_sort_pos'], errors='ignore')
+
 def append_rows_data(sheet_name, rows, columns):
     if not rows:
         return
@@ -898,6 +917,12 @@ def render_pos_engine(role_prefix):
                         save_data(latest_stock, STOCK_SHEET)
                         append_rows_data(SALES_SHEET, new_rows, SALES_COLS)
                         
+                        # 让结账后的销售流水表立即换 key 并刷新；否则 data_editor 可能保留旧 widget 状态，
+                        # 同时新流水 append 在 Sheet 底部，用户会误以为没有更新。
+                        st.session_state.sales_reset_key += 1
+                        st.session_state.stock_reset_key += 1
+                        st.session_state.last_order_id = order_id
+                        
                         st.session_state.pos_cart = []
                         st.success(t(f"🎉 结账成功！流水号 {order_id}", f"🎉 Checkout Success! ID: {order_id}"))
                         st.rerun()
@@ -1172,7 +1197,13 @@ if is_admin:
         
         st.divider()
         st.markdown("### 📝 销售流水编辑与防飞单机制")
-        f_sl = get_f(df_sales, q)
+        if st.session_state.get("last_order_id"):
+            st.success(f"✅ 刚刚已写入销售流水：{st.session_state.last_order_id}。最新流水会显示在下方最上面。")
+        if st.button("🔄 手动刷新销售流水", use_container_width=True, key="btn_refresh_sales_table_admin"):
+            st.session_state.sheet_versions[SALES_SHEET] = st.session_state.sheet_versions.get(SALES_SHEET, 0) + 1
+            st.session_state.sales_reset_key += 1
+            st.rerun()
+        f_sl = sort_sales_latest_first(get_f(df_sales, q))
         if not f_sl.empty:
             f_sl_sel = f_sl.copy()
             
@@ -2152,6 +2183,7 @@ elif is_employee:
             log_date_str = log_date.strftime("%Y/%m/%d")
             current_staff = str(st.session_state.get("current_user", "")).strip()
             today_sales = f_sl[(f_sl['日期'].astype(str).str.strip() == log_date_str) & (f_sl['收银员'].astype(str).str.strip() == current_staff)].copy()
+            today_sales = sort_sales_latest_first(today_sales)
             if not today_sales.empty:
                 today_sales['成交单价'] = pd.to_numeric(today_sales['成交单价'], errors='coerce').fillna(0.0)
                 today_sales['总营业额'] = pd.to_numeric(today_sales['总营业额'], errors='coerce').fillna(0.0)
