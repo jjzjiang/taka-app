@@ -715,8 +715,25 @@ def render_pos_engine(role_prefix):
                     d_opts = {"无折扣 (原价)": 1.0, "95折": 0.95, "9折": 0.90, "85折": 0.85, "8折": 0.80, "75折": 0.75, "7折": 0.70, "5折 (半价)": 0.50} if st.session_state.lang == 'cn' else {"No Discount": 1.0, "5% Off": 0.95, "10% Off": 0.90, "15% Off": 0.85, "20% Off": 0.80, "25% Off": 0.75, "30% Off": 0.70, "50% Off": 0.50}
                     s_discount = c_d.selectbox(t("快捷折扣", "Discount"), list(d_opts.keys()), key=f"pos_disc_{role_prefix}")
                     
-                    auto_calc_price = base_price * d_opts[s_discount]
-                    s_p = st.number_input(t("此单品最终成交价 ($)", "Final Price per item ($)"), value=float(auto_calc_price), format="%.2f", key=f"pos_final_p_{role_prefix}")
+                    auto_calc_price = round(base_price * d_opts[s_discount], 2)
+                    price_key = f"pos_final_p_{role_prefix}"
+                    price_sig_key = f"pos_final_price_sig_{role_prefix}"
+                    price_sig = f"{s_l}|{s_discount}|{base_price:.4f}"
+                    
+                    # Streamlit 的 number_input 有 key 后，会优先保留旧的 session_state。
+                    # 所以必须在商品/折扣变化时，主动把成交价刷新成新的折后价；
+                    # 但如果商品和折扣没变，允许店员手动改价，不会被反复覆盖。
+                    if st.session_state.get(price_sig_key) != price_sig:
+                        st.session_state[price_key] = float(auto_calc_price)
+                        st.session_state[price_sig_key] = price_sig
+                    
+                    s_p = st.number_input(
+                        t("此单品最终成交价 ($)", "Final Price per item ($)"),
+                        format="%.2f",
+                        key=price_key,
+                        help=t("会根据所选商品和折扣自动刷新，也可以手动改价。", "Auto-updates by selected item/discount, but can be manually overridden.")
+                    )
+                    st.caption(t(f"系统折后价：${auto_calc_price:.2f}，如需特殊价格可直接手动修改上方金额。", f"Auto discounted price: ${auto_calc_price:.2f}. You can manually override the amount above."))
                     
                     if st.button(t("➕ 加入当前购物车", "➕ Add to Cart"), use_container_width=True, key=f"btn_add_cart_{role_prefix}"):
                         if "pos_cart" not in st.session_state:
