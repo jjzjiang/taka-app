@@ -78,6 +78,23 @@ def to_float(value, default=0.0):
 def recalc_total_stock(df, idx):
     return sum(to_int(df.at[idx, col]) for col in ['展示数量', '货柜数量', '储物间数量'])
 
+# POS 出库策略：用【总库存】判断是否可卖，但实际扣减仍从具体库位扣，避免库位出现负数。
+def deduct_pos_stock_from_locations(df, idx, qty, priority=None):
+    if priority is None:
+        priority = ['货柜数量', '展示数量', '储物间数量']
+    remaining = int(qty)
+    for col in priority:
+        available = to_int(df.at[idx, col])
+        if available <= 0:
+            continue
+        take = min(available, remaining)
+        df.at[idx, col] = available - take
+        remaining -= take
+        if remaining <= 0:
+            break
+    df.at[idx, '总库存'] = recalc_total_stock(df, idx)
+    return remaining == 0
+
 def split_sku_label(label):
     label = str(label)
     if " (" not in label:
@@ -689,32 +706,41 @@ def render_pos_engine(role_prefix):
                         
                         new_rows = []
                         stock_errors = []
+                        cart_required = {}
 
-                        # 先统一校验库存，全部通过后再写入，避免半成功/负库存
+                        # 先按 SKU 汇总购物车数量，避免同一个商品分两行加入时绕过库存检查。
                         for item in st.session_state.pos_cart:
-                            real_n = item['real_name']
-                            real_c = item['real_color']
-                            idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
+                            key = (str(item['real_name']).strip(), str(item['real_color']).strip())
+                            cart_required[key] = cart_required.get(key, 0) + int(item['数量'])
+
+                        # POS 现在看【总库存】是否足够；总库存按 展示+货柜+储物 实时重算，避免 Google Sheet 里的旧值误导。
+                        for (real_n, real_c), need_qty in cart_required.items():
+                            idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == real_n) & (latest_stock['颜色'].astype(str).str.strip() == real_c)].index
                             if idx_p.empty:
                                 stock_errors.append(f"找不到商品：{real_n} ({real_c})")
                                 continue
-                            current_cabinet = to_int(latest_stock.at[idx_p[0], '货柜数量'])
-                            if current_cabinet < int(item['数量']):
-                                stock_errors.append(f"{real_n} ({real_c}) 货柜库存不足：现有 {current_cabinet}，需要 {item['数量']}")
+                            i_p = idx_p[0]
+                            current_total = recalc_total_stock(latest_stock, i_p)
+                            latest_stock.at[i_p, '总库存'] = current_total
+                            if current_total < need_qty:
+                                stock_errors.append(f"{real_n} ({real_c}) 总库存不足：现有 {current_total}，需要 {need_qty}")
 
                         if stock_errors:
                             st.error("⚠️ 无法结账：\n" + "\n".join(stock_errors))
                             st.stop()
 
                         for item in st.session_state.pos_cart:
-                            real_n = item['real_name']
-                            real_c = item['real_color']
-                            new_rows.append([order_id, order_date, curr_user, real_n, real_c, item['数量'], item['单价'], item['小计']])
-                            idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
+                            real_n = str(item['real_name']).strip()
+                            real_c = str(item['real_color']).strip()
+                            sell_qty = int(item['数量'])
+                            new_rows.append([order_id, order_date, curr_user, real_n, real_c, sell_qty, item['单价'], item['小计']])
+                            idx_p = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == real_n) & (latest_stock['颜色'].astype(str).str.strip() == real_c)].index
                             i_p = idx_p[0]
-                            latest_stock.at[i_p, '货柜数量'] = to_int(latest_stock.at[i_p, '货柜数量']) - int(item['数量'])
-                            latest_stock.at[i_p, '已售出数量'] = to_int(latest_stock.at[i_p, '已售出数量']) + int(item['数量'])
-                            latest_stock.at[i_p, '总库存'] = recalc_total_stock(latest_stock, i_p)
+                            ok = deduct_pos_stock_from_locations(latest_stock, i_p, sell_qty)
+                            if not ok:
+                                st.error(f"⚠️ 出库失败：{real_n} ({real_c}) 库位库存和总库存不一致，请刷新后重试。")
+                                st.stop()
+                            latest_stock.at[i_p, '已售出数量'] = to_int(latest_stock.at[i_p, '已售出数量']) + sell_qty
                         
                         save_data(latest_stock, STOCK_SHEET)
                         append_rows_data(SALES_SHEET, new_rows, SALES_COLS)
