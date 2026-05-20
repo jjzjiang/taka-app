@@ -5,6 +5,7 @@ import gspread
 from gspread.exceptions import WorksheetNotFound
 import json
 import hmac
+import hashlib
 import plotly.express as px
 
 # --- 1. 配置与云端数据库初始化 ---
@@ -307,11 +308,76 @@ def clear_fb(): st.session_state.fb_reset_key += 1
 manager_password = "taka888"
 
 # 🚀 门禁系统角色解析
-# 安全修复：不要再通过 ?role=admin 或 ?role=employee&user=xxx 自动登录。
-# 之前的写法任何人改 URL 都可能绕过密码/PIN。
+# 说明：Streamlit 的 session_state 在浏览器硬刷新/手机后台恢复时可能重置。
+# 为了避免一刷新就掉回登录页，这里用 URL query params 保存一个轻量登录 token。
+# token 会绑定角色、用户名和当前密码/PIN；员工改 PIN 后旧链接自动失效。
+AUTH_SALT = "taka-retail-login-v2"
+
+def _qp_get(name, default=""):
+    try:
+        val = st.query_params.get(name, default)
+        if isinstance(val, list):
+            return val[0] if val else default
+        return default if val is None else str(val)
+    except Exception:
+        return default
+
+def _auth_digest(role, user, secret):
+    raw = f"{AUTH_SALT}|{role}|{user}|{secret}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def make_auth_token(role, user):
+    role = str(role).strip()
+    user = str(user).strip()
+    if role == "admin":
+        return _auth_digest("admin", "店长", manager_password)
+
+    if role in ["employee", "supplier"] and not df_employee.empty:
+        emp_matches = df_employee[df_employee['员工姓名'].fillna('').astype(str).str.strip() == user]
+        if emp_matches.empty:
+            return None
+        emp_row_for_token = emp_matches.iloc[0]
+        if str(emp_row_for_token.get('状态', '')).strip() == '离职':
+            return None
+        expected_role = "supplier" if str(emp_row_for_token.get('职位', '')).strip() == '合作厂商' else "employee"
+        if expected_role != role:
+            return None
+        pin_secret = str(emp_row_for_token.get('登录密码', '')).strip()
+        if pin_secret == "":
+            return None
+        return _auth_digest(role, user, pin_secret)
+    return None
+
+def restore_login_from_url():
+    role = _qp_get("role")
+    user = _qp_get("user", "店长" if role == "admin" else "")
+    token = _qp_get("auth")
+    if not role or not token:
+        return False
+
+    if role == "admin":
+        user = "店长"
+    elif role not in ["employee", "supplier"] or not user:
+        return False
+
+    expected_token = make_auth_token(role, user)
+    if expected_token and hmac.compare_digest(str(token), str(expected_token)):
+        st.session_state.role = role
+        st.session_state.current_user = user
+        return True
+    return False
+
+def persist_login_to_url(role, user):
+    token = make_auth_token(role, user)
+    if token:
+        st.query_params["role"] = role
+        st.query_params["user"] = user
+        st.query_params["auth"] = token
+
 if "role" not in st.session_state:
-    st.session_state.role = None
-    st.session_state.current_user = None
+    if not restore_login_from_url():
+        st.session_state.role = None
+        st.session_state.current_user = None
 
 # 日期筛选已改为各看板独立选择，不再使用侧边栏全局档期。
 
@@ -376,7 +442,7 @@ with st.sidebar:
                 if hmac.compare_digest(str(pwd_input), str(manager_password)):
                     st.session_state.role = "admin"
                     st.session_state.current_user = "店长"
-                    st.query_params["role"] = "admin"
+                    persist_login_to_url("admin", "店长")
                     st.rerun()
                 else:
                     st.error(t("❌ 密码错误！", "❌ Incorrect Password!"))
@@ -407,8 +473,7 @@ with st.sidebar:
                                     save_data(fresh_emp, EMP_SHEET)
                                     st.session_state.role = assigned_role
                                     st.session_state.current_user = emp_sel
-                                    st.query_params["role"] = assigned_role
-                                    st.query_params["user"] = emp_sel
+                                    persist_login_to_url(assigned_role, emp_sel)
                                     st.success("✅ 密码设置成功！")
                                     st.rerun()
                                 else:
@@ -419,8 +484,7 @@ with st.sidebar:
                             if emp_pwd_input == emp_pwd:
                                 st.session_state.role = assigned_role
                                 st.session_state.current_user = emp_sel
-                                st.query_params["role"] = assigned_role
-                                st.query_params["user"] = emp_sel
+                                persist_login_to_url(assigned_role, emp_sel)
                                 st.rerun()
                             else:
                                 st.error(t("❌ 密码不匹配！", "❌ Incorrect PIN!"))
