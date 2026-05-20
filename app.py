@@ -1206,6 +1206,9 @@ if is_admin:
         f_sl = sort_sales_latest_first(get_f(df_sales, q))
         if not f_sl.empty:
             f_sl_sel = f_sl.copy()
+            # 保留这条流水在 Sales 表里的原始行号，用来做“单条精确撤销”。
+            # 这列会被隐藏，不展示给用户。
+            f_sl_sel['__sales_source_index'] = f_sl_sel.index.astype(int)
             
             f_sl_sel['成交单价'] = pd.to_numeric(f_sl_sel['成交单价'], errors='coerce').fillna(0.0)
             f_sl_sel['总营业额'] = pd.to_numeric(f_sl_sel['总营业额'], errors='coerce').fillna(0.0)
@@ -1224,10 +1227,15 @@ if is_admin:
             styled_sl = f_sl_sel.style.format({u_col: '${:.2f}', t_col: '${:.2f}'})
             
             d_disable = [c for c in f_sl_sel.columns if c != sel_col_name]
+            visible_sales_cols = [c for c in f_sl_sel.columns if c != '__sales_source_index']
             
             edt = st.data_editor(
                 styled_sl, 
-                column_config={sel_col_name: st.column_config.CheckboxColumn(sel_col_name, default=False)}, 
+                column_config={
+                    sel_col_name: st.column_config.CheckboxColumn(sel_col_name, default=False),
+                    '__sales_source_index': None,
+                }, 
+                column_order=visible_sales_cols,
                 disabled=d_disable, 
                 use_container_width=True, hide_index=True, 
                 key=f"sales_editor_{st.session_state.sales_reset_key}"
@@ -1236,40 +1244,75 @@ if is_admin:
             sel = edt[edt[sel_col_name] == True] if sel_col_name in edt.columns else pd.DataFrame()
             
             if not sel.empty:
-                sc1, sc2, _ = st.columns([1.5, 1.5, 4])
-                with sc1:
-                    if st.button("🔴 批量撤销流水", type="primary"):
-                        fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
-                        latest_stock = fresh[STOCK_SHEET]
-                        latest_sales = fresh[SALES_SHEET]
-                        
-                        for _, r in sel.iterrows():
-                            real_n = t_val(r['Product' if st.session_state.lang == 'en' else '商品名称'], 'cn')
-                            real_c = t_val(r['Variant' if st.session_state.lang == 'en' else '颜色'], 'cn')
-                            q_val = to_int(r['Qty' if st.session_state.lang == 'en' else '销售数量'])
+                if len(sel) > 1:
+                    st.warning("⚠️ 为了防止误删，现在不支持批量撤销。请只勾选 1 条销售流水。")
+                    st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
+                else:
+                    r_del = sel.iloc[0]
+                    del_order_id = str(r_del['Order ID' if st.session_state.lang == 'en' else '订单号']).strip()
+                    del_product = str(r_del['Product' if st.session_state.lang == 'en' else '商品名称']).strip()
+                    del_variant = str(r_del['Variant' if st.session_state.lang == 'en' else '颜色']).strip()
+                    del_qty = to_int(r_del['Qty' if st.session_state.lang == 'en' else '销售数量'])
+                    del_amount = to_float(r_del['Total Amount' if st.session_state.lang == 'en' else '总营业额'])
+                    st.warning(f"即将撤销 1 条销售流水：`{del_order_id}` / `{del_product} ({del_variant})` / 数量 `{del_qty}` / 金额 `${del_amount:.2f}`。此操作会同步回补库存。")
+
+                    sc1, sc2, _ = st.columns([1.8, 1.5, 4])
+                    with sc1:
+                        if st.button("🗑️ 确认撤销这 1 条流水", type="primary"):
+                            fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET])
+                            latest_stock = fresh[STOCK_SHEET]
+                            latest_sales = fresh[SALES_SHEET]
                             
+                            real_n = t_val(del_product, 'cn')
+                            real_c = t_val(del_variant, 'cn')
+                            q_val = del_qty
+
+                            try:
+                                source_idx = int(float(r_del.get('__sales_source_index', -1)))
+                            except Exception:
+                                source_idx = -1
+
+                            t_idx = None
+                            if source_idx in latest_sales.index:
+                                row_check = latest_sales.loc[source_idx]
+                                same_row = (
+                                    str(row_check.get('订单号', '')).strip() == del_order_id and
+                                    str(row_check.get('商品名称', '')).strip() == str(real_n).strip() and
+                                    str(row_check.get('颜色', '')).strip() == str(real_c).strip() and
+                                    to_int(row_check.get('销售数量', 0)) == q_val
+                                )
+                                if same_row:
+                                    t_idx = source_idx
+
+                            if t_idx is None:
+                                cond = (latest_sales['订单号'].astype(str).str.strip() == del_order_id) & \
+                                       (latest_sales['商品名称'].astype(str).str.strip() == str(real_n).strip()) & \
+                                       (latest_sales['颜色'].astype(str).str.strip() == str(real_c).strip()) & \
+                                       (pd.to_numeric(latest_sales['销售数量'], errors='coerce').fillna(0).astype(int) == q_val)
+                                match_idxs = latest_sales[cond].index.tolist()
+                                if len(match_idxs) == 1:
+                                    t_idx = match_idxs[0]
+                                elif len(match_idxs) > 1:
+                                    st.error("⚠️ 检测到多条完全相似的流水。为防止误删，请先点「手动刷新销售流水」后再试。")
+                                    st.stop()
+                                else:
+                                    st.error("⚠️ 未在云端找到这条流水，可能已被删除或页面不是最新。请先手动刷新。")
+                                    st.stop()
+
                             m = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_c).strip())].index
                             if not m.empty:
                                 latest_stock.at[m[0], '货柜数量'] = to_int(latest_stock.at[m[0], '货柜数量']) + q_val
                                 latest_stock.at[m[0], '已售出数量'] = to_int(latest_stock.at[m[0], '已售出数量']) - q_val
                                 latest_stock.at[m[0], '总库存'] = recalc_total_stock(latest_stock, m[0])
-                            
-                            o_id = str(r['Order ID' if st.session_state.lang == 'en' else '订单号']).strip()
-                            o_dt = str(r['Date' if st.session_state.lang == 'en' else '日期']).strip()
-                            
-                            cond = (latest_sales['订单号'].astype(str).str.strip() == o_id) & \
-                                   (latest_sales['商品名称'].astype(str).str.strip() == str(real_n).strip()) & \
-                                   (latest_sales['颜色'].astype(str).str.strip() == str(real_c).strip()) & \
-                                   (pd.to_numeric(latest_sales['销售数量'], errors='coerce').fillna(0).astype(int) == q_val)
-                                   
-                            latest_sales = latest_sales[~cond]
-                        
-                        save_data(latest_stock, STOCK_SHEET)
-                        save_data(latest_sales, SALES_SHEET)
-                        st.session_state.sales_reset_key += 1
-                        st.rerun()
-                with sc2: 
-                    st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
+
+                            latest_sales = latest_sales.drop(index=t_idx).reset_index(drop=True)
+                            save_data(latest_stock, STOCK_SHEET)
+                            save_data(latest_sales, SALES_SHEET)
+                            st.session_state.sales_reset_key += 1
+                            st.success("✅ 已精确撤销 1 条销售流水。")
+                            st.rerun()
+                    with sc2:
+                        st.button("🔄 取消所有选中", key="btn_cancel_sales", on_click=clear_sales)
 
                 if len(sel) == 1:
                     st.markdown("### ⚙️ 修改此笔流水 (Edit Log)")
