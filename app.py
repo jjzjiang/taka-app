@@ -230,10 +230,7 @@ def clear_att(): st.session_state.att_reset_key += 1
 def clear_b2b(): st.session_state.b2b_reset_key += 1
 def clear_fb(): st.session_state.fb_reset_key += 1
 
-manager_password = str(st.secrets.get("manager_password", "")).strip()
-if not manager_password:
-    st.error("🔴 缺少 Streamlit Secret：manager_password。请在 Streamlit Cloud 的 Secrets 中设置管理员密码。")
-    st.stop()
+manager_password = "taka888"
 
 # 🚀 门禁系统角色解析
 # 安全修复：不要再通过 ?role=admin 或 ?role=employee&user=xxx 自动登录。
