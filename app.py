@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta, time
 import gspread 
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import WorksheetNotFound, APIError
 import json
 import hmac
 import hashlib
+import time as pytime
 import plotly.express as px
 
 # --- 1. 配置与云端数据库初始化 ---
@@ -140,26 +141,33 @@ def append_rows_data(sheet_name, rows, columns):
     if not rows:
         return
     try:
-        worksheet = sh.worksheet(sheet_name)
+        worksheet = get_worksheet_cached(sheet_name)
     except WorksheetNotFound:
         worksheet = sh.add_worksheet(title=sheet_name, rows="1000", cols=str(max(20, len(columns) + 5)))
         worksheet.update(values=[columns], range_name='A1')
 
-    existing_header = worksheet.row_values(1)
-    if existing_header[:len(columns)] != columns:
-        worksheet.update(values=[columns], range_name='A1')
-
     safe_rows = [["" if pd.isna(v) else str(v) for v in row] for row in rows]
-    try:
-        worksheet.append_rows(safe_rows, value_input_option="USER_ENTERED")
-        st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
+    last_error = None
+    for attempt in range(3):
         try:
-            load_raw_data.clear()
-        except Exception:
-            pass
-    except Exception as e:
-        st.error(f"🔴 追加写入 {sheet_name} 失败。请检查网络/Google Sheet权限后重试。Error: {e}")
-        st.stop()
+            worksheet.append_rows(safe_rows, value_input_option="USER_ENTERED")
+            # 只让被保存的这张表失效，不清空所有表缓存，避免一次保存后全系统重新读取 8 张表触发 429。
+            st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
+            return
+        except APIError as e:
+            last_error = e
+            msg = str(e)
+            if ('429' in msg or 'Quota exceeded' in msg) and attempt < 2:
+                pytime.sleep(2 + attempt * 3)
+                continue
+            st.error(f"🔴 追加写入 {sheet_name} 失败。Google Sheets 额度可能暂时超限，请等 30-60 秒再试。Error: {e}")
+            st.stop()
+        except Exception as e:
+            last_error = e
+            st.error(f"🔴 追加写入 {sheet_name} 失败。请检查网络/Google Sheet权限后重试。Error: {e}")
+            st.stop()
+    st.error(f"🔴 追加写入 {sheet_name} 失败。Error: {last_error}")
+    st.stop()
 
 # ================= 🚀 数据定义与初始化 =================
 STOCK_SHEET, SALES_SHEET, EMP_SHEET = "Stock", "Sales", "Employee"
@@ -181,21 +189,45 @@ all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBAC
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {s: 0 for s in all_sheets}
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_resource(show_spinner=False)
+def get_worksheet_cached(sheet_name):
+    # 缓存 worksheet 对象，避免每次 rerun 都先请求一次 worksheet metadata。
+    return sh.worksheet(sheet_name)
+
+@st.cache_data(ttl=900, show_spinner=False)
 def load_raw_data(sheet_name, version):
-    try:
-        worksheet = sh.worksheet(sheet_name)
-        records = worksheet.get_all_records()
-        if not records:
+    last_error = None
+    for attempt in range(3):
+        try:
+            worksheet = get_worksheet_cached(sheet_name)
+            records = worksheet.get_all_records()
+            if not records:
+                return pd.DataFrame()
+            return pd.DataFrame(records)
+        except WorksheetNotFound:
+            # 新表允许为空；保存时会自动创建
             return pd.DataFrame()
-        return pd.DataFrame(records)
-    except WorksheetNotFound:
-        # 新表允许为空；保存时会自动创建
-        return pd.DataFrame()
-    except Exception as e:
-        # 重要：不要把网络/API错误伪装成空表，否则下一次保存可能覆盖掉真实数据
-        st.error(f"🔴 读取 {sheet_name} 失败，请刷新重试或检查 Google Sheet 权限。Error: {e}")
-        st.stop()
+        except APIError as e:
+            last_error = e
+            msg = str(e)
+            if '429' in msg or 'Quota exceeded' in msg or 'Read requests per minute' in msg:
+                if attempt < 2:
+                    pytime.sleep(2 + attempt * 3)
+                    continue
+                st.error(
+                    f"🔴 Google Sheets 读取额度暂时超限。系统已自动重试但仍失败。"
+                    f"请等 30-60 秒再刷新，不要连续猛点刷新。Sheet: {sheet_name}. Error: {e}"
+                )
+                st.stop()
+            st.error(f"🔴 读取 {sheet_name} 失败，请检查 Google Sheet 权限。Error: {e}")
+            st.stop()
+        except Exception as e:
+            last_error = e
+            # 重要：不要把网络/API错误伪装成空表，否则下一次保存可能覆盖掉真实数据
+            st.error(f"🔴 读取 {sheet_name} 失败，请刷新重试或检查 Google Sheet 权限。Error: {e}")
+            st.stop()
+    st.error(f"🔴 读取 {sheet_name} 失败。Error: {last_error}")
+    st.stop()
 
 def load_data(sheet_name, columns):
     ver = st.session_state.sheet_versions.get(sheet_name, 0)
@@ -209,7 +241,7 @@ def load_data(sheet_name, columns):
 
 def save_data(df, sheet_name):
     try:
-        worksheet = sh.worksheet(sheet_name)
+        worksheet = get_worksheet_cached(sheet_name)
     except WorksheetNotFound:
         worksheet = sh.add_worksheet(title=sheet_name, rows="1000", cols="20")
 
@@ -230,11 +262,8 @@ def save_data(df, sheet_name):
         if worksheet.row_count >= next_row:
             worksheet.batch_clear([f"A{next_row}:ZZ{worksheet.row_count}"])
 
+        # 只让被保存的这张表失效，不清空所有表缓存，避免一次保存后全系统重新读取 8 张表触发 429。
         st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
-        try:
-            load_raw_data.clear()
-        except Exception:
-            pass
     except Exception as e:
         st.error(f"🔴 保存 {sheet_name} 失败，数据没有被清空。请检查网络/Google Sheet权限后重试。Error: {e}")
         st.stop()
@@ -263,10 +292,11 @@ def load_safe_emp():
     return df
 
 def JIT_fetch(sheets_to_fetch):
-    try:
-        load_raw_data.clear()
-    except Exception:
-        pass
+    # 写入/结账前需要取最新数据，但不能 load_raw_data.clear() 清空所有表缓存。
+    # 这里只让本次真正需要的表失效，避免触发 Google Sheets per-minute read quota。
+    for s_name in sheets_to_fetch:
+        st.session_state.sheet_versions[s_name] = st.session_state.sheet_versions.get(s_name, 0) + 1
+
     res = {}
     if STOCK_SHEET in sheets_to_fetch: res[STOCK_SHEET] = load_data(STOCK_SHEET, STOCK_COLS)
     if SALES_SHEET in sheets_to_fetch: res[SALES_SHEET] = load_safe_sales()
@@ -282,14 +312,15 @@ def JIT_fetch(sheets_to_fetch):
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8-sig')
 
-df_stock = load_data(STOCK_SHEET, STOCK_COLS)
-df_sales = load_safe_sales()
+# 登录页只需要 Employee 表。不要在登录前一次性读取所有 Sheet，否则刷新/多人打开会很容易触发 429。
+df_stock = pd.DataFrame(columns=STOCK_COLS)
+df_sales = pd.DataFrame(columns=SALES_COLS)
 df_employee = load_safe_emp()
-df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期') 
-df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
-df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
-df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期')
-df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
+df_attendance = pd.DataFrame(columns=ATT_COLS)
+df_b2b = pd.DataFrame(columns=B2B_COLS)
+df_feedback = pd.DataFrame(columns=FEEDBACK_COLS)
+df_restock = pd.DataFrame(columns=RESTOCK_COLS)
+df_traffic = pd.DataFrame(columns=TRAFFIC_COLS)
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -500,6 +531,28 @@ if st.session_state.role is None:
             st.rerun()
     st.info(t("👈 请在左侧选择您的身份并完成登录。", "👈 Please select your role on the left menu to login."))
     st.stop()  
+
+# 登录后按身份懒加载数据：Admin 需要全量；员工/POS 只加载必要表；供应商只加载对账相关表。
+role_now = st.session_state.get("role")
+if role_now == "admin":
+    df_stock = load_data(STOCK_SHEET, STOCK_COLS)
+    df_sales = load_safe_sales()
+    df_employee = load_safe_emp()
+    df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
+    df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
+    df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
+    df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期')
+    df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
+elif role_now == "supplier":
+    df_stock = load_data(STOCK_SHEET, STOCK_COLS)
+    df_sales = load_safe_sales()
+    df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期')
+    df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
+elif role_now == "employee":
+    df_stock = load_data(STOCK_SHEET, STOCK_COLS)
+    df_sales = load_safe_sales()
+    df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
+    df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
 
 # ================= 🚀 主界面布局 =================
 col_title, col_lang = st.columns([8, 2])
