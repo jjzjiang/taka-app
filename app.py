@@ -37,7 +37,9 @@ col_map = {
     '创建日期': 'Create Date', '客户名称': 'Client', '采购数量': 'Purchase Qty', 'B2B单价': 'B2B Price',
     '总计应收': 'Total Recv.', '已收定金': 'Deposit', '待收尾款': 'Balance', '约定交期': 'Deadline', '订单状态': 'Order Status', '备注': 'Notes',
     '记录日期': 'Log Date', '操作类型': 'Operation', '变动数量': 'Change Qty', '库位详情': 'Location Det.',
-    '开始时间': 'Start Time', '结束时间': 'End Time', '工作时长': 'Hours', '核算薪资': 'Est. Wage'
+    '开始时间': 'Start Time', '结束时间': 'End Time', '工作时长': 'Hours', '核算薪资': 'Est. Wage',
+    '内购单号': 'Staff Purchase ID', '购买数量': 'Purchase Qty', '内购单价': 'Staff Price',
+    '扣款金额': 'Deduction Amount', '成本合计': 'Cost Total', '记录人': 'Recorded By', '是否扣库存': 'Deduct Stock'
 }
 
 val_map_cn_to_en = {
@@ -192,6 +194,7 @@ def append_rows_data(sheet_name, rows, columns):
 STOCK_SHEET, SALES_SHEET, EMP_SHEET = "Stock", "Sales", "Employee"
 ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET = "Attendance", "B2B_Orders", "Feedback"
 RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET = "Restock_Log", "Traffic_Log", "Campaigns"
+STAFF_PURCHASE_SHEET = "Staff_Purchases"
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
@@ -202,8 +205,9 @@ FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型',
 RESTOCK_COLS = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '单件成本', '备注']
 TRAFFIC_COLS = ['日期', '有效客流']
 CAMP_COLS = ['档期名称', '开始日期', '结束日期']
+STAFF_PURCHASE_COLS = ['内购单号', '日期', '员工姓名', '商品名称', '颜色', '购买数量', '内购单价', '扣款金额', '成本合计', '记录人', '是否扣库存', '备注']
 
-all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET]
+all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET]
 
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {s: 0 for s in all_sheets}
@@ -324,6 +328,7 @@ def JIT_fetch(sheets_to_fetch):
     if FEEDBACK_SHEET in sheets_to_fetch: res[FEEDBACK_SHEET] = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
     if EMP_SHEET in sheets_to_fetch: res[EMP_SHEET] = load_safe_emp()
     if ATT_SHEET in sheets_to_fetch: res[ATT_SHEET] = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
+    if STAFF_PURCHASE_SHEET in sheets_to_fetch: res[STAFF_PURCHASE_SHEET] = clean_date_col(load_data(STAFF_PURCHASE_SHEET, STAFF_PURCHASE_COLS), '日期')
     if TRAFFIC_SHEET in sheets_to_fetch: res[TRAFFIC_SHEET] = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
     return res
 
@@ -336,6 +341,7 @@ df_stock = pd.DataFrame(columns=STOCK_COLS)
 df_sales = pd.DataFrame(columns=SALES_COLS)
 df_employee = load_safe_emp()
 df_attendance = pd.DataFrame(columns=ATT_COLS)
+df_staff_purchase = pd.DataFrame(columns=STAFF_PURCHASE_COLS)
 df_b2b = pd.DataFrame(columns=B2B_COLS)
 df_feedback = pd.DataFrame(columns=FEEDBACK_COLS)
 df_restock = pd.DataFrame(columns=RESTOCK_COLS)
@@ -345,6 +351,7 @@ if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key =
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
 if "emp_reset_key" not in st.session_state: st.session_state.emp_reset_key = 0
 if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0 
+if "staff_purchase_reset_key" not in st.session_state: st.session_state.staff_purchase_reset_key = 0
 if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 
 if "fb_reset_key" not in st.session_state: st.session_state.fb_reset_key = 0 
 
@@ -352,6 +359,7 @@ def clear_stock(): st.session_state.stock_reset_key += 1
 def clear_sales(): st.session_state.sales_reset_key += 1
 def clear_emp(): st.session_state.emp_reset_key += 1
 def clear_att(): st.session_state.att_reset_key += 1
+def clear_staff_purchase(): st.session_state.staff_purchase_reset_key += 1
 def clear_b2b(): st.session_state.b2b_reset_key += 1
 def clear_fb(): st.session_state.fb_reset_key += 1
 
@@ -558,6 +566,7 @@ if role_now == "admin":
     df_sales = load_safe_sales()
     df_employee = load_safe_emp()
     df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
+    df_staff_purchase = clean_date_col(load_data(STAFF_PURCHASE_SHEET, STAFF_PURCHASE_COLS), '日期')
     df_b2b = clean_date_col(clean_date_col(load_data(B2B_SHEET, B2B_COLS), '创建日期'), '约定交期')
     df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
     df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期')
@@ -1646,6 +1655,178 @@ if is_admin:
                 c_t1.markdown(f"**🧾 列表总计** (共 {len(f_att)} 条记录)")
                 c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
                 c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
+
+            st.divider()
+            st.subheader("🛍️ 员工内购扣款")
+            st.caption("用于记录员工拿货/内购金额。发工资时可直接从薪资中扣除；如勾选扣库存，系统会同步从库存中出库。")
+
+            active_staff_for_purchase = df_employee[df_employee['状态'].fillna('').astype(str).str.strip() != '离职']['员工姓名'].astype(str).tolist() if not df_employee.empty else []
+            stock_purchase_options = []
+            if not df_stock.empty:
+                sp_stock_opts = df_stock.copy()
+                sp_stock_opts['disp_name'] = translate_series(sp_stock_opts['商品名称']).fillna('').astype(str)
+                sp_stock_opts['disp_color'] = translate_series(sp_stock_opts['颜色']).fillna('').astype(str)
+                sp_stock_opts['label'] = sp_stock_opts['disp_name'] + " (" + sp_stock_opts['disp_color'] + ")"
+                stock_purchase_options = sp_stock_opts['label'].tolist()
+
+            with st.expander("➕ 记录一笔员工内购", expanded=True):
+                if not active_staff_for_purchase:
+                    st.warning("⚠️ 暂无在职员工，无法记录内购。")
+                elif not stock_purchase_options:
+                    st.warning("⚠️ 暂无库存商品，无法记录内购。")
+                else:
+                    with st.form("add_staff_purchase_form"):
+                        sp_c1, sp_c2 = st.columns(2)
+                        sp_staff = sp_c1.selectbox("内购员工", active_staff_for_purchase)
+                        sp_date = sp_c2.date_input("内购日期", value=datetime.now().date())
+
+                        sp_sku = st.selectbox("内购商品", stock_purchase_options)
+                        sel_disp_name, sel_disp_color = split_sku_label(sp_sku)
+                        sp_real_name = t_val(sel_disp_name, 'cn')
+                        sp_real_color = t_val(sel_disp_color, 'cn')
+                        sp_row = df_stock[(df_stock['商品名称'].astype(str).str.strip() == str(sp_real_name).strip()) & (df_stock['颜色'].astype(str).str.strip() == str(sp_real_color).strip())]
+                        sp_cost = to_float(sp_row.iloc[0]['进价成本']) if not sp_row.empty else 0.0
+                        sp_retail = to_float(sp_row.iloc[0]['售卖价格']) if not sp_row.empty else 0.0
+                        sp_available = 0
+                        if not sp_row.empty:
+                            sp_available = sum(to_int(sp_row.iloc[0][col]) for col in ['展示数量', '货柜数量', '储物间数量'])
+                        st.info(f"当前总库存：{sp_available} 件｜进价成本：${sp_cost:.2f}｜原售价：${sp_retail:.2f}")
+
+                        sp_c3, sp_c4, sp_c5 = st.columns(3)
+                        sp_qty = sp_c3.number_input("内购数量", min_value=1, step=1, value=1)
+                        sp_unit_price = sp_c4.number_input("内购单价 / 工资扣款单价 ($)", min_value=0.0, value=float(sp_retail), format="%.2f", key=f"staff_purchase_unit_{sp_sku}_{st.session_state.staff_purchase_reset_key}")
+                        sp_deduct_stock = sp_c5.checkbox("同步扣库存", value=True)
+                        sp_note = st.text_input("备注", placeholder="例如：员工福利价/工资扣款/样品自用...")
+                        sp_total = round(float(sp_qty) * float(sp_unit_price), 2)
+                        sp_cost_total = round(float(sp_qty) * float(sp_cost), 2)
+                        st.markdown(f"**本笔工资扣款金额：`${sp_total:.2f}`**")
+
+                        if st.form_submit_button("💾 保存员工内购记录", type="primary", use_container_width=True):
+                            fresh = JIT_fetch([STAFF_PURCHASE_SHEET, STOCK_SHEET])
+                            latest_sp = fresh[STAFF_PURCHASE_SHEET]
+                            latest_stock = fresh[STOCK_SHEET]
+
+                            stock_match = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(sp_real_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(sp_real_color).strip())].index
+                            if sp_deduct_stock and stock_match.empty:
+                                st.error("⚠️ 找不到对应库存商品，无法扣库存。")
+                            else:
+                                if sp_deduct_stock:
+                                    idx_sp = stock_match[0]
+                                    latest_total_stock = recalc_total_stock(latest_stock, idx_sp)
+                                    if latest_total_stock < int(sp_qty):
+                                        st.error(f"⚠️ 总库存不足：当前只有 {latest_total_stock} 件，无法内购 {int(sp_qty)} 件。")
+                                        st.stop()
+                                    deduct_pos_stock_from_locations(latest_stock, idx_sp, int(sp_qty))
+                                    latest_stock.at[idx_sp, '已售出数量'] = to_int(latest_stock.at[idx_sp, '已售出数量']) + int(sp_qty)
+                                    latest_stock.at[idx_sp, '总库存'] = recalc_total_stock(latest_stock, idx_sp)
+
+                                sp_id = "EMPBUY-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[-22:]
+                                new_sp = pd.DataFrame([[
+                                    sp_id, sp_date.strftime("%Y/%m/%d"), sp_staff, sp_real_name, sp_real_color,
+                                    int(sp_qty), round(float(sp_unit_price), 2), sp_total, sp_cost_total,
+                                    st.session_state.get("current_user", "店长"), "是" if sp_deduct_stock else "否", sp_note
+                                ]], columns=STAFF_PURCHASE_COLS)
+
+                                latest_sp = pd.concat([new_sp, latest_sp], ignore_index=True)
+                                save_data(latest_sp, STAFF_PURCHASE_SHEET)
+                                if sp_deduct_stock:
+                                    save_data(latest_stock, STOCK_SHEET)
+                                st.session_state.staff_purchase_reset_key += 1
+                                st.success(f"✅ 已记录 {sp_staff} 的内购扣款：${sp_total:.2f}")
+                                st.rerun()
+
+            sp_view = filter_by_date_range(df_staff_purchase, '日期', att_start, att_end)
+            sp_view = get_f(sp_view, q)
+            if not sp_view.empty:
+                sp_view = sp_view.copy()
+                for c in ['购买数量', '内购单价', '扣款金额', '成本合计']:
+                    sp_view[c] = pd.to_numeric(sp_view[c], errors='coerce').fillna(0.0)
+
+                sp_total_deduction = sp_view['扣款金额'].sum()
+                sp_total_qty = sp_view['购买数量'].sum()
+                sp_m1, sp_m2 = st.columns(2)
+                sp_m1.metric("当前区间内购件数", f"{int(sp_total_qty)} 件")
+                sp_m2.metric("当前区间工资扣款总额", f"${sp_total_deduction:.2f}")
+
+                st.markdown("### 📋 员工内购明细")
+                sp_display = sp_view.copy()
+                sp_display.insert(0, "选择", False)
+                sp_display['商品名称'] = translate_series(sp_display['商品名称'])
+                sp_display['颜色'] = translate_series(sp_display['颜色'])
+                styled_sp = sp_display.style.format({'内购单价': '${:.2f}', '扣款金额': '${:.2f}', '成本合计': '${:.2f}'})
+                edited_sp = st.data_editor(
+                    styled_sp,
+                    column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
+                    disabled=[c for c in sp_display.columns if c != "选择"],
+                    use_container_width=True,
+                    hide_index=True,
+                    key=f"staff_purchase_editor_{st.session_state.staff_purchase_reset_key}"
+                )
+                selected_sp = edited_sp[edited_sp["选择"] == True]
+                if len(selected_sp) > 1:
+                    st.warning("⚠️ 为避免误删，员工内购记录一次只能撤销 1 条。请只勾选 1 条。")
+                elif len(selected_sp) == 1:
+                    row_sp = selected_sp.iloc[0]
+                    st.warning(f"即将撤销 1 条内购记录：{row_sp['员工姓名']} / {row_sp['商品名称']} ({row_sp['颜色']}) / 数量 {row_sp['购买数量']} / 扣款 ${to_float(row_sp['扣款金额']):.2f}")
+                    del_c1, del_c2, _ = st.columns([1.8, 1.5, 4])
+                    with del_c1:
+                        if st.button("🗑️ 确认撤销这 1 条内购", type="primary", key="delete_one_staff_purchase"):
+                            fresh = JIT_fetch([STAFF_PURCHASE_SHEET, STOCK_SHEET])
+                            latest_sp = fresh[STAFF_PURCHASE_SHEET]
+                            latest_stock = fresh[STOCK_SHEET]
+                            del_id = str(row_sp['内购单号']).strip()
+                            matched_old = latest_sp[latest_sp['内购单号'].astype(str).str.strip() == del_id]
+                            if matched_old.empty:
+                                st.error("⚠️ 云端找不到这条内购记录，可能已经被删除。")
+                                st.stop()
+                            old = matched_old.iloc[0]
+                            if str(old.get('是否扣库存', '')).strip() == '是':
+                                real_old_n = t_val(old['商品名称'], 'cn')
+                                real_old_c = t_val(old['颜色'], 'cn')
+                                old_qty = to_int(old['购买数量'])
+                                m_stock = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_old_n).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_old_c).strip())].index
+                                if not m_stock.empty:
+                                    idx_old = m_stock[0]
+                                    latest_stock.at[idx_old, '货柜数量'] = to_int(latest_stock.at[idx_old, '货柜数量']) + old_qty
+                                    latest_stock.at[idx_old, '已售出数量'] = max(0, to_int(latest_stock.at[idx_old, '已售出数量']) - old_qty)
+                                    latest_stock.at[idx_old, '总库存'] = recalc_total_stock(latest_stock, idx_old)
+                                    save_data(latest_stock, STOCK_SHEET)
+                            latest_sp = latest_sp[latest_sp['内购单号'].astype(str).str.strip() != del_id]
+                            save_data(latest_sp, STAFF_PURCHASE_SHEET)
+                            st.session_state.staff_purchase_reset_key += 1
+                            st.success("✅ 已撤销这 1 条员工内购记录。")
+                            st.rerun()
+                    with del_c2:
+                        st.button("🔄 取消选中", key="cancel_staff_purchase_selection", on_click=clear_staff_purchase)
+            else:
+                st.info("该考勤日期区间内暂无员工内购扣款记录。")
+
+            st.markdown("### 💳 发工资扣款汇总")
+            payroll_wage = pd.DataFrame(columns=['员工姓名', '工作时长', '核算薪资'])
+            if not f_att.empty:
+                tmp_att_pay = f_att.copy()
+                tmp_att_pay['工作时长'] = pd.to_numeric(tmp_att_pay['工作时长'], errors='coerce').fillna(0.0)
+                tmp_att_pay['核算薪资'] = pd.to_numeric(tmp_att_pay['核算薪资'], errors='coerce').fillna(0.0)
+                payroll_wage = tmp_att_pay.groupby('员工姓名', as_index=False).agg({'工作时长': 'sum', '核算薪资': 'sum'})
+
+            payroll_deduct = pd.DataFrame(columns=['员工姓名', '内购扣款'])
+            if not sp_view.empty:
+                tmp_sp_pay = sp_view.copy()
+                tmp_sp_pay['扣款金额'] = pd.to_numeric(tmp_sp_pay['扣款金额'], errors='coerce').fillna(0.0)
+                payroll_deduct = tmp_sp_pay.groupby('员工姓名', as_index=False).agg({'扣款金额': 'sum'}).rename(columns={'扣款金额': '内购扣款'})
+
+            payroll_summary = pd.merge(payroll_wage, payroll_deduct, on='员工姓名', how='outer').fillna(0.0)
+            if not payroll_summary.empty:
+                payroll_summary['应发工资'] = payroll_summary['核算薪资']
+                payroll_summary['实发参考'] = payroll_summary['应发工资'] - payroll_summary['内购扣款']
+                payroll_summary = payroll_summary[['员工姓名', '工作时长', '应发工资', '内购扣款', '实发参考']].sort_values('员工姓名')
+                st.dataframe(
+                    payroll_summary.style.format({'工作时长': '{:.2f}', '应发工资': '${:.2f}', '内购扣款': '${:.2f}', '实发参考': '${:.2f}'}),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("当前区间暂无工资或内购扣款数据。")
 
     with t5:
         st.subheader(f"💎 真实净利润核算 (9% GST 剥离版)")
