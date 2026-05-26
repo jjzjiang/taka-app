@@ -172,8 +172,10 @@ def append_rows_data(sheet_name, rows, columns):
     for attempt in range(3):
         try:
             worksheet.append_rows(safe_rows, value_input_option="USER_ENTERED")
-            # 只让被保存的这张表失效，不清空所有表缓存，避免一次保存后全系统重新读取 8 张表触发 429。
+            # 写入成功后必须清掉全局 cache。否则刷新页面后新 session 的 sheet_versions 会回到 0，
+            # 可能命中旧的 load_raw_data(sheet_name, 0) 缓存，导致新销售/SKU/补货看起来消失。
             st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
+            invalidate_data_cache(sheet_name)
             return
         except APIError as e:
             last_error = e
@@ -211,6 +213,23 @@ all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBAC
 
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {s: 0 for s in all_sheets}
+
+
+def invalidate_data_cache(sheet_name=None):
+    """
+    清掉 Streamlit 的全局数据缓存。
+    原因：st.cache_data 是跨 session 共享的；如果用户刷新页面后 sheet_versions 归零，
+    可能重新读到旧的 version=0 缓存，造成新增销售/SKU/补货看起来"消失"。
+    每次写入成功后清缓存，确保刷新/重新登录也能看到 Google Sheet 最新数据。
+    """
+    try:
+        load_raw_data.clear()
+    except Exception:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
 
 @st.cache_resource(show_spinner=False)
 def get_worksheet_cached(sheet_name):
@@ -285,8 +304,10 @@ def save_data(df, sheet_name):
         if worksheet.row_count >= next_row:
             worksheet.batch_clear([f"A{next_row}:ZZ{worksheet.row_count}"])
 
-        # 只让被保存的这张表失效，不清空所有表缓存，避免一次保存后全系统重新读取 8 张表触发 429。
+        # 写入成功后必须清掉全局 cache。否则刷新页面后新 session 的 sheet_versions 会回到 0，
+        # 可能命中旧的 load_raw_data(sheet_name, 0) 缓存，导致新销售/SKU/补货看起来消失。
         st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
+        invalidate_data_cache(sheet_name)
     except Exception as e:
         st.error(f"🔴 保存 {sheet_name} 失败，数据没有被清空。请检查网络/Google Sheet权限后重试。Error: {e}")
         st.stop()
