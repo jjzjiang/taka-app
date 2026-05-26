@@ -106,11 +106,12 @@ def split_sku_label(label):
     name, color = label.rsplit(" (", 1)
     return name.strip(), color.replace(")", "").strip()
 
-DEFAULT_REPORT_START = datetime(2026, 3, 26).date()
-
+# 日期区间默认值：从今天到今天。
+# 之前这里固定为 2026/03/26，导致每次打开毛利/考勤/净利润等区间都要从 3 月手动调到当天。
 def date_range_picker(label_cn, label_en, key, default_start=None, default_end=None):
-    start_default = default_start or DEFAULT_REPORT_START
-    end_default = default_end or datetime.now().date()
+    today = datetime.now().date()
+    start_default = default_start if default_start is not None else today
+    end_default = default_end if default_end is not None else today
     selected = st.date_input(
         t(label_cn, label_en),
         value=(start_default, end_default),
@@ -640,7 +641,7 @@ else:
 def render_inventory_snapshot(role_prefix):
     st.subheader(t(f"📊 实时库存与期间动销快照", f"📊 Real-time Inventory & Sales Snapshot"))
     
-    t1_start, t1_end = date_range_picker("📅 期间售出日期区间", "📅 Period Sales Date Range", key=f"inventory_range_{role_prefix}")
+    t1_start, t1_end = date_range_picker("📅 期间售出日期区间", "📅 Period Sales Date Range", key=f"inventory_range_today_{role_prefix}")
     st.info(f"📅 此看板的【期间售出】按上方日期区间计算：**{t1_start}** 至 **{t1_end}**")
         
     f_stock = get_f(df_stock, q)
@@ -1420,7 +1421,7 @@ if is_admin:
     with t3:
         st.subheader("📊 财务与客流报表")
         
-        t3_start, t3_end = date_range_picker("📅 毛利/客流日期区间", "📅 Margin / Traffic Date Range", key="admin_margin_range")
+        t3_start, t3_end = date_range_picker("📅 毛利/客流日期区间", "📅 Margin / Traffic Date Range", key="admin_margin_range_today")
         st.info(f"📅 此看板的财务数据按上方日期区间计算：**{t3_start}** 至 **{t3_end}**")
 
         if not df_sales.empty:
@@ -1637,7 +1638,7 @@ if is_admin:
                         st.rerun()
 
             st.markdown("### 🕒 考勤记录查询")
-            att_start, att_end = date_range_picker("📅 考勤记录日期区间", "📅 Attendance Date Range", key="admin_attendance_range")
+            att_start, att_end = date_range_picker("📅 考勤记录日期区间", "📅 Attendance Date Range", key="admin_attendance_range_today")
             f_att = filter_by_date_range(df_attendance, '日期', att_start, att_end)
             f_att = get_f(f_att, q)
             if not f_att.empty:
@@ -1852,7 +1853,7 @@ if is_admin:
     with t5:
         st.subheader(f"💎 真实净利润核算 (9% GST 剥离版)")
         
-        t5_start, t5_end = date_range_picker("📅 净利润核算日期区间", "📅 Net Profit Date Range", key="admin_net_profit_range")
+        t5_start, t5_end = date_range_picker("📅 净利润核算日期区间", "📅 Net Profit Date Range", key="admin_net_profit_range_today")
         st.info(f"📅 此看板的净利数据按上方日期区间计算：**{t5_start}** 至 **{t5_end}**")
 
         if not df_sales.empty:
@@ -2320,7 +2321,7 @@ elif is_supplier:
             df_s['日期_dt'] = pd.to_datetime(df_s['日期'], errors='coerce')
             df_s = df_s.dropna(subset=['日期_dt'])
             if not df_s.empty:
-                s_start, s_end = date_range_picker("📅 选择查询日期区间", "📅 Select Date Range", key="sup_sales_date")
+                s_start, s_end = date_range_picker("📅 选择查询日期区间", "📅 Select Date Range", key="sup_sales_date_today")
                     
                 f_s = df_s[(df_s['日期_dt'].dt.date >= s_start) & (df_s['日期_dt'].dt.date <= s_end)]
                 f_s = get_f(f_s, q)
@@ -2345,7 +2346,7 @@ elif is_supplier:
     
     with t3:
         st.subheader(t("📦 进货与入库对账单 (ERP 底单)", "📦 Inbound Records"))
-        r_s, r_e = date_range_picker("📅 入库对账日期区间", "📅 Inbound Record Date Range", key="supplier_restock_range")
+        r_s, r_e = date_range_picker("📅 入库对账日期区间", "📅 Inbound Record Date Range", key="supplier_restock_range_today")
         st.info(f"📅 此对账单按上方日期区间计算：**{r_s}** 至 **{r_e}**")
         
         if not df_restock.empty:
@@ -2381,7 +2382,7 @@ elif is_supplier:
 
     with t4:
         st.subheader(t("🤝 B2B 订单对账单", "🤝 B2B Orders"))
-        b_s, b_e = date_range_picker("📅 B2B 订单日期区间", "📅 B2B Order Date Range", key="supplier_b2b_range")
+        b_s, b_e = date_range_picker("📅 B2B 订单日期区间", "📅 B2B Order Date Range", key="supplier_b2b_range_today")
         st.info(f"📅 此对账单按上方日期区间计算：**{b_s}** 至 **{b_e}**")
         
         if not df_b2b.empty:
