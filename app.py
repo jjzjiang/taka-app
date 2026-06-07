@@ -1434,10 +1434,24 @@ if is_admin:
                 f_sales_range['销售数量'] = pd.to_numeric(f_sales_range['销售数量'], errors='coerce').fillna(0)
                 f_sales_range['总营业额'] = pd.to_numeric(f_sales_range['总营业额'], errors='coerce').fillna(0.0)
                 
+                # Tab 3 only: normalize and deduplicate the SKU cost lookup before merging.
+                # Otherwise duplicate Stock rows can duplicate a sales row during merge and distort margin.
                 df_stock_calc = df_stock[['商品名称', '颜色', '进价成本']].copy()
+                df_stock_calc['_sku_name'] = df_stock_calc['商品名称'].fillna('').astype(str).str.strip()
+                df_stock_calc['_sku_color'] = df_stock_calc['颜色'].fillna('').astype(str).str.strip()
                 df_stock_calc['进价成本'] = pd.to_numeric(df_stock_calc['进价成本'], errors='coerce').fillna(0.0)
-                f_sales_range = f_sales_range.merge(df_stock_calc, on=['商品名称', '颜色'], how='left')
+                df_stock_calc = df_stock_calc.drop_duplicates(subset=['_sku_name', '_sku_color'], keep='last')
+
+                f_sales_range['_sku_name'] = f_sales_range['商品名称'].fillna('').astype(str).str.strip()
+                f_sales_range['_sku_color'] = f_sales_range['颜色'].fillna('').astype(str).str.strip()
+                f_sales_range = f_sales_range.merge(
+                    df_stock_calc[['_sku_name', '_sku_color', '进价成本']],
+                    on=['_sku_name', '_sku_color'],
+                    how='left'
+                )
+                f_sales_range['进价成本'] = pd.to_numeric(f_sales_range['进价成本'], errors='coerce').fillna(0.0)
                 f_sales_range['具体毛利'] = f_sales_range['总营业额'] - (f_sales_range['销售数量'] * f_sales_range['进价成本'])
+                f_sales_range.drop(columns=['_sku_name', '_sku_color'], inplace=True, errors='ignore')
                 
                 f_sales_range = get_f(f_sales_range, q)
                 
