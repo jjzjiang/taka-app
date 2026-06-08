@@ -229,6 +229,82 @@ def compare_periods(stock_df, sales_df, restock_df, period_a, period_b):
     merged["分类变化"] = merged.apply(lambda r: r["B_系统分类"] if r["A_系统分类"] == r["B_系统分类"] else f"{r['A_系统分类']} → {r['B_系统分类']}", axis=1)
     return merged.sort_values(["售出变化", "销售额变化"], ascending=[False, False]).reset_index(drop=True)
 
+def compute_period_financials(stock_df, sales_df, attendance_df, start_date, end_date):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    sales = _bi_norm_sales(sales_df)
+    stock = _bi_norm_stock(stock_df)
+    attendance = attendance_df.copy()
+    period_sales = sales[(sales["日期_dt"] >= start_date) & (sales["日期_dt"] <= end_date)].copy()
+    if not period_sales.empty:
+        period_sales = period_sales.merge(stock[BI_SKU_KEYS + ["进价成本"]], on=BI_SKU_KEYS, how="left")
+        period_sales["进价成本"] = _bi_num(period_sales["进价成本"])
+        period_sales["总进价成本"] = period_sales["销售数量"] * period_sales["进价成本"]
+    else:
+        period_sales["总进价成本"] = pd.Series(dtype="float64")
+    if attendance.empty:
+        wage_total = 0.0
+    else:
+        if "日期" not in attendance.columns:
+            attendance["日期"] = ""
+        attendance["日期_dt"] = _bi_dates(attendance, "日期")
+        if "核算薪资" not in attendance.columns:
+            attendance["核算薪资"] = 0
+        attendance["核算薪资"] = _bi_num(attendance["核算薪资"])
+        period_att = attendance[(attendance["日期_dt"] >= start_date) & (attendance["日期_dt"] <= end_date)]
+        wage_total = float(period_att["核算薪资"].sum()) if not period_att.empty else 0.0
+    gross = float(period_sales["总营业额"].sum()) if not period_sales.empty else 0.0
+    cogs = float(period_sales["总进价成本"].sum()) if not period_sales.empty else 0.0
+    net_revenue = gross / 1.09 if gross else 0.0
+    gst = gross - net_revenue
+    commission = net_revenue * 0.36
+    settlement = net_revenue - commission
+    gross_profit = settlement - cogs
+    net_profit = gross_profit - wage_total
+    net_margin = (net_profit / gross * 100) if gross > 0 else 0.0
+    return {
+        "总营业额": round(gross, 2),
+        "免税净营业额": round(net_revenue, 2),
+        "代扣GST(9%)": round(gst, 2),
+        "商场抽成(36%)": round(commission, 2),
+        "商场实际回款": round(settlement, 2),
+        "总进价成本": round(cogs, 2),
+        "人工成本": round(wage_total, 2),
+        "毛利润": round(gross_profit, 2),
+        "真实净利润": round(net_profit, 2),
+        "含税净利率%": round(net_margin, 2),
+    }
+
+def _period_change_rate(after, before):
+    after = float(after)
+    before = float(before)
+    if before == 0:
+        return 0.0 if after == 0 else 100.0
+    return (after - before) / abs(before) * 100
+
+def compare_financial_periods(stock_df, sales_df, attendance_df, period_a, period_b):
+    name_a, start_a, end_a = period_a
+    name_b, start_b, end_b = period_b
+    summary_a = compute_period_financials(stock_df, sales_df, attendance_df, start_a, end_a)
+    summary_b = compute_period_financials(stock_df, sales_df, attendance_df, start_b, end_b)
+    metric_order = ["总营业额", "免税净营业额", "代扣GST(9%)", "商场抽成(36%)", "商场实际回款", "总进价成本", "人工成本", "毛利润", "真实净利润", "含税净利率%"]
+    rows = []
+    for metric in metric_order:
+        a_val = summary_a.get(metric, 0.0)
+        b_val = summary_b.get(metric, 0.0)
+        rows.append({
+            "指标": metric,
+            "档期A": name_a,
+            "A值": a_val,
+            "档期B": name_b,
+            "B值": b_val,
+            "变化": round(b_val - a_val, 2),
+            "变化率%": round(_period_change_rate(b_val, a_val), 2),
+        })
+    return pd.DataFrame(rows)
+
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 
@@ -985,7 +1061,7 @@ def render_campaign_bi_center():
                 with dc2:
                     st.button("🔄 取消选中", key="cancel_campaign_selection", on_click=clear_campaign)
 
-    mode_tab1, mode_tab2 = st.tabs(["📊 单档期复盘", "⚖️ 双档期对比"])
+    mode_tab1, mode_tab2, mode_tab3 = st.tabs(["📊 单档期复盘", "⚖️ 双档期对比", "💎 档期财务对比"])
 
     with mode_tab1:
         period_name, start_date, end_date = _pick_period("选择单档期分析方式", "single_bi")
@@ -1067,6 +1143,73 @@ def render_campaign_bi_center():
                 st.info("两个档期没有可比较的 SKU 数据。")
         else:
             st.info("请先至少保存 2 个档期，再使用双档期对比。")
+
+    with mode_tab3:
+        campaigns = _campaign_options()
+        if len(campaigns) >= 2:
+            st.info("财务口径沿用「净利润」tab：含税营业额剥离 9% GST，商场 36% 抽成按免税净额计算，再扣商品成本和打卡人工成本。")
+            c1, c2 = st.columns(2)
+            labels = list(campaigns.keys())
+            label_a = c1.selectbox("财务档期 A", labels, index=0, key="finance_period_a")
+            label_b = c2.selectbox("财务档期 B", labels, index=1 if len(labels) > 1 else 0, key="finance_period_b")
+            period_a = campaigns[label_a]
+            period_b = campaigns[label_b]
+            summary_a = compute_period_financials(df_stock, df_sales, df_attendance, period_a[1], period_a[2])
+            summary_b = compute_period_financials(df_stock, df_sales, df_attendance, period_b[1], period_b[2])
+            finance_compare = compare_financial_periods(df_stock, df_sales, df_attendance, period_a, period_b)
+
+            def _fmt_money(v):
+                return f"${float(v):,.2f}"
+
+            def _fmt_delta(metric):
+                row = finance_compare[finance_compare["指标"] == metric]
+                if row.empty:
+                    return "0.0%"
+                change = float(row.iloc[0]["变化率%"])
+                sign = "+" if change > 0 else ""
+                return f"{sign}{change:.1f}% vs A"
+
+            st.markdown(f"### {period_a[0]} vs {period_b[0]}")
+            st.caption(f"档期 A：{period_a[1]} 至 {period_a[2]}｜档期 B：{period_b[1]} 至 {period_b[2]}")
+
+            top1, top2, top3, top4 = st.columns(4)
+            top1.metric("B 总营业额", _fmt_money(summary_b["总营业额"]), delta=_fmt_delta("总营业额"))
+            top2.metric("B 商场实际回款", _fmt_money(summary_b["商场实际回款"]), delta=_fmt_delta("商场实际回款"))
+            top3.metric("B 真实净利润", _fmt_money(summary_b["真实净利润"]), delta=_fmt_delta("真实净利润"))
+            top4.metric("B 含税净利率", f"{summary_b['含税净利率%']:.1f}%", delta=_fmt_delta("含税净利率%"))
+
+            st.divider()
+            compare_view = finance_compare.copy()
+            compare_view["A值显示"] = compare_view.apply(lambda r: f"{r['A值']:.1f}%" if r["指标"] == "含税净利率%" else f"${r['A值']:,.2f}", axis=1)
+            compare_view["B值显示"] = compare_view.apply(lambda r: f"{r['B值']:.1f}%" if r["指标"] == "含税净利率%" else f"${r['B值']:,.2f}", axis=1)
+            compare_view["变化显示"] = compare_view.apply(lambda r: f"{r['变化']:+.1f} pct" if r["指标"] == "含税净利率%" else f"${r['变化']:+,.2f}", axis=1)
+            compare_view["变化率显示"] = compare_view["变化率%"].apply(lambda x: f"{x:+.1f}%")
+            st.dataframe(
+                compare_view[["指标", "A值显示", "B值显示", "变化显示", "变化率显示"]].rename(columns={
+                    "A值显示": "档期A",
+                    "B值显示": "档期B",
+                    "变化显示": "B-A变化",
+                    "变化率显示": "B相对A变化率",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            chart_df = pd.DataFrame([
+                {"档期": "A", "总营业额": summary_a["总营业额"], "真实净利润": summary_a["真实净利润"], "商场实际回款": summary_a["商场实际回款"]},
+                {"档期": "B", "总营业额": summary_b["总营业额"], "真实净利润": summary_b["真实净利润"], "商场实际回款": summary_b["商场实际回款"]},
+            ]).set_index("档期")
+            st.bar_chart(chart_df, use_container_width=True)
+
+            st.download_button(
+                "⬇️ 导出档期财务对比 CSV",
+                data=convert_df_to_csv(finance_compare),
+                file_name=f"Takashimaya_Finance_Compare_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+                key="download_finance_compare",
+            )
+        else:
+            st.info("请先至少保存 2 个档期，再使用档期财务对比。")
 
 if is_admin and st.session_state.get("admin_page") == "campaign_bi":
     render_campaign_bi_center()
