@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import time as pytime
 import plotly.express as px
+from bi_engine import compare_periods, compute_period_sku_bi
 
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
@@ -352,6 +353,7 @@ def JIT_fetch(sheets_to_fetch):
     if ATT_SHEET in sheets_to_fetch: res[ATT_SHEET] = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
     if STAFF_PURCHASE_SHEET in sheets_to_fetch: res[STAFF_PURCHASE_SHEET] = clean_date_col(load_data(STAFF_PURCHASE_SHEET, STAFF_PURCHASE_COLS), '日期')
     if TRAFFIC_SHEET in sheets_to_fetch: res[TRAFFIC_SHEET] = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
+    if CAMP_SHEET in sheets_to_fetch: res[CAMP_SHEET] = clean_date_col(clean_date_col(load_data(CAMP_SHEET, CAMP_COLS), '开始日期'), '结束日期')
     return res
 
 @st.cache_data(show_spinner=False)
@@ -368,6 +370,7 @@ df_b2b = pd.DataFrame(columns=B2B_COLS)
 df_feedback = pd.DataFrame(columns=FEEDBACK_COLS)
 df_restock = pd.DataFrame(columns=RESTOCK_COLS)
 df_traffic = pd.DataFrame(columns=TRAFFIC_COLS)
+df_campaign = pd.DataFrame(columns=CAMP_COLS)
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -376,6 +379,8 @@ if "att_reset_key" not in st.session_state: st.session_state.att_reset_key = 0
 if "staff_purchase_reset_key" not in st.session_state: st.session_state.staff_purchase_reset_key = 0
 if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 
 if "fb_reset_key" not in st.session_state: st.session_state.fb_reset_key = 0 
+if "camp_reset_key" not in st.session_state: st.session_state.camp_reset_key = 0
+if "admin_page" not in st.session_state: st.session_state.admin_page = "main"
 
 def clear_stock(): st.session_state.stock_reset_key += 1
 def clear_sales(): st.session_state.sales_reset_key += 1
@@ -384,6 +389,7 @@ def clear_att(): st.session_state.att_reset_key += 1
 def clear_staff_purchase(): st.session_state.staff_purchase_reset_key += 1
 def clear_b2b(): st.session_state.b2b_reset_key += 1
 def clear_fb(): st.session_state.fb_reset_key += 1
+def clear_campaign(): st.session_state.camp_reset_key += 1
 
 manager_password = "taka888"
 
@@ -512,6 +518,14 @@ with st.sidebar:
                             save_data(latest_stock, STOCK_SHEET) 
                             st.success("✅ 云端建档成功！")
                             st.rerun()
+            st.divider()
+            if st.button("📅 档期中心 / Popup 对比", use_container_width=True):
+                st.session_state.admin_page = "campaign_bi"
+                st.rerun()
+            if st.session_state.get("admin_page") == "campaign_bi":
+                if st.button("↩️ 返回日常管理台", use_container_width=True):
+                    st.session_state.admin_page = "main"
+                    st.rerun()
     
     else:
         login_type = st.radio(t("请选择您的身份", "Select Role"), [t("🧑‍💼 门店店员 / 🏭 合作厂商", "🧑‍💼 Staff / 🏭 Supplier"), t("👑 店长/管理员", "👑 Admin")], horizontal=True)
@@ -593,6 +607,7 @@ if role_now == "admin":
     df_feedback = clean_date_col(load_data(FEEDBACK_SHEET, FEEDBACK_COLS), '反馈日期')
     df_restock = clean_date_col(load_data(RESTOCK_SHEET, RESTOCK_COLS), '记录日期')
     df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
+    df_campaign = clean_date_col(clean_date_col(load_data(CAMP_SHEET, CAMP_COLS), '开始日期'), '结束日期')
 elif role_now == "supplier":
     df_stock = load_data(STOCK_SHEET, STOCK_COLS)
     df_sales = load_safe_sales()
@@ -628,6 +643,215 @@ def get_f(df, q):
 is_admin = st.session_state.role == "admin"
 is_supplier = st.session_state.role == "supplier"
 is_employee = st.session_state.role == "employee"
+
+def _campaign_options():
+    if df_campaign.empty:
+        return {}
+    out = {}
+    for _, row in df_campaign.iterrows():
+        name = str(row.get('档期名称', '')).strip()
+        try:
+            start = pd.to_datetime(row.get('开始日期'), errors='coerce').date()
+            end = pd.to_datetime(row.get('结束日期'), errors='coerce').date()
+        except Exception:
+            continue
+        if name and pd.notna(start) and pd.notna(end):
+            if start > end:
+                start, end = end, start
+            out[f"{name} ({start} 至 {end})"] = (name, start, end)
+    return out
+
+def _render_bi_table(df, key_prefix):
+    if df.empty:
+        st.info("这个范围内没有可分析的 SKU 数据。")
+        return
+    view = get_f(df, q).copy()
+    if view.empty:
+        st.info("没有符合全局搜索条件的 SKU。")
+        return
+    view['售罄率%'] = (pd.to_numeric(view['售罄率'], errors='coerce').fillna(0) * 100).round(1)
+    view['毛利率%'] = (pd.to_numeric(view['毛利率'], errors='coerce').fillna(0) * 100).round(1)
+    show_cols = [
+        'SKU', '系统分类', '期初库存', '本期入库', '本期可售量', '本期POS售出',
+        '售罄率%', '日均销量', '当前库存', '库存年龄天数', '销售额',
+        '单件毛利', '毛利率%', '毛利贡献', '动销分', '利润分', '换货参考数量'
+    ]
+    st.dataframe(
+        view[show_cols].style.format({
+            '售罄率%': '{:.1f}%',
+            '毛利率%': '{:.1f}%',
+            '日均销量': '{:.2f}',
+            '销售额': '${:.2f}',
+            '单件毛利': '${:.2f}',
+            '毛利贡献': '${:.2f}',
+            '动销分': '{:.1f}',
+            '利润分': '{:.1f}',
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        "⬇️ 导出当前 BI 明细 CSV",
+        data=convert_df_to_csv(view),
+        file_name=f"Takashimaya_Popup_BI_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        key=f"download_bi_{key_prefix}",
+    )
+
+def _pick_period(label, key_prefix):
+    campaigns = _campaign_options()
+    mode = st.radio(
+        label,
+        ["选择已保存档期", "临时日期范围"],
+        horizontal=True,
+        key=f"{key_prefix}_mode",
+    )
+    if mode == "选择已保存档期" and campaigns:
+        selected = st.selectbox("选择档期", list(campaigns.keys()), key=f"{key_prefix}_campaign")
+        return campaigns[selected]
+    if mode == "选择已保存档期" and not campaigns:
+        st.warning("还没有保存档期，先用临时日期范围。")
+    start, end = date_range_picker("📅 临时分析日期区间", "📅 BI Date Range", key=f"{key_prefix}_range")
+    return ("临时日期范围", start, end)
+
+def render_campaign_bi_center():
+    st.title("📅 档期中心 / Popup 对比")
+    st.caption("用于复盘每次 popup 的 SKU 动销、利润贡献、库存风险和两档期变化。动销评分只计算正常 POS 零售订单，不包含 B2B、员工内购和换货。")
+
+    with st.expander("➕ 新增保存档期", expanded=df_campaign.empty):
+        with st.form("add_campaign_form"):
+            c1, c2, c3 = st.columns([2, 1, 1])
+            camp_name = c1.text_input("档期名称", placeholder="例如：2026 高岛屋第一期 Popup")
+            camp_start = c2.date_input("开始日期", value=datetime.now().date(), key="new_campaign_start")
+            camp_end = c3.date_input("结束日期", value=datetime.now().date(), key="new_campaign_end")
+            if st.form_submit_button("💾 保存档期", type="primary", use_container_width=True):
+                if not camp_name.strip():
+                    st.warning("档期名称不能为空。")
+                else:
+                    fresh_camp = JIT_fetch([CAMP_SHEET])[CAMP_SHEET]
+                    new_row = pd.DataFrame([[camp_name.strip(), camp_start.strftime("%Y/%m/%d"), camp_end.strftime("%Y/%m/%d")]], columns=CAMP_COLS)
+                    fresh_camp = pd.concat([fresh_camp, new_row], ignore_index=True)
+                    save_data(fresh_camp[CAMP_COLS], CAMP_SHEET)
+                    st.session_state.camp_reset_key += 1
+                    st.success("✅ 档期已保存。")
+                    st.rerun()
+
+    if not df_campaign.empty:
+        with st.expander("📋 已保存档期", expanded=False):
+            camp_view = df_campaign.copy()
+            camp_view.insert(0, "选择", False)
+            edited_camp = st.data_editor(
+                camp_view,
+                column_config={"选择": st.column_config.CheckboxColumn("选择", default=False)},
+                disabled=[c for c in camp_view.columns if c != "选择"],
+                use_container_width=True,
+                hide_index=True,
+                key=f"campaign_editor_{st.session_state.camp_reset_key}",
+            )
+            selected_camp = edited_camp[edited_camp["选择"] == True]
+            if not selected_camp.empty:
+                dc1, dc2, _ = st.columns([1.6, 1.4, 4])
+                with dc1:
+                    if st.button("🗑️ 删除选中档期", type="primary", key="delete_campaign"):
+                        fresh_camp = JIT_fetch([CAMP_SHEET])[CAMP_SHEET]
+                        for _, row in selected_camp.iterrows():
+                            fresh_camp = fresh_camp[~(
+                                (fresh_camp['档期名称'].astype(str).str.strip() == str(row['档期名称']).strip()) &
+                                (fresh_camp['开始日期'].astype(str).str.strip() == str(row['开始日期']).strip()) &
+                                (fresh_camp['结束日期'].astype(str).str.strip() == str(row['结束日期']).strip())
+                            )]
+                        save_data(fresh_camp[CAMP_COLS], CAMP_SHEET)
+                        st.session_state.camp_reset_key += 1
+                        st.rerun()
+                with dc2:
+                    st.button("🔄 取消选中", key="cancel_campaign_selection", on_click=clear_campaign)
+
+    mode_tab1, mode_tab2 = st.tabs(["📊 单档期复盘", "⚖️ 双档期对比"])
+
+    with mode_tab1:
+        period_name, start_date, end_date = _pick_period("选择单档期分析方式", "single_bi")
+        bi_df = compute_period_sku_bi(df_stock, df_sales, df_restock, start_date, end_date)
+        st.markdown(f"### {period_name}：{start_date} 至 {end_date}")
+        if not bi_df.empty:
+            total_sold = pd.to_numeric(bi_df['本期POS售出'], errors='coerce').fillna(0).sum()
+            total_revenue = pd.to_numeric(bi_df['销售额'], errors='coerce').fillna(0).sum()
+            total_profit = pd.to_numeric(bi_df['毛利贡献'], errors='coerce').fillna(0).sum()
+            avg_sell_through = pd.to_numeric(bi_df['售罄率'], errors='coerce').fillna(0).mean() * 100
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("本期 POS 售出", f"{int(total_sold)} 件")
+            m2.metric("本期销售额", f"${total_revenue:.2f}")
+            m3.metric("毛利贡献", f"${total_profit:.2f}")
+            m4.metric("SKU 平均售罄率", f"{avg_sell_through:.1f}%")
+
+            category_order = ["断货错失机会款", "动销爆品", "潜力测试款", "高毛利精品款", "压货风险款", "稳定常规款"]
+            category_counts = bi_df['系统分类'].value_counts().reindex(category_order).fillna(0).astype(int)
+            st.bar_chart(category_counts, use_container_width=True)
+
+            category_tabs = st.tabs(["全部"] + category_order)
+            with category_tabs[0]:
+                _render_bi_table(bi_df.sort_values(['动销分', '利润分'], ascending=False), "all")
+            for tab, cat in zip(category_tabs[1:], category_order):
+                with tab:
+                    cat_df = bi_df[bi_df['系统分类'] == cat].sort_values(['动销分', '利润分'], ascending=False)
+                    _render_bi_table(cat_df, cat)
+        else:
+            st.info("当前档期没有可分析数据。")
+
+    with mode_tab2:
+        campaigns = _campaign_options()
+        if len(campaigns) >= 2:
+            c1, c2 = st.columns(2)
+            labels = list(campaigns.keys())
+            label_a = c1.selectbox("档期 A", labels, index=0, key="compare_period_a")
+            label_b = c2.selectbox("档期 B", labels, index=1 if len(labels) > 1 else 0, key="compare_period_b")
+            period_a = campaigns[label_a]
+            period_b = campaigns[label_b]
+            compared = compare_periods(df_stock, df_sales, df_restock, period_a, period_b)
+            if not compared.empty:
+                compared = get_f(compared, q).copy()
+                compared['A_售罄率%'] = (pd.to_numeric(compared['A_售罄率'], errors='coerce').fillna(0) * 100).round(1)
+                compared['B_售罄率%'] = (pd.to_numeric(compared['B_售罄率'], errors='coerce').fillna(0) * 100).round(1)
+                compared['售罄率变化%'] = (pd.to_numeric(compared['售罄率变化'], errors='coerce').fillna(0) * 100).round(1)
+                show_cols = [
+                    'SKU', 'A_本期POS售出', 'B_本期POS售出', '售出变化',
+                    'A_售罄率%', 'B_售罄率%', '售罄率变化%',
+                    'A_销售额', 'B_销售额', '销售额变化',
+                    'A_毛利贡献', 'B_毛利贡献', '毛利贡献变化', '分类变化'
+                ]
+                c_top1, c_top2, c_top3 = st.columns(3)
+                c_top1.metric("售出变化合计", f"{int(pd.to_numeric(compared['售出变化'], errors='coerce').fillna(0).sum())} 件")
+                c_top2.metric("销售额变化合计", f"${pd.to_numeric(compared['销售额变化'], errors='coerce').fillna(0).sum():.2f}")
+                c_top3.metric("毛利变化合计", f"${pd.to_numeric(compared['毛利贡献变化'], errors='coerce').fillna(0).sum():.2f}")
+                st.dataframe(
+                    compared[show_cols].style.format({
+                        'A_售罄率%': '{:.1f}%',
+                        'B_售罄率%': '{:.1f}%',
+                        '售罄率变化%': '{:+.1f}%',
+                        'A_销售额': '${:.2f}',
+                        'B_销售额': '${:.2f}',
+                        '销售额变化': '${:+.2f}',
+                        'A_毛利贡献': '${:.2f}',
+                        'B_毛利贡献': '${:.2f}',
+                        '毛利贡献变化': '${:+.2f}',
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.download_button(
+                    "⬇️ 导出双档期对比 CSV",
+                    data=convert_df_to_csv(compared),
+                    file_name=f"Takashimaya_Popup_Compare_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    key="download_bi_compare",
+                )
+            else:
+                st.info("两个档期没有可比较的 SKU 数据。")
+        else:
+            st.info("请先至少保存 2 个档期，再使用双档期对比。")
+
+if is_admin and st.session_state.get("admin_page") == "campaign_bi":
+    render_campaign_bi_center()
+    st.stop()
 
 if is_admin:
     t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([t("📊 库存", "📊 Inventory"), t("💰 销售", "💰 Sales"), t("📈 毛利", "📈 Margin"), t("👥 考勤", "👥 Staff"), t("💎 净利润", "💎 Net Profit"), t("🤝 B2B订单", "🤝 B2B"), t("🗣️ 客户反馈", "🗣️ Feedback"), t("🧠 战略(BI)", "🧠 BI")])
@@ -2322,6 +2546,13 @@ if is_admin:
                 with fbc2: st.button("🔄 取消选中", key="btn_cancel_fb", on_click=clear_fb)
         else:
             st.info("💡 暂无客户反馈记录或没有找到符合条件的反馈。")
+
+    with t8:
+        st.subheader("🧠 战略 BI")
+        st.info("新的 BI 已移到左侧「📅 档期中心 / Popup 对比」。在那里可以管理档期、做单档期 SKU 复盘，并进行两个 popup 档期对比。")
+        if st.button("📅 打开档期中心 / Popup 对比", type="primary", use_container_width=True, key="open_campaign_bi_from_tab"):
+            st.session_state.admin_page = "campaign_bi"
+            st.rerun()
 
 # ================= 🚀 Tab 3/4: 厂商专属层 (Supplier) =================
 elif is_supplier:
