@@ -118,6 +118,8 @@ def _bi_classify(row):
         return "潜力测试款"
     if sold >= 4 and sell_through >= 0.6:
         return "动销爆品"
+    if age_days >= 45 and current_stock > 0 and sold == 0:
+        return "压货风险款"
     if age_days >= 45 and current_stock >= 5 and sell_through <= 0.4:
         return "压货风险款"
     if (margin_rate >= 0.65 or unit_margin >= 150) and sold > 0 and sell_through < 0.6:
