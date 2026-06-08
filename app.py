@@ -17,7 +17,7 @@ def _bi_empty_frame():
     return pd.DataFrame(columns=[
         "SKU", "商品名称", "颜色", "期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量",
         "售罄率", "日均销量", "当前库存", "库存年龄天数", "销售额", "单件毛利", "毛利率", "毛利贡献",
-        "动销分", "利润分", "系统分类"
+        "动销分", "利润分", "系统分类", "辅助标签"
     ])
 
 def _bi_num(value, default=0.0):
@@ -109,22 +109,44 @@ def _bi_classify(row):
     sold = _bi_max0(row["本期POS售出"])
     current_stock = _bi_max0(row["当前库存"])
     sell_through = _bi_max0(row["售罄率"])
+    daily_sales = _bi_max0(row["日均销量"])
+    age_days = _bi_max0(row["库存年龄天数"])
+
+    if age_days >= 30 and current_stock > 0 and sold == 0:
+        return "滞销款"
+    if age_days >= 45 and current_stock > 0 and sell_through <= 0.35:
+        return "滞销款"
+    if current_stock > 0 and available > 0 and sold <= 1 and sell_through <= 0.15:
+        return "滞销款"
+    if available <= 6 and sold > 0 and sell_through >= 0.7 and current_stock <= 1 and age_days <= 45:
+        return "潜力款"
+    if sold > 0 and (sell_through >= 0.75 or (sell_through >= 0.55 and daily_sales >= 0.08)):
+        return "畅销款"
+    if sold > 0:
+        return "常规款"
+    return "常规款"
+
+def _bi_tags(row):
+    available = _bi_max0(row["本期可售量"])
+    sold = _bi_max0(row["本期POS售出"])
+    current_stock = _bi_max0(row["当前库存"])
+    sell_through = _bi_max0(row["售罄率"])
     age_days = _bi_max0(row["库存年龄天数"])
     margin_rate = _bi_max0(row["毛利率"])
     unit_margin = _bi_max0(row["单件毛利"])
+    inbound = _bi_max0(row["本期入库"])
+    tags = []
+    if margin_rate >= 0.65 or unit_margin >= 150:
+        tags.append("高毛利")
     if sold > 0 and sell_through >= 0.75 and current_stock <= 1:
-        return "断货错失机会款"
-    if available <= 6 and sold > 0 and sell_through >= 0.6:
-        return "潜力测试款"
-    if sold >= 4 and sell_through >= 0.6:
-        return "动销爆品"
-    if age_days >= 45 and current_stock > 0 and sold == 0:
-        return "压货风险款"
-    if age_days >= 45 and current_stock >= 5 and sell_through <= 0.4:
-        return "压货风险款"
-    if (margin_rate >= 0.65 or unit_margin >= 150) and sold > 0 and sell_through < 0.6:
-        return "高毛利精品款"
-    return "稳定常规款"
+        tags.append("可能断货")
+    if available > 0 and available <= 6:
+        tags.append("小样本")
+    if age_days >= 60 and current_stock > 0:
+        tags.append("老库存")
+    if inbound > 0 and age_days <= 30:
+        tags.append("新入库")
+    return "、".join(tags) if tags else "-"
 
 def compute_period_sku_bi(stock_df, sales_df, restock_df, start_date, end_date):
     start_date = pd.to_datetime(start_date).date()
@@ -176,13 +198,14 @@ def compute_period_sku_bi(stock_df, sales_df, restock_df, start_date, end_date):
     result["动销分"] = [s[0] for s in scores]
     result["利润分"] = [s[1] for s in scores]
     result["系统分类"] = result.apply(_bi_classify, axis=1)
+    result["辅助标签"] = result.apply(_bi_tags, axis=1)
     result["SKU"] = result["商品名称"] + " (" + result["颜色"] + ")"
     for col in ["期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量", "当前库存", "库存年龄天数"]:
         result[col] = result[col].round(0).astype(int)
     return result[[
         "SKU", "商品名称", "颜色", "期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量",
         "售罄率", "日均销量", "当前库存", "库存年龄天数", "销售额", "单件毛利", "毛利率", "毛利贡献",
-        "动销分", "利润分", "系统分类"
+        "动销分", "利润分", "系统分类", "辅助标签"
     ]].sort_values(["系统分类", "动销分", "利润分"], ascending=[True, False, False]).reset_index(drop=True)
 
 def compare_periods(stock_df, sales_df, restock_df, period_a, period_b):
@@ -866,7 +889,7 @@ def _render_bi_table(df, key_prefix):
     view['售罄率%'] = (pd.to_numeric(view['售罄率'], errors='coerce').fillna(0) * 100).round(1)
     view['毛利率%'] = (pd.to_numeric(view['毛利率'], errors='coerce').fillna(0) * 100).round(1)
     show_cols = [
-        'SKU', '系统分类', '期初库存', '本期入库', '本期可售量', '本期POS售出',
+        'SKU', '系统分类', '辅助标签', '期初库存', '本期入库', '本期可售量', '本期POS售出',
         '售罄率%', '日均销量', '当前库存', '库存年龄天数', '销售额',
         '单件毛利', '毛利率%', '毛利贡献', '动销分', '利润分', '换货参考数量'
     ]
@@ -977,7 +1000,7 @@ def render_campaign_bi_center():
             m3.metric("毛利贡献", f"${total_profit:.2f}")
             m4.metric("SKU 平均售罄率", f"{avg_sell_through:.1f}%")
 
-            category_order = ["断货错失机会款", "动销爆品", "潜力测试款", "高毛利精品款", "压货风险款", "稳定常规款"]
+            category_order = ["潜力款", "畅销款", "常规款", "滞销款"]
             category_counts = bi_df['系统分类'].value_counts().reindex(category_order).fillna(0).astype(int)
             st.bar_chart(category_counts, use_container_width=True)
 
