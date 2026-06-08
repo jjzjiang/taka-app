@@ -134,8 +134,8 @@ def compute_period_sku_bi(stock_df, sales_df, restock_df, start_date, end_date):
     restock = _bi_norm_restock(restock_df)
     if stock.empty and sales.empty and restock.empty:
         return _bi_empty_frame()
-    normal_sales = sales[sales["订单号"].str.startswith("ORD-", na=False)].copy()
     exchange_sales = sales[sales["订单号"].str.startswith("EXC-", na=False)].copy()
+    normal_sales = sales[~sales["订单号"].str.startswith("EXC-", na=False)].copy()
     inbound = restock[restock["操作类型"].isin(BI_INBOUND_OPS)].copy()
     period_sales = normal_sales[(normal_sales["日期_dt"] >= start_date) & (normal_sales["日期_dt"] <= end_date)]
     period_exchange = exchange_sales[(exchange_sales["日期_dt"] >= start_date) & (exchange_sales["日期_dt"] <= end_date)]
