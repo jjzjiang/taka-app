@@ -8,7 +8,199 @@ import hmac
 import hashlib
 import time as pytime
 import plotly.express as px
-from bi_engine import compare_periods, compute_period_sku_bi
+
+# Popup BI is kept inside app.py so Streamlit Cloud can run even when only this file is deployed.
+BI_SKU_KEYS = ["商品名称", "颜色"]
+BI_INBOUND_OPS = {"入库", "初始建档", "Inbound", "Initial Setup"}
+
+def _bi_empty_frame():
+    return pd.DataFrame(columns=[
+        "SKU", "商品名称", "颜色", "期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量",
+        "售罄率", "日均销量", "当前库存", "库存年龄天数", "销售额", "单件毛利", "毛利率", "毛利贡献",
+        "动销分", "利润分", "系统分类"
+    ])
+
+def _bi_num(value, default=0.0):
+    converted = pd.to_numeric(value, errors="coerce")
+    if isinstance(converted, pd.Series):
+        return converted.fillna(default)
+    return default if pd.isna(converted) else converted
+
+def _bi_dates(df, col):
+    if df.empty or col not in df.columns:
+        return pd.Series(pd.NaT, index=df.index)
+    return pd.to_datetime(df[col], errors="coerce").dt.date
+
+def _bi_norm_stock(stock_df):
+    stock = stock_df.copy()
+    if stock.empty:
+        return pd.DataFrame(columns=BI_SKU_KEYS + ["当前库存", "进价成本", "售卖价格"])
+    for col in BI_SKU_KEYS:
+        if col not in stock.columns:
+            stock[col] = ""
+        stock[col] = stock[col].fillna("").astype(str).str.strip()
+    for col in ["展示数量", "货柜数量", "储物间数量", "总库存", "进价成本", "售卖价格"]:
+        if col not in stock.columns:
+            stock[col] = 0
+        stock[col] = _bi_num(stock[col])
+    location_total = stock[["展示数量", "货柜数量", "储物间数量"]].sum(axis=1)
+    stock["当前库存"] = location_total.where(location_total > 0, stock["总库存"])
+    return stock.drop_duplicates(subset=BI_SKU_KEYS, keep="last")[BI_SKU_KEYS + ["当前库存", "进价成本", "售卖价格"]]
+
+def _bi_norm_sales(sales_df):
+    sales = sales_df.copy()
+    if sales.empty:
+        return pd.DataFrame(columns=BI_SKU_KEYS + ["日期_dt", "订单号", "销售数量", "总营业额"])
+    for col in BI_SKU_KEYS + ["订单号"]:
+        if col not in sales.columns:
+            sales[col] = ""
+        sales[col] = sales[col].fillna("").astype(str).str.strip()
+    if "日期" not in sales.columns:
+        sales["日期"] = ""
+    sales["日期_dt"] = _bi_dates(sales, "日期")
+    for col in ["销售数量", "总营业额"]:
+        if col not in sales.columns:
+            sales[col] = 0
+        sales[col] = _bi_num(sales[col])
+    return sales
+
+def _bi_norm_restock(restock_df):
+    restock = restock_df.copy()
+    if restock.empty:
+        return pd.DataFrame(columns=BI_SKU_KEYS + ["记录日期_dt", "操作类型", "变动数量"])
+    for col in BI_SKU_KEYS + ["操作类型"]:
+        if col not in restock.columns:
+            restock[col] = ""
+        restock[col] = restock[col].fillna("").astype(str).str.strip()
+    if "记录日期" not in restock.columns:
+        restock["记录日期"] = ""
+    restock["记录日期_dt"] = _bi_dates(restock, "记录日期")
+    if "变动数量" not in restock.columns:
+        restock["变动数量"] = 0
+    restock["变动数量"] = _bi_num(restock["变动数量"])
+    return restock
+
+def _bi_sum(df, value_col, output_col):
+    if df.empty:
+        return pd.DataFrame(columns=BI_SKU_KEYS + [output_col])
+    out = df.groupby(BI_SKU_KEYS, as_index=False)[value_col].sum()
+    return out.rename(columns={value_col: output_col})
+
+def _bi_max0(value):
+    return max(float(value), 0.0)
+
+def _bi_score_row(row, max_daily_sales, max_profit):
+    available = _bi_max0(row["本期可售量"])
+    sell_through = _bi_max0(row["售罄率"])
+    daily_sales = _bi_max0(row["日均销量"])
+    age_days = _bi_max0(row["库存年龄天数"])
+    speed_score = (daily_sales / max_daily_sales * 30) if max_daily_sales > 0 else 0
+    sell_through_score = min(sell_through, 1.0) * 55
+    sample_bonus = 10 if 0 < available <= 6 and sell_through >= 0.6 else 0
+    age_penalty = min(age_days / 60 * 20, 20) if sell_through < 0.4 else 0
+    movement_score = max(0, min(100, sell_through_score + speed_score + sample_bonus - age_penalty))
+    margin_rate_score = min(_bi_max0(row["毛利率"]), 1.0) * 35
+    unit_margin_score = min(_bi_max0(row["单件毛利"]) / 120, 1.0) * 30
+    contribution_score = (_bi_max0(row["毛利贡献"]) / max_profit * 35) if max_profit > 0 else 0
+    return round(movement_score, 1), round(max(0, min(100, margin_rate_score + unit_margin_score + contribution_score)), 1)
+
+def _bi_classify(row):
+    available = _bi_max0(row["本期可售量"])
+    sold = _bi_max0(row["本期POS售出"])
+    current_stock = _bi_max0(row["当前库存"])
+    sell_through = _bi_max0(row["售罄率"])
+    age_days = _bi_max0(row["库存年龄天数"])
+    margin_rate = _bi_max0(row["毛利率"])
+    unit_margin = _bi_max0(row["单件毛利"])
+    if sold > 0 and sell_through >= 0.75 and current_stock <= 1:
+        return "断货错失机会款"
+    if available <= 6 and sold > 0 and sell_through >= 0.6:
+        return "潜力测试款"
+    if sold >= 4 and sell_through >= 0.6:
+        return "动销爆品"
+    if age_days >= 45 and current_stock >= 5 and sell_through <= 0.4:
+        return "压货风险款"
+    if (margin_rate >= 0.65 or unit_margin >= 150) and sold > 0 and sell_through < 0.6:
+        return "高毛利精品款"
+    return "稳定常规款"
+
+def compute_period_sku_bi(stock_df, sales_df, restock_df, start_date, end_date):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    stock = _bi_norm_stock(stock_df)
+    sales = _bi_norm_sales(sales_df)
+    restock = _bi_norm_restock(restock_df)
+    if stock.empty and sales.empty and restock.empty:
+        return _bi_empty_frame()
+    normal_sales = sales[sales["订单号"].str.startswith("ORD-", na=False)].copy()
+    exchange_sales = sales[sales["订单号"].str.startswith("EXC-", na=False)].copy()
+    inbound = restock[restock["操作类型"].isin(BI_INBOUND_OPS)].copy()
+    period_sales = normal_sales[(normal_sales["日期_dt"] >= start_date) & (normal_sales["日期_dt"] <= end_date)]
+    period_exchange = exchange_sales[(exchange_sales["日期_dt"] >= start_date) & (exchange_sales["日期_dt"] <= end_date)]
+    period_inbound = inbound[(inbound["记录日期_dt"] >= start_date) & (inbound["记录日期_dt"] <= end_date)]
+    after_start_sales = normal_sales[normal_sales["日期_dt"] >= start_date]
+    after_start_inbound = inbound[inbound["记录日期_dt"] >= start_date]
+    sku_base = pd.concat([stock[BI_SKU_KEYS], normal_sales[BI_SKU_KEYS], inbound[BI_SKU_KEYS], exchange_sales[BI_SKU_KEYS]], ignore_index=True).drop_duplicates()
+    if sku_base.empty:
+        return _bi_empty_frame()
+    result = sku_base.merge(stock, on=BI_SKU_KEYS, how="left")
+    for agg in [
+        _bi_sum(period_inbound, "变动数量", "本期入库"),
+        _bi_sum(period_sales, "销售数量", "本期POS售出"),
+        _bi_sum(period_sales, "总营业额", "销售额"),
+        _bi_sum(period_exchange, "销售数量", "换货参考数量"),
+        _bi_sum(after_start_sales, "销售数量", "期后售出"),
+        _bi_sum(after_start_inbound, "变动数量", "期后入库"),
+    ]:
+        result = result.merge(agg, on=BI_SKU_KEYS, how="left")
+    for col in ["当前库存", "进价成本", "售卖价格", "本期入库", "本期POS售出", "销售额", "换货参考数量", "期后售出", "期后入库"]:
+        result[col] = _bi_num(result[col])
+    result["期初库存"] = (result["当前库存"] + result["期后售出"] - result["期后入库"]).clip(lower=0)
+    result["本期可售量"] = result["期初库存"] + result["本期入库"]
+    period_days = max((end_date - start_date).days + 1, 1)
+    result["售罄率"] = result.apply(lambda r: round(float(r["本期POS售出"]) / float(r["本期可售量"]), 4) if float(r["本期可售量"]) > 0 else 0.0, axis=1)
+    result["日均销量"] = (result["本期POS售出"] / period_days).round(3)
+    result["单件毛利"] = result["售卖价格"] - result["进价成本"]
+    result["毛利率"] = result.apply(lambda r: round(float(r["单件毛利"]) / float(r["售卖价格"]), 4) if float(r["售卖价格"]) > 0 else 0.0, axis=1)
+    result["毛利贡献"] = result["销售额"] - result["本期POS售出"] * result["进价成本"]
+    first_inbound = inbound.dropna(subset=["记录日期_dt"]).groupby(BI_SKU_KEYS, as_index=False)["记录日期_dt"].min().rename(columns={"记录日期_dt": "首次入库日期"})
+    result = result.merge(first_inbound, on=BI_SKU_KEYS, how="left")
+    result["库存年龄天数"] = result["首次入库日期"].apply(lambda d: max((end_date - d).days + 1, 0) if pd.notna(d) else 0)
+    max_daily_sales = float(result["日均销量"].max()) if not result.empty else 0.0
+    max_profit = float(result["毛利贡献"].max()) if not result.empty else 0.0
+    scores = result.apply(lambda row: _bi_score_row(row, max_daily_sales, max_profit), axis=1)
+    result["动销分"] = [s[0] for s in scores]
+    result["利润分"] = [s[1] for s in scores]
+    result["系统分类"] = result.apply(_bi_classify, axis=1)
+    result["SKU"] = result["商品名称"] + " (" + result["颜色"] + ")"
+    for col in ["期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量", "当前库存", "库存年龄天数"]:
+        result[col] = result[col].round(0).astype(int)
+    return result[[
+        "SKU", "商品名称", "颜色", "期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量",
+        "售罄率", "日均销量", "当前库存", "库存年龄天数", "销售额", "单件毛利", "毛利率", "毛利贡献",
+        "动销分", "利润分", "系统分类"
+    ]].sort_values(["系统分类", "动销分", "利润分"], ascending=[True, False, False]).reset_index(drop=True)
+
+def compare_periods(stock_df, sales_df, restock_df, period_a, period_b):
+    name_a, start_a, end_a = period_a
+    name_b, start_b, end_b = period_b
+    a = compute_period_sku_bi(stock_df, sales_df, restock_df, start_a, end_a)
+    b = compute_period_sku_bi(stock_df, sales_df, restock_df, start_b, end_b)
+    key_cols = ["SKU", "商品名称", "颜色"]
+    compare_cols = ["本期POS售出", "售罄率", "销售额", "毛利贡献", "动销分", "利润分", "系统分类"]
+    merged = a[key_cols + compare_cols].merge(b[key_cols + compare_cols], on=key_cols, how="outer", suffixes=("_A_raw", "_B_raw")).fillna(0)
+    for col in compare_cols:
+        merged.rename(columns={f"{col}_A_raw": f"A_{col}", f"{col}_B_raw": f"B_{col}"}, inplace=True)
+    merged["档期A"] = name_a
+    merged["档期B"] = name_b
+    merged["售出变化"] = _bi_num(merged["B_本期POS售出"]) - _bi_num(merged["A_本期POS售出"])
+    merged["售罄率变化"] = _bi_num(merged["B_售罄率"]) - _bi_num(merged["A_售罄率"])
+    merged["销售额变化"] = _bi_num(merged["B_销售额"]) - _bi_num(merged["A_销售额"])
+    merged["毛利贡献变化"] = _bi_num(merged["B_毛利贡献"]) - _bi_num(merged["A_毛利贡献"])
+    merged["分类变化"] = merged.apply(lambda r: r["B_系统分类"] if r["A_系统分类"] == r["B_系统分类"] else f"{r['A_系统分类']} → {r['B_系统分类']}", axis=1)
+    return merged.sort_values(["售出变化", "销售额变化"], ascending=[False, False]).reset_index(drop=True)
 
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
