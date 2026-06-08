@@ -277,6 +277,89 @@ def compute_period_financials(stock_df, sales_df, attendance_df, start_date, end
         "含税净利率%": round(net_margin, 2),
     }
 
+def _dashboard_traffic(traffic_df):
+    traffic = traffic_df.copy()
+    if traffic.empty:
+        return pd.DataFrame(columns=["日期_dt", "有效客流"])
+    if "日期" not in traffic.columns:
+        traffic["日期"] = ""
+    traffic["日期_dt"] = _bi_dates(traffic, "日期")
+    if "有效客流" not in traffic.columns:
+        traffic["有效客流"] = 0
+    traffic["有效客流"] = _bi_num(traffic["有效客流"])
+    return traffic
+
+def _dashboard_sales_with_cost(stock_df, sales_df, start_date, end_date):
+    sales = _bi_norm_sales(sales_df)
+    stock = _bi_norm_stock(stock_df)
+    period_sales = sales[(sales["日期_dt"] >= start_date) & (sales["日期_dt"] <= end_date)].copy()
+    if period_sales.empty:
+        period_sales["进价成本"] = pd.Series(dtype="float64")
+        period_sales["总进价成本"] = pd.Series(dtype="float64")
+        period_sales["具体毛利"] = pd.Series(dtype="float64")
+        return period_sales
+    period_sales = period_sales.merge(stock[BI_SKU_KEYS + ["进价成本"]], on=BI_SKU_KEYS, how="left")
+    period_sales["进价成本"] = _bi_num(period_sales["进价成本"])
+    period_sales["总进价成本"] = period_sales["销售数量"] * period_sales["进价成本"]
+    period_sales["具体毛利"] = period_sales["总营业额"] - period_sales["总进价成本"]
+    return period_sales
+
+def compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, start_date, end_date):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    period_sales = _dashboard_sales_with_cost(stock_df, sales_df, start_date, end_date)
+    financials = compute_period_financials(stock_df, sales_df, attendance_df, start_date, end_date)
+    traffic = _dashboard_traffic(traffic_df)
+    period_traffic = traffic[(traffic["日期_dt"] >= start_date) & (traffic["日期_dt"] <= end_date)]
+    total_traffic = float(period_traffic["有效客流"].sum()) if not period_traffic.empty else 0.0
+    total_revenue = float(period_sales["总营业额"].sum()) if not period_sales.empty else 0.0
+    total_items = float(period_sales["销售数量"].sum()) if not period_sales.empty else 0.0
+    gross_margin = float(period_sales["具体毛利"].sum()) if not period_sales.empty else 0.0
+    if not period_sales.empty:
+        valid_orders = period_sales[
+            (~period_sales["订单号"].astype(str).str.contains("历史单", na=False)) &
+            (~period_sales["订单号"].astype(str).str.contains("EXC-", na=False))
+        ]
+        legacy_orders = period_sales[period_sales["订单号"].astype(str).str.contains("历史单", na=False)]
+        order_count = int(valid_orders["订单号"].nunique() + len(legacy_orders))
+    else:
+        order_count = 0
+    conversion = (order_count / total_traffic * 100) if total_traffic > 0 else 0.0
+    acv = total_revenue / order_count if order_count > 0 else 0.0
+    upt = total_items / order_count if order_count > 0 else 0.0
+    avg_margin_rate = (gross_margin / total_revenue * 100) if total_revenue > 0 else 0.0
+    days = max((end_date - start_date).days + 1, 1)
+    if period_sales.empty:
+        daily_sales = pd.DataFrame(columns=["日期", "总营业额", "具体毛利", "销售数量"])
+    else:
+        daily_sales = period_sales.copy()
+        daily_sales["日期"] = pd.to_datetime(daily_sales["日期_dt"]).dt.strftime("%Y/%m/%d")
+        daily_sales = daily_sales.groupby("日期", as_index=False).agg({"总营业额": "sum", "具体毛利": "sum", "销售数量": "sum"})
+    financial_daily = daily_sales.copy()
+    if not financial_daily.empty:
+        financial_daily["免税净营业额"] = financial_daily["总营业额"] / 1.09
+        financial_daily["商场抽成(36%)"] = financial_daily["免税净营业额"] * 0.36
+        financial_daily["商场实际回款"] = financial_daily["免税净营业额"] - financial_daily["商场抽成(36%)"]
+        financial_daily["真实净利润"] = financial_daily["商场实际回款"] - (financial_daily["总营业额"] - financial_daily["具体毛利"])
+    else:
+        financial_daily["真实净利润"] = pd.Series(dtype="float64")
+    summary = {
+        "有效客流": int(total_traffic),
+        "交易单数": int(order_count),
+        "购买转化率%": round(conversion, 2),
+        "总营业额": round(total_revenue, 2),
+        "平均客单价": round(acv, 2),
+        "连带率": round(upt, 2),
+        "具体毛利": round(gross_margin, 2),
+        "总售出件数": int(total_items),
+        "平均毛利率%": round(avg_margin_rate, 2),
+        "日均营收": round(total_revenue / days, 2),
+    }
+    summary.update(financials)
+    return {"summary": summary, "daily": financial_daily}
+
 def _period_change_rate(after, before):
     after = float(after)
     before = float(before)
@@ -1061,7 +1144,7 @@ def render_campaign_bi_center():
                 with dc2:
                     st.button("🔄 取消选中", key="cancel_campaign_selection", on_click=clear_campaign)
 
-    mode_tab1, mode_tab2, mode_tab3 = st.tabs(["📊 单档期复盘", "⚖️ 双档期对比", "💎 档期财务对比"])
+    mode_tab1, mode_tab2, mode_tab3, mode_tab4 = st.tabs(["📊 单档期复盘", "📈 档期看板", "⚖️ 双档期对比", "💎 档期财务对比"])
 
     with mode_tab1:
         period_name, start_date, end_date = _pick_period("选择单档期分析方式", "single_bi")
@@ -1093,6 +1176,69 @@ def render_campaign_bi_center():
             st.info("当前档期没有可分析数据。")
 
     with mode_tab2:
+        campaigns = _campaign_options()
+        if campaigns:
+            labels = list(campaigns.keys())
+            selected_label = st.selectbox("选择档期看板", labels, index=0, key="dashboard_period")
+            period = campaigns[selected_label]
+            dashboard = compute_period_dashboard(df_stock, df_sales, df_attendance, df_traffic, period[1], period[2])
+            summary = dashboard["summary"]
+            daily = dashboard["daily"]
+
+            st.markdown(f"### {period[0]}：{period[1]} 至 {period[2]}")
+            st.info("这个看板把「毛利」和「净利润」tab 的核心数据按已保存档期汇总。")
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric("有效客流", f"{summary['有效客流']} 人")
+            d2.metric("交易单数", f"{summary['交易单数']} 单")
+            d3.metric("购买转化率", f"{summary['购买转化率%']:.1f}%")
+
+            st.divider()
+            d4, d5, d6 = st.columns(3)
+            d4.metric("总营业额", f"${summary['总营业额']:,.2f}")
+            d5.metric("平均客单价 ACV", f"${summary['平均客单价']:,.2f}")
+            d6.metric("连带率 UPT", f"{summary['连带率']:.2f} 件/单")
+
+            st.divider()
+            d7, d8, d9, d10 = st.columns(4)
+            d7.metric("具体毛利", f"${summary['具体毛利']:,.2f}")
+            d8.metric("总售出件数", f"{summary['总售出件数']} 件")
+            d9.metric("平均毛利率", f"{summary['平均毛利率%']:.1f}%")
+            d10.metric("日均营收", f"${summary['日均营收']:,.2f}")
+
+            st.divider()
+            d11, d12, d13, d14 = st.columns(4)
+            d11.metric("剥离 GST (9%)", f"${summary['代扣GST(9%)']:,.2f}")
+            d12.metric("商场抽成 (36%)", f"${summary['商场抽成(36%)']:,.2f}")
+            d13.metric("商场实际回款", f"${summary['商场实际回款']:,.2f}")
+            d14.metric("真实净利润", f"${summary['真实净利润']:,.2f}", delta=f"净利率 {summary['含税净利率%']:.1f}%")
+
+            st.divider()
+            d15, d16 = st.columns(2)
+            d15.metric("商品进价成本", f"${summary['总进价成本']:,.2f}")
+            d16.metric("打卡人工成本", f"${summary['人工成本']:,.2f}")
+
+            if not daily.empty:
+                chart_df = daily.set_index("日期")[["总营业额", "具体毛利", "真实净利润"]].sort_index()
+                st.markdown("### 每日营收 / 毛利 / 净利润走势")
+                st.bar_chart(chart_df, use_container_width=True)
+                st.markdown("### 每日明细")
+                st.dataframe(
+                    daily.style.format({
+                        "总营业额": "${:.2f}",
+                        "具体毛利": "${:.2f}",
+                        "真实净利润": "${:.2f}",
+                        "销售数量": "{:.0f}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("这个档期暂无销售流水，无法生成每日走势。")
+        else:
+            st.info("请先保存至少 1 个档期，再使用档期看板。")
+
+    with mode_tab3:
         campaigns = _campaign_options()
         if len(campaigns) >= 2:
             c1, c2 = st.columns(2)
@@ -1144,7 +1290,7 @@ def render_campaign_bi_center():
         else:
             st.info("请先至少保存 2 个档期，再使用双档期对比。")
 
-    with mode_tab3:
+    with mode_tab4:
         campaigns = _campaign_options()
         if len(campaigns) >= 2:
             st.info("财务口径沿用「净利润」tab：含税营业额剥离 9% GST，商场 36% 抽成按免税净额计算，再扣商品成本和打卡人工成本。")
