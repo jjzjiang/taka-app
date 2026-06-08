@@ -112,6 +112,8 @@ def _bi_classify(row):
     daily_sales = _bi_max0(row["日均销量"])
     age_days = _bi_max0(row["库存年龄天数"])
 
+    if available <= 0 and current_stock <= 0 and sold <= 0:
+        return "无库存/未参与"
     if age_days >= 30 and current_stock > 0 and sold == 0:
         return "滞销款"
     if age_days >= 45 and current_stock > 0 and sell_through <= 0.35:
@@ -1000,7 +1002,7 @@ def render_campaign_bi_center():
             m3.metric("毛利贡献", f"${total_profit:.2f}")
             m4.metric("SKU 平均售罄率", f"{avg_sell_through:.1f}%")
 
-            category_order = ["潜力款", "畅销款", "常规款", "滞销款"]
+            category_order = ["潜力款", "畅销款", "常规款", "滞销款", "无库存/未参与"]
             category_counts = bi_df['系统分类'].value_counts().reindex(category_order).fillna(0).astype(int)
             st.bar_chart(category_counts, use_container_width=True)
 
