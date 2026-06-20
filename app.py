@@ -601,6 +601,23 @@ def compute_monthly_commission(
     }
     return {"summary": summary, "employees": employees.reset_index(drop=True)}
 
+def get_employee_commission_view(commission_result, staff_name):
+    staff_name = str(staff_name).strip()
+    summary = commission_result.get("summary", {}) if isinstance(commission_result, dict) else {}
+    employees = commission_result.get("employees", pd.DataFrame()) if isinstance(commission_result, dict) else pd.DataFrame()
+    if employees.empty:
+        employee = pd.DataFrame(columns=["员工姓名", "工作时长", "基础工资", "个人销售额", "销售贡献占比", "Commission", "内购扣款", "最终应发"])
+    else:
+        employee = employees[employees["员工姓名"].astype(str).str.strip() == staff_name].copy()
+        employee = employee[["员工姓名", "工作时长", "基础工资", "个人销售额", "销售贡献占比", "Commission", "内购扣款", "最终应发"]]
+    return {
+        "summary": {
+            "当前档位比例": summary.get("当前档位比例", 0.0),
+            "最终提成池": summary.get("最终提成池", 0.0),
+        },
+        "employee": employee.reset_index(drop=True),
+    }
+
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 
@@ -3591,3 +3608,94 @@ elif is_employee:
             c4.metric(t("预估总薪资", "Total Est. Wage"), f"${tot_w:.2f}")
         else:
             st.info(t("暂无打卡记录。", "No time logs found."))
+
+        st.divider()
+        st.markdown(t("### 💵 我的提成与工资", "### 💵 My Commission & Wage"))
+        st.caption(t(
+            "这里只显示你自己的结算数据；自定义日期会用 30 天月化营业额判断档位，但提成按实际期间营业额发放。",
+            "Only your own payroll data is shown here. Custom range uses 30-day annualized sales for tiering, while payout uses actual selected-period sales."
+        ))
+
+        emp_commission_mode = st.radio(
+            t("选择结算方式", "Settlement Mode"),
+            [t("按整月结算", "Monthly"), t("自定义日期范围", "Custom Date Range")],
+            horizontal=True,
+            key="employee_commission_mode",
+        )
+        if emp_commission_mode == t("按整月结算", "Monthly"):
+            emp_commission_month = st.date_input(t("选择结算月份", "Select Month"), value=datetime.now().date().replace(day=1), key="employee_commission_month")
+            emp_commission_start = emp_commission_month.replace(day=1)
+            if emp_commission_start.month == 12:
+                emp_next_month = emp_commission_start.replace(year=emp_commission_start.year + 1, month=1, day=1)
+            else:
+                emp_next_month = emp_commission_start.replace(month=emp_commission_start.month + 1, day=1)
+            emp_commission_end = emp_next_month - timedelta(days=1)
+            emp_tier_basis = None
+        else:
+            emp_c1, emp_c2 = st.columns(2)
+            emp_commission_start = emp_c1.date_input(t("开始日期", "Start Date"), value=datetime.now().date().replace(day=1), key="employee_commission_custom_start")
+            emp_commission_end = emp_c2.date_input(t("结束日期", "End Date"), value=datetime.now().date(), key="employee_commission_custom_end")
+            if emp_commission_start > emp_commission_end:
+                emp_commission_start, emp_commission_end = emp_commission_end, emp_commission_start
+            emp_tier_basis = None
+
+        emp_commission_result = compute_monthly_commission(
+            sales_df=df_sales,
+            attendance_df=df_attendance,
+            staff_purchase_df=df_staff_purchase,
+            stock_df=df_stock,
+            start_date=emp_commission_start,
+            end_date=emp_commission_end,
+            manager_cashiers=DEFAULT_MANAGER_CASHIERS,
+            tier_basis_gross=emp_tier_basis,
+        )
+        if emp_commission_mode == t("自定义日期范围", "Custom Date Range"):
+            emp_tier_basis = _commission_annualized_gross(
+                emp_commission_result["summary"]["月总营业额"],
+                emp_commission_start,
+                emp_commission_end,
+            )
+            emp_commission_result = compute_monthly_commission(
+                sales_df=df_sales,
+                attendance_df=df_attendance,
+                staff_purchase_df=df_staff_purchase,
+                stock_df=df_stock,
+                start_date=emp_commission_start,
+                end_date=emp_commission_end,
+                manager_cashiers=DEFAULT_MANAGER_CASHIERS,
+                tier_basis_gross=emp_tier_basis,
+            )
+
+        emp_commission_view = get_employee_commission_view(emp_commission_result, st.session_state.current_user)
+        emp_safe_summary = emp_commission_view["summary"]
+        emp_row = emp_commission_view["employee"]
+        st.info(t(
+            f"当前结算区间：**{emp_commission_start.strftime('%Y-%m-%d')} 至 {emp_commission_end.strftime('%Y-%m-%d')}**",
+            f"Settlement period: **{emp_commission_start.strftime('%Y-%m-%d')} to {emp_commission_end.strftime('%Y-%m-%d')}**"
+        ))
+
+        if emp_row.empty:
+            st.info(t("该区间暂无你的工资或提成数据。", "No wage or commission data for you in this period."))
+        else:
+            emp_one = emp_row.iloc[0]
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            ec1.metric(t("我的销售额", "My Sales"), f"${float(emp_one['个人销售额']):,.2f}")
+            ec2.metric(t("我的 Commission", "My Commission"), f"${float(emp_one['Commission']):,.2f}", delta=f"{emp_safe_summary['当前档位比例'] * 100:.1f}% tier", delta_color="off")
+            ec3.metric(t("我的基础工资", "My Base Wage"), f"${float(emp_one['基础工资']):,.2f}")
+            ec4.metric(t("最终应发", "Final Pay"), f"${float(emp_one['最终应发']):,.2f}")
+
+            emp_display = emp_row.copy()
+            emp_display["销售贡献占比"] = emp_display["销售贡献占比"] * 100
+            st.dataframe(
+                emp_display.style.format({
+                    "工作时长": "{:.2f}",
+                    "基础工资": "${:.2f}",
+                    "个人销售额": "${:.2f}",
+                    "销售贡献占比": "{:.1f}%",
+                    "Commission": "${:.2f}",
+                    "内购扣款": "${:.2f}",
+                    "最终应发": "${:.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
