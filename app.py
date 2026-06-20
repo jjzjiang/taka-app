@@ -803,14 +803,85 @@ def append_rows_data(sheet_name, rows, columns):
     st.stop()
 
 # ================= 🚀 数据定义与初始化 =================
-STOCK_SHEET, SALES_SHEET, EMP_SHEET = "Stock", "Sales", "Employee"
-ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET = "Attendance", "B2B_Orders", "Feedback"
-RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET = "Restock_Log", "Traffic_Log", "Campaigns"
-STAFF_PURCHASE_SHEET = "Staff_Purchases"
+DEFAULT_CATEGORY_SYSTEM = "titanium"
+SYSTEM_PERMISSION_COL = "可进入系统"
+CATEGORY_SYSTEMS = {
+    "titanium": {
+        "label": "钛杯系统",
+        "stock": "Stock",
+        "sales": "Sales",
+        "restock": "Restock_Log",
+        "traffic": "Traffic_Log",
+        "campaign": "Campaigns",
+        "b2b": "B2B_Orders",
+        "feedback": "Feedback",
+        "staff_purchase": "Staff_Purchases",
+    },
+    "silk": {
+        "label": "丝绸系统",
+        "stock": "Silk_Stock",
+        "sales": "Silk_Sales",
+        "restock": "Silk_Restock_Log",
+        "traffic": "Silk_Traffic_Log",
+        "campaign": "Silk_Campaigns",
+        "b2b": "Silk_B2B_Orders",
+        "feedback": "Silk_Feedback",
+        "staff_purchase": "Silk_Staff_Purchases",
+    },
+}
+
+def get_category_system_config(system_key):
+    system_key = str(system_key or DEFAULT_CATEGORY_SYSTEM).strip()
+    return CATEGORY_SYSTEMS.get(system_key, CATEGORY_SYSTEMS[DEFAULT_CATEGORY_SYSTEM])
+
+def resolve_system_sheets(system_key):
+    config = get_category_system_config(system_key)
+    return {k: config[k] for k in ["stock", "sales", "restock", "traffic", "campaign", "b2b", "feedback", "staff_purchase"]}
+
+def parse_allowed_systems(value):
+    raw = "" if value is None else str(value)
+    normalized = raw.replace("，", ",")
+    labels = {cfg["label"]: key for key, cfg in CATEGORY_SYSTEMS.items()}
+    allowed = []
+    for part in normalized.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        key = labels.get(token, token)
+        if key in CATEGORY_SYSTEMS and key not in allowed:
+            allowed.append(key)
+    if not allowed:
+        allowed = [DEFAULT_CATEGORY_SYSTEM]
+    return [key for key in CATEGORY_SYSTEMS if key in allowed]
+
+def get_active_system_from_state(state):
+    selected = state.get("current_category_system", DEFAULT_CATEGORY_SYSTEM)
+    return selected if selected in CATEGORY_SYSTEMS else DEFAULT_CATEGORY_SYSTEM
+
+def choose_employee_default_system(allowed_systems):
+    allowed = [s for s in allowed_systems if s in CATEGORY_SYSTEMS]
+    if len(allowed) == 1:
+        return allowed[0]
+    return None
+
+ACTIVE_CATEGORY_SYSTEM = get_active_system_from_state(st.session_state)
+ACTIVE_SYSTEM_CONFIG = get_category_system_config(ACTIVE_CATEGORY_SYSTEM)
+ACTIVE_SYSTEM_SHEETS = resolve_system_sheets(ACTIVE_CATEGORY_SYSTEM)
+
+STOCK_SHEET = ACTIVE_SYSTEM_SHEETS["stock"]
+SALES_SHEET = ACTIVE_SYSTEM_SHEETS["sales"]
+EMP_SHEET = "Employee"
+ATT_SHEET = "Attendance"
+B2B_SHEET = ACTIVE_SYSTEM_SHEETS["b2b"]
+FEEDBACK_SHEET = ACTIVE_SYSTEM_SHEETS["feedback"]
+RESTOCK_SHEET = ACTIVE_SYSTEM_SHEETS["restock"]
+TRAFFIC_SHEET = ACTIVE_SYSTEM_SHEETS["traffic"]
+CAMP_SHEET = ACTIVE_SYSTEM_SHEETS["campaign"]
+STAFF_PURCHASE_SHEET = ACTIVE_SYSTEM_SHEETS["staff_purchase"]
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
-EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期', '登录密码', '状态']
+EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期', '登录密码', '状态', SYSTEM_PERMISSION_COL]
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
@@ -943,6 +1014,8 @@ def load_safe_emp():
     if not df.empty:
         df['状态'] = df['状态'].fillna('').astype(str).replace('0', '在职').replace('', '在职').replace('nan', '在职')
         df['登录密码'] = df['登录密码'].fillna('').astype(str).replace('0', '').replace('nan', '')
+        df[SYSTEM_PERMISSION_COL] = df[SYSTEM_PERMISSION_COL].fillna('').astype(str).replace('0', '').replace('nan', '')
+        df[SYSTEM_PERMISSION_COL] = df[SYSTEM_PERMISSION_COL].replace('', CATEGORY_SYSTEMS[DEFAULT_CATEGORY_SYSTEM]["label"])
     return df
 
 def JIT_fetch(sheets_to_fetch):
@@ -1058,6 +1131,10 @@ def restore_login_from_url():
     if expected_token and hmac.compare_digest(str(token), str(expected_token)):
         st.session_state.role = role
         st.session_state.current_user = user
+        if role in ["employee", "supplier"] and not df_employee.empty:
+            emp_matches = df_employee[df_employee['员工姓名'].fillna('').astype(str).str.strip() == user]
+            if not emp_matches.empty:
+                apply_employee_system_access(emp_matches.iloc[0])
         return True
     return False
 
@@ -1067,6 +1144,12 @@ def persist_login_to_url(role, user):
         st.query_params["role"] = role
         st.query_params["user"] = user
         st.query_params["auth"] = token
+
+def apply_employee_system_access(emp_row):
+    allowed_systems = parse_allowed_systems(emp_row.get(SYSTEM_PERMISSION_COL, ""))
+    st.session_state.allowed_category_systems = allowed_systems
+    chosen_system = choose_employee_default_system(allowed_systems)
+    st.session_state.current_category_system = chosen_system or allowed_systems[0]
 
 if "role" not in st.session_state:
     if not restore_login_from_url():
@@ -1085,10 +1168,12 @@ with st.sidebar:
         else: user_emoji = "🧑‍💼"
         
         st.success(t(f"{user_emoji} 欢迎回来：{st.session_state.current_user}", f"{user_emoji} Welcome back: {st.session_state.current_user}"))
+        st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
         
         if st.button(t("🚪 退出系统 (交接班)", "🚪 Logout (Handover)"), use_container_width=True):
             st.session_state.role = None
             st.session_state.current_user = None
+            st.session_state.allowed_category_systems = []
             st.query_params.clear()
             st.rerun()
             
@@ -1097,6 +1182,15 @@ with st.sidebar:
         st.divider()
         
         if is_admin:
+            system_keys = list(CATEGORY_SYSTEMS.keys())
+            system_labels = [CATEGORY_SYSTEMS[key]["label"] for key in system_keys]
+            current_idx = system_keys.index(ACTIVE_CATEGORY_SYSTEM) if ACTIVE_CATEGORY_SYSTEM in system_keys else 0
+            selected_label = st.radio("当前系统", system_labels, index=current_idx, key="admin_category_system_selector")
+            selected_key = system_keys[system_labels.index(selected_label)]
+            if selected_key != st.session_state.get("current_category_system", DEFAULT_CATEGORY_SYSTEM):
+                st.session_state.current_category_system = selected_key
+                st.rerun()
+            st.divider()
             st.header("🛠️ 核心管理")
             with st.expander("➕ 新增产品建档 (Add SKU)"):
                 with st.form("new_sku"):
@@ -1133,6 +1227,17 @@ with st.sidebar:
             if st.session_state.get("admin_page") == "campaign_bi":
                 if st.button("↩️ 返回日常管理台", use_container_width=True):
                     st.session_state.admin_page = "main"
+                    st.rerun()
+        elif st.session_state.role == "employee":
+            allowed_systems = st.session_state.get("allowed_category_systems", [DEFAULT_CATEGORY_SYSTEM])
+            allowed_systems = [s for s in allowed_systems if s in CATEGORY_SYSTEMS] or [DEFAULT_CATEGORY_SYSTEM]
+            if len(allowed_systems) > 1:
+                system_labels = [CATEGORY_SYSTEMS[key]["label"] for key in allowed_systems]
+                current_idx = allowed_systems.index(ACTIVE_CATEGORY_SYSTEM) if ACTIVE_CATEGORY_SYSTEM in allowed_systems else 0
+                selected_label = st.radio("我的系统", system_labels, index=current_idx, key="employee_category_system_selector")
+                selected_key = allowed_systems[system_labels.index(selected_label)]
+                if selected_key != ACTIVE_CATEGORY_SYSTEM:
+                    st.session_state.current_category_system = selected_key
                     st.rerun()
     
     else:
@@ -1175,6 +1280,7 @@ with st.sidebar:
                                     save_data(fresh_emp, EMP_SHEET)
                                     st.session_state.role = assigned_role
                                     st.session_state.current_user = emp_sel
+                                    apply_employee_system_access(emp_row)
                                     persist_login_to_url(assigned_role, emp_sel)
                                     st.success("✅ 密码设置成功！")
                                     st.rerun()
@@ -1186,6 +1292,7 @@ with st.sidebar:
                             if emp_pwd_input == emp_pwd:
                                 st.session_state.role = assigned_role
                                 st.session_state.current_user = emp_sel
+                                apply_employee_system_access(emp_row)
                                 persist_login_to_url(assigned_role, emp_sel)
                                 st.rerun()
                             else:
@@ -1231,6 +1338,7 @@ elif role_now == "employee":
 col_title, col_lang = st.columns([8, 2])
 with col_title:
     st.title(t("🏙️ Takashimaya 零售管理系统 (云端同步版)", "🏙️ Takashimaya Retail System (Cloud Sync)"))
+    st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
 with col_lang:
     lang_choice = st.radio("🌐 Language", ["中文", "English"], index=0 if st.session_state.lang == 'cn' else 1, horizontal=True)
     if (lang_choice == "中文" and st.session_state.lang != "cn") or (lang_choice == "English" and st.session_state.lang != "en"):
@@ -2510,12 +2618,20 @@ if is_admin:
                 e_wage = c3.number_input("时薪 ($/小时, 厂商填0)", min_value=0.0, step=0.5, value=12.0, format="%.2f")
                 e_phone = c4.text_input("联系方式 (选填)")
                 e_date = c5.date_input("入职/开通日期", value=datetime.now())
+                system_labels = [cfg["label"] for cfg in CATEGORY_SYSTEMS.values()]
+                e_systems = st.multiselect(
+                    "可进入系统",
+                    system_labels,
+                    default=[CATEGORY_SYSTEMS[DEFAULT_CATEGORY_SYSTEM]["label"]],
+                    help="只授权丝绸系统的员工，登录后会直接进入丝绸系统；授权两个系统的员工可自行切换。",
+                )
                 if st.form_submit_button("保存人员信息"):
                     if e_name.strip() == "": st.warning("⚠️ 姓名不能为空！")
+                    elif not e_systems: st.warning("⚠️ 请至少选择一个可进入系统。")
                     elif e_name in df_employee['员工姓名'].values: st.warning(f"⚠️ 人员 {e_name} 已经存在！")
                     else:
                         fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
-                        new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d"), "", "在职"]], columns=EMP_COLS)
+                        new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d"), "", "在职", ", ".join(e_systems)]], columns=EMP_COLS)
                         fresh_emp = pd.concat([fresh_emp, new_emp], ignore_index=True)
                         save_data(fresh_emp, EMP_SHEET) 
                         st.session_state.emp_reset_key += 1
@@ -2535,7 +2651,8 @@ if is_admin:
                 column_config={
                     "选择": st.column_config.CheckboxColumn("选择", default=False),
                     "状态": st.column_config.SelectboxColumn("在离职状态", options=["在职", "离职"]),
-                    "登录密码": st.column_config.TextColumn("登录密码 (店长清空后，人员可重新设置)")
+                    "登录密码": st.column_config.TextColumn("登录密码 (店长清空后，人员可重新设置)"),
+                    SYSTEM_PERMISSION_COL: st.column_config.TextColumn("可进入系统（钛杯系统, 丝绸系统）")
                 }, 
                 disabled=['员工姓名', '入职日期'], 
                 use_container_width=True, hide_index=True, key=editor_key
