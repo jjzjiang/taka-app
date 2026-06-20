@@ -2643,16 +2643,22 @@ if is_admin:
             v_emp.insert(0, "选择", False)
             
             v_emp['时薪'] = pd.to_numeric(v_emp['时薪'], errors='coerce').fillna(0.0)
-            styled_emp = v_emp.style.format({'时薪': '${:.2f}'})
+            permission_options = [
+                "钛杯系统",
+                "丝绸系统",
+                "钛杯系统, 丝绸系统",
+            ]
+            v_emp[SYSTEM_PERMISSION_COL] = v_emp[SYSTEM_PERMISSION_COL].fillna("").astype(str).replace("", "钛杯系统")
             
             editor_key = f"emp_editor_{st.session_state.emp_reset_key}"
             edited_emp = st.data_editor(
-                styled_emp, 
+                v_emp, 
                 column_config={
                     "选择": st.column_config.CheckboxColumn("选择", default=False),
                     "状态": st.column_config.SelectboxColumn("在离职状态", options=["在职", "离职"]),
+                    "时薪": st.column_config.NumberColumn("时薪", format="$%.2f", min_value=0.0, step=0.5),
                     "登录密码": st.column_config.TextColumn("登录密码 (店长清空后，人员可重新设置)"),
-                    SYSTEM_PERMISSION_COL: st.column_config.TextColumn("可进入系统（钛杯系统, 丝绸系统）")
+                    SYSTEM_PERMISSION_COL: st.column_config.SelectboxColumn("可进入系统", options=permission_options, required=True)
                 }, 
                 disabled=['员工姓名', '入职日期'], 
                 use_container_width=True, hide_index=True, key=editor_key
