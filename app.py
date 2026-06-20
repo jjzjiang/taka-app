@@ -829,6 +829,7 @@ CATEGORY_SYSTEMS = {
         "staff_purchase": "Silk_Staff_Purchases",
     },
 }
+CATEGORY_SCOPED_SESSION_KEYS = ["pos_cart", "last_order_id"]
 
 def get_category_system_config(system_key):
     system_key = str(system_key or DEFAULT_CATEGORY_SYSTEM).strip()
@@ -863,6 +864,21 @@ def choose_employee_default_system(allowed_systems):
     if len(allowed) == 1:
         return allowed[0]
     return None
+
+def update_category_system_state(state, system_key):
+    selected = system_key if system_key in CATEGORY_SYSTEMS else DEFAULT_CATEGORY_SYSTEM
+    current = state.get("current_category_system", DEFAULT_CATEGORY_SYSTEM)
+    if current == selected:
+        state["current_category_system"] = selected
+        return False
+
+    for key in CATEGORY_SCOPED_SESSION_KEYS:
+        state.pop(key, None)
+    state["current_category_system"] = selected
+    return True
+
+def employee_has_system_access(permission_value, system_key):
+    return system_key in parse_allowed_systems(permission_value)
 
 ACTIVE_CATEGORY_SYSTEM = get_active_system_from_state(st.session_state)
 ACTIVE_SYSTEM_CONFIG = get_category_system_config(ACTIVE_CATEGORY_SYSTEM)
@@ -1134,7 +1150,8 @@ def restore_login_from_url():
         if role in ["employee", "supplier"] and not df_employee.empty:
             emp_matches = df_employee[df_employee['员工姓名'].fillna('').astype(str).str.strip() == user]
             if not emp_matches.empty:
-                apply_employee_system_access(emp_matches.iloc[0])
+                if apply_employee_system_access(emp_matches.iloc[0]):
+                    st.session_state._category_restore_needs_rerun = True
         return True
     return False
 
@@ -1149,12 +1166,15 @@ def apply_employee_system_access(emp_row):
     allowed_systems = parse_allowed_systems(emp_row.get(SYSTEM_PERMISSION_COL, ""))
     st.session_state.allowed_category_systems = allowed_systems
     chosen_system = choose_employee_default_system(allowed_systems)
-    st.session_state.current_category_system = chosen_system or allowed_systems[0]
+    return update_category_system_state(st.session_state, chosen_system or allowed_systems[0])
 
 if "role" not in st.session_state:
     if not restore_login_from_url():
         st.session_state.role = None
         st.session_state.current_user = None
+
+if st.session_state.pop("_category_restore_needs_rerun", False):
+    st.rerun()
 
 # 日期筛选已改为各看板独立选择，不再使用侧边栏全局档期。
 
@@ -1188,7 +1208,7 @@ with st.sidebar:
             selected_label = st.radio("当前系统", system_labels, index=current_idx, key="admin_category_system_selector")
             selected_key = system_keys[system_labels.index(selected_label)]
             if selected_key != st.session_state.get("current_category_system", DEFAULT_CATEGORY_SYSTEM):
-                st.session_state.current_category_system = selected_key
+                update_category_system_state(st.session_state, selected_key)
                 st.rerun()
             st.divider()
             st.header("🛠️ 核心管理")
@@ -1237,7 +1257,7 @@ with st.sidebar:
                 selected_label = st.radio("我的系统", system_labels, index=current_idx, key="employee_category_system_selector")
                 selected_key = allowed_systems[system_labels.index(selected_label)]
                 if selected_key != ACTIVE_CATEGORY_SYSTEM:
-                    st.session_state.current_category_system = selected_key
+                    update_category_system_state(st.session_state, selected_key)
                     st.rerun()
     
     else:
@@ -1952,6 +1972,10 @@ def render_pos_engine(role_prefix):
                             active_staff_df = df_employee[df_employee['状态'].fillna('').astype(str).str.strip() != '离职'].copy()
                             if '职位' in active_staff_df.columns:
                                 active_staff_df = active_staff_df[active_staff_df['职位'].fillna('').astype(str).str.strip() != '合作厂商']
+                            if SYSTEM_PERMISSION_COL in active_staff_df.columns:
+                                active_staff_df = active_staff_df[
+                                    active_staff_df[SYSTEM_PERMISSION_COL].apply(lambda v: employee_has_system_access(v, ACTIVE_CATEGORY_SYSTEM))
+                                ]
                             staff_names = active_staff_df['员工姓名'].fillna('').astype(str).str.strip().tolist()
                             cashier_options += [name for name in staff_names if name and name not in cashier_options]
 
@@ -2781,7 +2805,15 @@ if is_admin:
             st.subheader("🛍️ 员工内购扣款")
             st.caption("用于记录员工拿货/内购金额。发工资时可直接从薪资中扣除；如勾选扣库存，系统会同步从库存中出库。")
 
-            active_staff_for_purchase = df_employee[df_employee['状态'].fillna('').astype(str).str.strip() != '离职']['员工姓名'].astype(str).tolist() if not df_employee.empty else []
+            if not df_employee.empty:
+                active_purchase_staff_df = df_employee[df_employee['状态'].fillna('').astype(str).str.strip() != '离职'].copy()
+                if SYSTEM_PERMISSION_COL in active_purchase_staff_df.columns:
+                    active_purchase_staff_df = active_purchase_staff_df[
+                        active_purchase_staff_df[SYSTEM_PERMISSION_COL].apply(lambda v: employee_has_system_access(v, ACTIVE_CATEGORY_SYSTEM))
+                    ]
+                active_staff_for_purchase = active_purchase_staff_df['员工姓名'].astype(str).tolist()
+            else:
+                active_staff_for_purchase = []
             stock_purchase_options = []
             if not df_stock.empty:
                 sp_stock_opts = df_stock.copy()
