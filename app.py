@@ -2832,7 +2832,7 @@ if is_admin:
                 commission_period_label = "当前结算月份"
             else:
                 custom_c1, custom_c2 = st.columns(2)
-                commission_start = custom_c1.date_input("开始日期", value=DEFAULT_START_DATE, key="admin_commission_custom_start")
+                commission_start = custom_c1.date_input("开始日期", value=datetime.now().date().replace(day=1), key="admin_commission_custom_start")
                 commission_end = custom_c2.date_input("结束日期", value=datetime.now().date(), key="admin_commission_custom_end")
                 if commission_start > commission_end:
                     commission_start, commission_end = commission_end, commission_start
