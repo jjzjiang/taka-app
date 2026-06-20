@@ -285,7 +285,7 @@ def compute_period_inventory_reconciliation(stock_df, sales_df, restock_df, star
     result["SKU"] = result["商品名称"] + " (" + result["颜色"] + ")"
 
     for col in ["期初库存", "本期入库", "本期调整", "本期可售量", "本期POS售出", "理论期末库存", "当前库存", "库存差异", "库存年龄天数"]:
-        result[col] = result[col].round(0).astype(int)
+        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0).round(0).astype(int)
     return result[[
         "SKU", "商品名称", "颜色", "期初库存来源", "期初库存", "本期入库", "本期调整",
         "本期可售量", "本期POS售出", "理论期末库存", "当前库存", "库存差异",
