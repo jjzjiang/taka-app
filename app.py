@@ -17,7 +17,7 @@ def _bi_empty_frame():
     return pd.DataFrame(columns=[
         "SKU", "商品名称", "颜色", "期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量",
         "售罄率", "日均销量", "当前库存", "库存年龄天数", "销售额", "单件毛利", "毛利率", "毛利贡献",
-        "动销分", "利润分", "系统分类", "辅助标签"
+        "动销分", "利润分", "系统分类", "辅助标签", "库存预警"
     ])
 
 def _bi_num(value, default=0.0):
@@ -150,6 +150,32 @@ def _bi_tags(row):
         tags.append("新入库")
     return "、".join(tags) if tags else "-"
 
+def _bi_inventory_warning(row):
+    available = _bi_max0(row["本期可售量"])
+    sold = _bi_max0(row["本期POS售出"])
+    current_stock = _bi_max0(row["当前库存"])
+    sell_through = _bi_max0(row["售罄率"])
+    age_days = _bi_max0(row["库存年龄天数"])
+    remaining_rate = (current_stock / available) if available > 0 else 0.0
+
+    if available <= 0 and current_stock <= 0 and sold <= 0:
+        return "无库存动作"
+    if current_stock > 0 and (sold == 0 and age_days >= 30):
+        return "停止补货/清货"
+    if current_stock > 0 and age_days >= 45 and sell_through <= 0.35:
+        return "停止补货/清货"
+    if 0 < available <= 6 and sold > 0 and sell_through >= 0.6:
+        return "建议复测加量"
+    if sold > 0 and sell_through >= 0.7 and remaining_rate <= 0.3:
+        return "建议补货"
+    if available >= 8 and current_stock > 0 and sell_through <= 0.2:
+        return "动销偏慢"
+    if current_stock > 0 and age_days >= 14 and sell_through <= 0.35:
+        return "动销偏慢"
+    if sold > 0:
+        return "继续观察"
+    return "暂无动作"
+
 def compute_period_sku_bi(stock_df, sales_df, restock_df, start_date, end_date):
     start_date = pd.to_datetime(start_date).date()
     end_date = pd.to_datetime(end_date).date()
@@ -201,13 +227,14 @@ def compute_period_sku_bi(stock_df, sales_df, restock_df, start_date, end_date):
     result["利润分"] = [s[1] for s in scores]
     result["系统分类"] = result.apply(_bi_classify, axis=1)
     result["辅助标签"] = result.apply(_bi_tags, axis=1)
+    result["库存预警"] = result.apply(_bi_inventory_warning, axis=1)
     result["SKU"] = result["商品名称"] + " (" + result["颜色"] + ")"
     for col in ["期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量", "当前库存", "库存年龄天数"]:
         result[col] = result[col].round(0).astype(int)
     return result[[
         "SKU", "商品名称", "颜色", "期初库存", "本期入库", "本期可售量", "本期POS售出", "换货参考数量",
         "售罄率", "日均销量", "当前库存", "库存年龄天数", "销售额", "单件毛利", "毛利率", "毛利贡献",
-        "动销分", "利润分", "系统分类", "辅助标签"
+        "动销分", "利润分", "系统分类", "辅助标签", "库存预警"
     ]].sort_values(["系统分类", "动销分", "利润分"], ascending=[True, False, False]).reset_index(drop=True)
 
 def compare_periods(stock_df, sales_df, restock_df, period_a, period_b):
@@ -1408,7 +1435,7 @@ def _render_bi_table(df, key_prefix):
     view['售罄率%'] = (pd.to_numeric(view['售罄率'], errors='coerce').fillna(0) * 100).round(1)
     view['毛利率%'] = (pd.to_numeric(view['毛利率'], errors='coerce').fillna(0) * 100).round(1)
     show_cols = [
-        'SKU', '系统分类', '辅助标签', '期初库存', '本期入库', '本期可售量', '本期POS售出',
+        'SKU', '系统分类', '库存预警', '辅助标签', '期初库存', '本期入库', '本期可售量', '本期POS售出',
         '售罄率%', '日均销量', '当前库存', '库存年龄天数', '销售额',
         '单件毛利', '毛利率%', '毛利贡献', '动销分', '利润分', '换货参考数量'
     ]
