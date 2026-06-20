@@ -437,6 +437,14 @@ def _commission_rate_for_gross(gross):
             rate = tier_rate
     return rate
 
+def _commission_annualized_gross(gross, start_date, end_date):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    days = max((end_date - start_date).days + 1, 1)
+    return float(gross or 0.0) / days * 30
+
 def _commission_period_financials(stock_df, sales_df, attendance_df, start_date, end_date):
     start_date = pd.to_datetime(start_date).date()
     end_date = pd.to_datetime(end_date).date()
@@ -494,6 +502,7 @@ def compute_monthly_commission(
     manager_cashiers=None,
     pre_commission_net_profit=None,
     profit_cap_rate=COMMISSION_PROFIT_CAP_RATE,
+    tier_basis_gross=None,
 ):
     start_date = pd.to_datetime(start_date).date()
     end_date = pd.to_datetime(end_date).date()
@@ -511,7 +520,8 @@ def compute_monthly_commission(
     manager_sales_total = float(manager_sales["总营业额"].sum()) if not manager_sales.empty else 0.0
     employee_sales_total = float(employee_sales["总营业额"].sum()) if not employee_sales.empty else 0.0
 
-    tier_rate = _commission_rate_for_gross(monthly_gross)
+    tier_basis_gross = monthly_gross if tier_basis_gross is None else float(tier_basis_gross or 0.0)
+    tier_rate = _commission_rate_for_gross(tier_basis_gross)
     theoretical_pool = monthly_gross * tier_rate
     if pre_commission_net_profit is None:
         pre_commission_net_profit = _commission_period_financials(stock_df, sales_df, attendance_df, start_date, end_date)["真实净利润"]
@@ -581,6 +591,7 @@ def compute_monthly_commission(
         "月总营业额": round(monthly_gross, 2),
         "老板/店长销售额": round(manager_sales_total, 2),
         "员工可分配销售额": round(employee_sales_total, 2),
+        "月化档位营业额": round(tier_basis_gross, 2),
         "当前档位比例": round(tier_rate, 4),
         "理论提成池": round(theoretical_pool, 2),
         "扣提成前真实净利润": round(float(pre_commission_net_profit or 0.0), 2),
@@ -2800,41 +2811,78 @@ if is_admin:
 
             st.divider()
             st.subheader("💵 月度工资与提成结算")
-            st.caption("按月总营业额生成提成池，再按员工个人销售贡献分配；老板/店长销售计入总营业额，但不参与员工提成分配。")
+            st.caption("整月适合长期专柜；自定义日期适合 popup。自定义日期会用 30 天月化营业额判断档位，但提成池仍按实际期间营业额发放。")
 
-            default_commission_month = datetime.now().date().replace(day=1)
-            commission_month_pick = st.date_input("选择结算月份", value=default_commission_month, key="admin_commission_month")
-            commission_month_start = commission_month_pick.replace(day=1)
-            if commission_month_start.month == 12:
-                commission_next_month = commission_month_start.replace(year=commission_month_start.year + 1, month=1, day=1)
+            commission_mode = st.radio(
+                "选择结算方式",
+                ["按整月结算", "自定义日期范围"],
+                horizontal=True,
+                key="admin_commission_mode",
+            )
+            if commission_mode == "按整月结算":
+                default_commission_month = datetime.now().date().replace(day=1)
+                commission_month_pick = st.date_input("选择结算月份", value=default_commission_month, key="admin_commission_month")
+                commission_start = commission_month_pick.replace(day=1)
+                if commission_start.month == 12:
+                    commission_next_month = commission_start.replace(year=commission_start.year + 1, month=1, day=1)
+                else:
+                    commission_next_month = commission_start.replace(month=commission_start.month + 1, day=1)
+                commission_end = commission_next_month - timedelta(days=1)
+                commission_tier_basis = None
+                commission_period_label = "当前结算月份"
             else:
-                commission_next_month = commission_month_start.replace(month=commission_month_start.month + 1, day=1)
-            commission_month_end = commission_next_month - timedelta(days=1)
+                custom_c1, custom_c2 = st.columns(2)
+                commission_start = custom_c1.date_input("开始日期", value=DEFAULT_START_DATE, key="admin_commission_custom_start")
+                commission_end = custom_c2.date_input("结束日期", value=datetime.now().date(), key="admin_commission_custom_end")
+                if commission_start > commission_end:
+                    commission_start, commission_end = commission_end, commission_start
+                commission_tier_basis = None
+                commission_period_label = "当前自定义结算期"
 
             commission_result = compute_monthly_commission(
                 sales_df=df_sales,
                 attendance_df=df_attendance,
                 staff_purchase_df=df_staff_purchase,
                 stock_df=df_stock,
-                start_date=commission_month_start,
-                end_date=commission_month_end,
+                start_date=commission_start,
+                end_date=commission_end,
                 manager_cashiers=DEFAULT_MANAGER_CASHIERS,
+                tier_basis_gross=commission_tier_basis,
             )
             commission_summary = commission_result["summary"]
             commission_employees = commission_result["employees"].copy()
+            if commission_mode == "自定义日期范围":
+                commission_tier_basis = _commission_annualized_gross(
+                    commission_summary["月总营业额"],
+                    commission_start,
+                    commission_end,
+                )
+                commission_result = compute_monthly_commission(
+                    sales_df=df_sales,
+                    attendance_df=df_attendance,
+                    staff_purchase_df=df_staff_purchase,
+                    stock_df=df_stock,
+                    start_date=commission_start,
+                    end_date=commission_end,
+                    manager_cashiers=DEFAULT_MANAGER_CASHIERS,
+                    tier_basis_gross=commission_tier_basis,
+                )
+                commission_summary = commission_result["summary"]
+                commission_employees = commission_result["employees"].copy()
 
-            st.info(f"当前结算月份：**{commission_month_start.strftime('%Y-%m-%d')} 至 {commission_month_end.strftime('%Y-%m-%d')}**。提成营业额不含换货 EXC 流水；净利润保护沿用「净利润」tab 的 GST/高岛屋抽成/成本/人工逻辑。")
+            st.info(f"{commission_period_label}：**{commission_start.strftime('%Y-%m-%d')} 至 {commission_end.strftime('%Y-%m-%d')}**。提成营业额不含换货 EXC 流水；净利润保护沿用「净利润」tab 的 GST/高岛屋抽成/成本/人工逻辑。")
 
             cm1, cm2, cm3, cm4 = st.columns(4)
-            cm1.metric("本月 POS 零售总营业额", f"${commission_summary['月总营业额']:,.2f}")
+            cm1.metric("选中期间 POS 零售总营业额", f"${commission_summary['月总营业额']:,.2f}")
             cm2.metric("当前提成档位", f"{commission_summary['当前档位比例'] * 100:.1f}%")
             cm3.metric("最终提成池", f"${commission_summary['最终提成池']:,.2f}", delta=f"理论 ${commission_summary['理论提成池']:,.2f}", delta_color="off")
             cm4.metric("提成后真实净利润", f"${commission_summary['提成后真实净利润']:,.2f}", delta=f"保护上限 ${commission_summary['利润保护上限']:,.2f}", delta_color="off")
 
-            cm5, cm6, cm7 = st.columns(3)
+            cm5, cm6, cm7, cm8 = st.columns(4)
             cm5.metric("老板/店长销售额", f"${commission_summary['老板/店长销售额']:,.2f}", help="计入店铺总营业额，但不参与员工提成分配。")
             cm6.metric("员工可分配销售额", f"${commission_summary['员工可分配销售额']:,.2f}")
-            cm7.metric("扣提成前真实净利润", f"${commission_summary['扣提成前真实净利润']:,.2f}")
+            cm7.metric("档位判断营业额", f"${commission_summary['月化档位营业额']:,.2f}", help="整月模式等于实际营业额；自定义日期模式会折算成 30 天月化营业额。")
+            cm8.metric("扣提成前真实净利润", f"${commission_summary['扣提成前真实净利润']:,.2f}")
 
             tier_df = pd.DataFrame(
                 [
@@ -2876,7 +2924,7 @@ if is_admin:
                 st.download_button(
                     "⬇️ 导出月度工资与提成 CSV",
                     export_commission.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"monthly_payroll_commission_{commission_month_start.strftime('%Y_%m')}.csv",
+                    file_name=f"payroll_commission_{commission_start.strftime('%Y%m%d')}_{commission_end.strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                     use_container_width=True,
                 )
