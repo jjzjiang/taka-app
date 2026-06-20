@@ -388,6 +388,206 @@ def compare_financial_periods(stock_df, sales_df, attendance_df, period_a, perio
         })
     return pd.DataFrame(rows)
 
+COMMISSION_TIERS = [
+    (30000, 0.006),
+    (50000, 0.012),
+    (65000, 0.015),
+    (80000, 0.018),
+    (100000, 0.022),
+    (120000, 0.025),
+]
+COMMISSION_PROFIT_CAP_RATE = 0.20
+DEFAULT_MANAGER_CASHIERS = {"店长", "店长/历史", "老板", "admin", "Admin", "Manager", "Unknown"}
+
+def _commission_num(value, default=0.0):
+    converted = pd.to_numeric(value, errors="coerce")
+    if isinstance(converted, pd.Series):
+        return converted.fillna(default)
+    return default if pd.isna(converted) else converted
+
+def _commission_dates(df, col):
+    if df.empty or col not in df.columns:
+        return pd.Series(pd.NaT, index=df.index)
+    return pd.to_datetime(df[col], errors="coerce").dt.date
+
+def _commission_norm_sales(sales_df):
+    sales = sales_df.copy()
+    if sales.empty:
+        return pd.DataFrame(columns=["订单号", "日期_dt", "收银员", "商品名称", "颜色", "销售数量", "总营业额"])
+    for col in ["订单号", "收银员", "商品名称", "颜色"]:
+        if col not in sales.columns:
+            sales[col] = ""
+        sales[col] = sales[col].fillna("").astype(str).str.strip()
+    if "日期" not in sales.columns:
+        sales["日期"] = ""
+    sales["日期_dt"] = _commission_dates(sales, "日期")
+    for col in ["销售数量", "总营业额"]:
+        if col not in sales.columns:
+            sales[col] = 0
+        sales[col] = _commission_num(sales[col])
+    return sales
+
+def _commission_rate_for_gross(gross):
+    gross = float(gross or 0)
+    rate = 0.0
+    for threshold, tier_rate in COMMISSION_TIERS:
+        if gross >= threshold:
+            rate = tier_rate
+    return rate
+
+def _commission_period_financials(stock_df, sales_df, attendance_df, start_date, end_date):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    sales = _commission_norm_sales(sales_df)
+    period_sales = sales[(sales["日期_dt"] >= start_date) & (sales["日期_dt"] <= end_date)].copy()
+    cogs = 0.0
+    if not period_sales.empty and stock_df is not None and not stock_df.empty:
+        stock = stock_df.copy()
+        for col in ["商品名称", "颜色"]:
+            if col not in stock.columns:
+                stock[col] = ""
+            stock[col] = stock[col].fillna("").astype(str).str.strip()
+        if "进价成本" not in stock.columns:
+            stock["进价成本"] = 0
+        stock["进价成本"] = _commission_num(stock["进价成本"])
+        period_sales = period_sales.merge(
+            stock[["商品名称", "颜色", "进价成本"]].drop_duplicates(["商品名称", "颜色"], keep="last"),
+            on=["商品名称", "颜色"],
+            how="left",
+        )
+        period_sales["进价成本"] = _commission_num(period_sales["进价成本"])
+        cogs = float((period_sales["销售数量"] * period_sales["进价成本"]).sum())
+
+    wage_total = 0.0
+    attendance = attendance_df.copy() if attendance_df is not None else pd.DataFrame()
+    if not attendance.empty:
+        if "日期" not in attendance.columns:
+            attendance["日期"] = ""
+        attendance["日期_dt"] = _commission_dates(attendance, "日期")
+        if "核算薪资" not in attendance.columns:
+            attendance["核算薪资"] = 0
+        attendance["核算薪资"] = _commission_num(attendance["核算薪资"])
+        period_att = attendance[(attendance["日期_dt"] >= start_date) & (attendance["日期_dt"] <= end_date)]
+        wage_total = float(period_att["核算薪资"].sum()) if not period_att.empty else 0.0
+
+    gross = float(period_sales["总营业额"].sum()) if not period_sales.empty else 0.0
+    settlement = (gross / 1.09) * 0.64 if gross else 0.0
+    return {
+        "总营业额": round(gross, 2),
+        "总进价成本": round(cogs, 2),
+        "人工成本": round(wage_total, 2),
+        "真实净利润": round(settlement - cogs - wage_total, 2),
+    }
+
+def compute_monthly_commission(
+    sales_df,
+    attendance_df,
+    staff_purchase_df,
+    stock_df,
+    start_date,
+    end_date,
+    manager_cashiers=None,
+    pre_commission_net_profit=None,
+    profit_cap_rate=COMMISSION_PROFIT_CAP_RATE,
+):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    manager_cashiers = set(manager_cashiers or DEFAULT_MANAGER_CASHIERS)
+
+    sales = _commission_norm_sales(sales_df)
+    period_sales = sales[(sales["日期_dt"] >= start_date) & (sales["日期_dt"] <= end_date)].copy()
+    retail_sales = period_sales[~period_sales["订单号"].astype(str).str.startswith("EXC-")].copy() if not period_sales.empty else period_sales
+
+    monthly_gross = float(retail_sales["总营业额"].sum()) if not retail_sales.empty else 0.0
+    manager_sales = retail_sales[retail_sales["收银员"].isin(manager_cashiers)].copy()
+    employee_sales = retail_sales[~retail_sales["收银员"].isin(manager_cashiers)].copy()
+    manager_sales_total = float(manager_sales["总营业额"].sum()) if not manager_sales.empty else 0.0
+    employee_sales_total = float(employee_sales["总营业额"].sum()) if not employee_sales.empty else 0.0
+
+    tier_rate = _commission_rate_for_gross(monthly_gross)
+    theoretical_pool = monthly_gross * tier_rate
+    if pre_commission_net_profit is None:
+        pre_commission_net_profit = _commission_period_financials(stock_df, sales_df, attendance_df, start_date, end_date)["真实净利润"]
+    profit_cap = max(0.0, float(pre_commission_net_profit or 0.0) * float(profit_cap_rate or 0.0))
+    final_pool = min(theoretical_pool, profit_cap) if profit_cap_rate is not None else theoretical_pool
+
+    sales_by_staff = pd.DataFrame(columns=["员工姓名", "个人销售额"])
+    if not employee_sales.empty:
+        sales_by_staff = employee_sales.groupby("收银员", as_index=False)["总营业额"].sum()
+        sales_by_staff = sales_by_staff.rename(columns={"收银员": "员工姓名", "总营业额": "个人销售额"})
+
+    wage_by_staff = pd.DataFrame(columns=["员工姓名", "工作时长", "基础工资"])
+    attendance = attendance_df.copy() if attendance_df is not None else pd.DataFrame()
+    if not attendance.empty:
+        if "日期" not in attendance.columns:
+            attendance["日期"] = ""
+        attendance["日期_dt"] = _commission_dates(attendance, "日期")
+        if "员工姓名" not in attendance.columns:
+            attendance["员工姓名"] = ""
+        attendance["员工姓名"] = attendance["员工姓名"].fillna("").astype(str).str.strip()
+        for col in ["工作时长", "核算薪资"]:
+            if col not in attendance.columns:
+                attendance[col] = 0
+            attendance[col] = _commission_num(attendance[col])
+        period_att = attendance[(attendance["日期_dt"] >= start_date) & (attendance["日期_dt"] <= end_date)]
+        if not period_att.empty:
+            wage_by_staff = period_att.groupby("员工姓名", as_index=False).agg({"工作时长": "sum", "核算薪资": "sum"})
+            wage_by_staff = wage_by_staff.rename(columns={"核算薪资": "基础工资"})
+
+    deduct_by_staff = pd.DataFrame(columns=["员工姓名", "内购扣款"])
+    purchases = staff_purchase_df.copy() if staff_purchase_df is not None else pd.DataFrame()
+    if not purchases.empty:
+        if "日期" not in purchases.columns:
+            purchases["日期"] = ""
+        purchases["日期_dt"] = _commission_dates(purchases, "日期")
+        if "员工姓名" not in purchases.columns:
+            purchases["员工姓名"] = ""
+        purchases["员工姓名"] = purchases["员工姓名"].fillna("").astype(str).str.strip()
+        if "扣款金额" not in purchases.columns:
+            purchases["扣款金额"] = 0
+        purchases["扣款金额"] = _commission_num(purchases["扣款金额"])
+        period_purchases = purchases[(purchases["日期_dt"] >= start_date) & (purchases["日期_dt"] <= end_date)]
+        if not period_purchases.empty:
+            deduct_by_staff = period_purchases.groupby("员工姓名", as_index=False)["扣款金额"].sum()
+            deduct_by_staff = deduct_by_staff.rename(columns={"扣款金额": "内购扣款"})
+
+    employees = pd.merge(wage_by_staff, sales_by_staff, on="员工姓名", how="outer")
+    employees = pd.merge(employees, deduct_by_staff, on="员工姓名", how="outer")
+    if employees.empty:
+        employees = pd.DataFrame(columns=["员工姓名", "工作时长", "基础工资", "个人销售额", "销售贡献占比", "Commission", "内购扣款", "最终应发"])
+    else:
+        employees["员工姓名"] = employees["员工姓名"].fillna("").astype(str).str.strip()
+        for col in ["工作时长", "基础工资", "个人销售额", "内购扣款"]:
+            if col not in employees.columns:
+                employees[col] = 0.0
+            employees[col] = pd.to_numeric(employees[col], errors="coerce").fillna(0.0)
+        employees["销售贡献占比"] = employees["个人销售额"] / employee_sales_total if employee_sales_total > 0 else 0.0
+        employees["Commission"] = employees["销售贡献占比"] * final_pool
+        employees["最终应发"] = employees["基础工资"] + employees["Commission"] - employees["内购扣款"]
+        for col in ["工作时长", "基础工资", "个人销售额", "销售贡献占比", "Commission", "内购扣款", "最终应发"]:
+            employees[col] = pd.to_numeric(employees[col], errors="coerce").fillna(0.0).round(4)
+        employees = employees[["员工姓名", "工作时长", "基础工资", "个人销售额", "销售贡献占比", "Commission", "内购扣款", "最终应发"]].sort_values(
+            ["Commission", "个人销售额", "员工姓名"], ascending=[False, False, True]
+        )
+
+    summary = {
+        "月总营业额": round(monthly_gross, 2),
+        "老板/店长销售额": round(manager_sales_total, 2),
+        "员工可分配销售额": round(employee_sales_total, 2),
+        "当前档位比例": round(tier_rate, 4),
+        "理论提成池": round(theoretical_pool, 2),
+        "扣提成前真实净利润": round(float(pre_commission_net_profit or 0.0), 2),
+        "利润保护上限": round(profit_cap, 2),
+        "最终提成池": round(final_pool, 2),
+        "提成后真实净利润": round(float(pre_commission_net_profit or 0.0) - final_pool, 2),
+    }
+    return {"summary": summary, "employees": employees.reset_index(drop=True)}
+
 # --- 1. 配置与云端数据库初始化 ---
 st.set_page_config(page_title="Taka 零售终极管理系统", layout="wide")
 
@@ -2595,6 +2795,87 @@ if is_admin:
                 )
             else:
                 st.info("当前区间暂无工资或内购扣款数据。")
+
+            st.divider()
+            st.subheader("💵 月度工资与提成结算")
+            st.caption("按月总营业额生成提成池，再按员工个人销售贡献分配；老板/店长销售计入总营业额，但不参与员工提成分配。")
+
+            default_commission_month = datetime.now().date().replace(day=1)
+            commission_month_pick = st.date_input("选择结算月份", value=default_commission_month, key="admin_commission_month")
+            commission_month_start = commission_month_pick.replace(day=1)
+            if commission_month_start.month == 12:
+                commission_next_month = commission_month_start.replace(year=commission_month_start.year + 1, month=1, day=1)
+            else:
+                commission_next_month = commission_month_start.replace(month=commission_month_start.month + 1, day=1)
+            commission_month_end = commission_next_month - timedelta(days=1)
+
+            commission_result = compute_monthly_commission(
+                sales_df=df_sales,
+                attendance_df=df_attendance,
+                staff_purchase_df=df_staff_purchase,
+                stock_df=df_stock,
+                start_date=commission_month_start,
+                end_date=commission_month_end,
+                manager_cashiers=DEFAULT_MANAGER_CASHIERS,
+            )
+            commission_summary = commission_result["summary"]
+            commission_employees = commission_result["employees"].copy()
+
+            st.info(f"当前结算月份：**{commission_month_start.strftime('%Y-%m-%d')} 至 {commission_month_end.strftime('%Y-%m-%d')}**。提成营业额不含换货 EXC 流水；净利润保护沿用「净利润」tab 的 GST/高岛屋抽成/成本/人工逻辑。")
+
+            cm1, cm2, cm3, cm4 = st.columns(4)
+            cm1.metric("本月 POS 零售总营业额", f"${commission_summary['月总营业额']:,.2f}")
+            cm2.metric("当前提成档位", f"{commission_summary['当前档位比例'] * 100:.1f}%")
+            cm3.metric("最终提成池", f"${commission_summary['最终提成池']:,.2f}", delta=f"理论 ${commission_summary['理论提成池']:,.2f}", delta_color="off")
+            cm4.metric("提成后真实净利润", f"${commission_summary['提成后真实净利润']:,.2f}", delta=f"保护上限 ${commission_summary['利润保护上限']:,.2f}", delta_color="off")
+
+            cm5, cm6, cm7 = st.columns(3)
+            cm5.metric("老板/店长销售额", f"${commission_summary['老板/店长销售额']:,.2f}", help="计入店铺总营业额，但不参与员工提成分配。")
+            cm6.metric("员工可分配销售额", f"${commission_summary['员工可分配销售额']:,.2f}")
+            cm7.metric("扣提成前真实净利润", f"${commission_summary['扣提成前真实净利润']:,.2f}")
+
+            tier_df = pd.DataFrame(
+                [
+                    {"月总营业额达到": "$30,000", "提成池比例": "0.6%"},
+                    {"月总营业额达到": "$50,000", "提成池比例": "1.2%"},
+                    {"月总营业额达到": "$65,000", "提成池比例": "1.5%"},
+                    {"月总营业额达到": "$80,000", "提成池比例": "1.8%"},
+                    {"月总营业额达到": "$100,000", "提成池比例": "2.2%"},
+                    {"月总营业额达到": "$120,000", "提成池比例": "2.5%"},
+                ]
+            )
+            with st.expander("查看提成档位表", expanded=False):
+                st.dataframe(tier_df, use_container_width=True, hide_index=True)
+                st.caption("最终提成池最多不超过扣提成前真实净利润的 20%。")
+
+            if commission_employees.empty:
+                st.info("该月份暂无员工销售、考勤或内购记录。")
+            else:
+                display_commission = commission_employees.copy()
+                display_commission["销售贡献占比"] = display_commission["销售贡献占比"] * 100
+                st.markdown("### 员工结算明细")
+                st.dataframe(
+                    display_commission.style.format({
+                        "工作时长": "{:.2f}",
+                        "基础工资": "${:.2f}",
+                        "个人销售额": "${:.2f}",
+                        "销售贡献占比": "{:.1f}%",
+                        "Commission": "${:.2f}",
+                        "内购扣款": "${:.2f}",
+                        "最终应发": "${:.2f}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                export_commission = commission_employees.copy()
+                export_commission["销售贡献占比"] = export_commission["销售贡献占比"] * 100
+                st.download_button(
+                    "⬇️ 导出月度工资与提成 CSV",
+                    export_commission.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"monthly_payroll_commission_{commission_month_start.strftime('%Y_%m')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
     with t5:
         st.subheader(f"💎 真实净利润核算 (9% GST 剥离版)")
