@@ -310,7 +310,7 @@ def compute_sku_inventory_diagnostic(stock_df, sales_df, restock_df, staff_purch
         },
     }
 
-def compute_period_inventory_reconciliation(stock_df, sales_df, restock_df, start_date, end_date, snapshot_df=None, period_key=None, period_name=None):
+def compute_period_inventory_reconciliation(stock_df, sales_df, restock_df, start_date, end_date, snapshot_df=None, period_key=None, period_name=None, staff_purchase_df=None):
     start_date = pd.to_datetime(start_date).date()
     end_date = pd.to_datetime(end_date).date()
     if start_date > end_date:
@@ -319,22 +319,31 @@ def compute_period_inventory_reconciliation(stock_df, sales_df, restock_df, star
     stock = _bi_norm_stock(stock_df)
     sales = _bi_norm_sales(sales_df)
     restock = _bi_norm_restock(restock_df)
+    purchases = _bi_norm_staff_purchases(staff_purchase_df)
     normal_sales = sales[~sales["订单号"].str.startswith("EXC-", na=False)].copy()
+    exchange_sales = sales[sales["订单号"].str.startswith("EXC-", na=False)].copy()
     inbound = restock[restock["操作类型"].isin(BI_INBOUND_OPS)].copy()
     adjustments = restock[restock["操作类型"].isin(BI_ADJUSTMENT_OPS)].copy()
+    stock_purchases = purchases[purchases["是否扣库存"].astype(str).str.strip() == "是"].copy()
 
     period_sales = normal_sales[(normal_sales["日期_dt"] >= start_date) & (normal_sales["日期_dt"] <= end_date)]
+    period_exchange = exchange_sales[(exchange_sales["日期_dt"] >= start_date) & (exchange_sales["日期_dt"] <= end_date)]
     period_inbound = inbound[(inbound["记录日期_dt"] >= start_date) & (inbound["记录日期_dt"] <= end_date)]
     period_adjustments = adjustments[(adjustments["记录日期_dt"] >= start_date) & (adjustments["记录日期_dt"] <= end_date)]
-    after_start_sales = normal_sales[normal_sales["日期_dt"] >= start_date]
-    after_start_inbound = inbound[inbound["记录日期_dt"] >= start_date]
-    after_start_adjustments = adjustments[adjustments["记录日期_dt"] >= start_date]
+    period_staff_purchases = stock_purchases[(stock_purchases["日期_dt"] >= start_date) & (stock_purchases["日期_dt"] <= end_date)]
 
-    sku_base = pd.concat([stock[BI_SKU_KEYS], normal_sales[BI_SKU_KEYS], restock[BI_SKU_KEYS]], ignore_index=True).drop_duplicates()
+    prior_sales = normal_sales[normal_sales["日期_dt"] < start_date]
+    prior_exchange = exchange_sales[exchange_sales["日期_dt"] < start_date]
+    prior_inbound = inbound[inbound["记录日期_dt"] < start_date]
+    prior_adjustments = adjustments[adjustments["记录日期_dt"] < start_date]
+    prior_staff_purchases = stock_purchases[stock_purchases["日期_dt"] < start_date]
+    inbound_until_end = inbound[inbound["记录日期_dt"] <= end_date]
+
+    sku_base = pd.concat([stock[BI_SKU_KEYS], normal_sales[BI_SKU_KEYS], exchange_sales[BI_SKU_KEYS], restock[BI_SKU_KEYS], purchases[BI_SKU_KEYS]], ignore_index=True).drop_duplicates()
     if sku_base.empty:
         return pd.DataFrame(columns=[
             "SKU", "商品名称", "颜色", "期初库存来源", "期初库存", "本期入库", "本期调整",
-            "本期可售量", "本期POS售出", "理论期末库存", "当前库存", "库存差异",
+            "本期POS售出", "本期换货净出库", "本期员工内购", "本期可售量", "理论期末库存", "当前库存", "库存差异",
             "差异解释", "售罄率", "库存年龄天数", "库存预警"
         ])
 
@@ -343,22 +352,58 @@ def compute_period_inventory_reconciliation(stock_df, sales_df, restock_df, star
         _bi_sum(period_inbound, "变动数量", "本期入库"),
         _bi_sum(period_adjustments, "变动数量", "本期调整"),
         _bi_sum(period_sales, "销售数量", "本期POS售出"),
-        _bi_sum(after_start_inbound, "变动数量", "期后入库"),
-        _bi_sum(after_start_adjustments, "变动数量", "期后调整"),
-        _bi_sum(after_start_sales, "销售数量", "期后售出"),
+        _bi_sum(period_exchange, "销售数量", "本期换货净出库"),
+        _bi_sum(period_staff_purchases, "购买数量", "本期员工内购"),
+        _bi_sum(prior_inbound, "变动数量", "期前入库"),
+        _bi_sum(prior_adjustments, "变动数量", "期前调整"),
+        _bi_sum(prior_sales, "销售数量", "期前POS售出"),
+        _bi_sum(prior_exchange, "销售数量", "期前换货净出库"),
+        _bi_sum(prior_staff_purchases, "购买数量", "期前员工内购"),
+        _bi_sum(inbound_until_end, "变动数量", "截至期末入库记录"),
     ]:
         result = result.merge(agg, on=BI_SKU_KEYS, how="left")
 
-    for col in ["当前库存", "本期入库", "本期调整", "本期POS售出", "期后入库", "期后调整", "期后售出"]:
+    numeric_cols = [
+        "当前库存", "本期入库", "本期调整", "本期POS售出", "本期换货净出库", "本期员工内购",
+        "期前入库", "期前调整", "期前POS售出", "期前换货净出库", "期前员工内购", "截至期末入库记录"
+    ]
+    for col in numeric_cols:
         result[col] = _bi_num(result[col])
 
-    historical_opening = (result["当前库存"] + result["期后售出"] - result["期后入库"] - result["期后调整"]).clip(lower=0)
+    historical_opening = (
+        result["期前入库"]
+        + result["期前调整"]
+        - result["期前POS售出"]
+        - result["期前换货净出库"]
+        - result["期前员工内购"]
+    )
     snapshots = _bi_snapshot_opening_stock(snapshot_df, period_key, period_name, start_date, end_date)
     result = result.merge(snapshots, on=BI_SKU_KEYS, how="left")
-    result["期初库存来源"] = result["快照期初库存"].apply(lambda v: "开档快照" if pd.notna(v) else "历史倒推")
-    result["期初库存"] = result["快照期初库存"].where(pd.notna(result["快照期初库存"]), historical_opening)
+    has_snapshot = pd.notna(result["快照期初库存"])
+    has_activity = (
+        (result["当前库存"] != 0)
+        | (result["本期POS售出"] != 0)
+        | (result["本期换货净出库"] != 0)
+        | (result["本期员工内购"] != 0)
+        | (result["期前POS售出"] != 0)
+        | (result["期前换货净出库"] != 0)
+        | (result["期前员工内购"] != 0)
+    )
+    missing_inbound_record = (~has_snapshot) & (result["截至期末入库记录"] <= 0) & has_activity
+    result["期初库存来源"] = "历史入库累计"
+    result.loc[has_snapshot, "期初库存来源"] = "开档快照"
+    result.loc[missing_inbound_record, "期初库存来源"] = "缺入库流水"
+    result["期初库存"] = result["快照期初库存"].where(has_snapshot, historical_opening)
+    result.loc[missing_inbound_record, "期初库存"] = 0
     result["本期可售量"] = (result["期初库存"] + result["本期入库"] + result["本期调整"]).clip(lower=0)
-    result["理论期末库存"] = (result["期初库存"] + result["本期入库"] + result["本期调整"] - result["本期POS售出"]).clip(lower=0)
+    result["理论期末库存"] = (
+        result["期初库存"]
+        + result["本期入库"]
+        + result["本期调整"]
+        - result["本期POS售出"]
+        - result["本期换货净出库"]
+        - result["本期员工内购"]
+    )
     result["库存差异"] = result["当前库存"] - result["理论期末库存"]
     result["差异解释"] = result["库存差异"].apply(_bi_difference_note)
     result["售罄率"] = result.apply(lambda r: round(float(r["本期POS售出"]) / float(r["本期可售量"]), 4) if float(r["本期可售量"]) > 0 else 0.0, axis=1)
@@ -369,11 +414,11 @@ def compute_period_inventory_reconciliation(stock_df, sales_df, restock_df, star
     result["库存预警"] = result.apply(_bi_inventory_warning, axis=1)
     result["SKU"] = result["商品名称"] + " (" + result["颜色"] + ")"
 
-    for col in ["期初库存", "本期入库", "本期调整", "本期可售量", "本期POS售出", "理论期末库存", "当前库存", "库存差异", "库存年龄天数"]:
+    for col in ["期初库存", "本期入库", "本期调整", "本期POS售出", "本期换货净出库", "本期员工内购", "本期可售量", "理论期末库存", "当前库存", "库存差异", "库存年龄天数"]:
         result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0).round(0).astype(int)
     return result[[
         "SKU", "商品名称", "颜色", "期初库存来源", "期初库存", "本期入库", "本期调整",
-        "本期可售量", "本期POS售出", "理论期末库存", "当前库存", "库存差异",
+        "本期POS售出", "本期换货净出库", "本期员工内购", "本期可售量", "理论期末库存", "当前库存", "库存差异",
         "差异解释", "售罄率", "库存年龄天数", "库存预警"
     ]].sort_values(["库存差异", "售罄率"], ascending=[True, False]).reset_index(drop=True)
 
@@ -2625,6 +2670,7 @@ if is_admin:
                 snapshot_df=df_inventory_snapshot,
                 period_key=inv_period_key,
                 period_name=inv_period_name,
+                staff_purchase_df=df_staff_purchase,
             )
 
             if recon_df.empty:
@@ -2642,10 +2688,14 @@ if is_admin:
                     rc1.metric("有差异 SKU", f"{diff_sku_count} 个")
                     rc2.metric("库存差异合计", f"{int(diff_abs)} 件")
                     rc3.metric("期初来源", source_text if source_text else "-")
+                    missing_source_count = int((recon_view['期初库存来源'].astype(str) == "缺入库流水").sum())
+                    if missing_source_count > 0:
+                        st.warning(f"有 {missing_source_count} 个 SKU 缺少截至档期末的入库/初始建档流水。系统不会再硬倒推虚高的期初库存；建议补录入库记录或为新档期锁定开档快照。")
 
                     show_recon_cols = [
                         'SKU', '期初库存来源', '库存预警', '期初库存', '本期入库', '本期调整', '本期可售量',
-                        '本期POS售出', '理论期末库存', '当前库存', '库存差异', '差异解释', '售罄率%', '库存年龄天数'
+                        '本期POS售出', '本期换货净出库', '本期员工内购', '理论期末库存',
+                        '当前库存', '库存差异', '差异解释', '售罄率%', '库存年龄天数'
                     ]
                     st.dataframe(
                         recon_view[show_recon_cols].style.format({'售罄率%': '{:.1f}%'}),
