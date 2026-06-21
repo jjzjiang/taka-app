@@ -225,6 +225,91 @@ def _bi_difference_note(diff):
         return "库存多于理论"
     return "库存一致"
 
+def _bi_norm_staff_purchases(staff_purchase_df):
+    if staff_purchase_df is None:
+        return pd.DataFrame(columns=BI_SKU_KEYS + ["日期_dt", "购买数量", "是否扣库存"])
+    purchases = staff_purchase_df.copy()
+    if purchases.empty:
+        return pd.DataFrame(columns=BI_SKU_KEYS + ["日期_dt", "购买数量", "是否扣库存"])
+    for col in BI_SKU_KEYS + ["是否扣库存"]:
+        if col not in purchases.columns:
+            purchases[col] = ""
+        purchases[col] = purchases[col].fillna("").astype(str).str.strip()
+    if "日期" not in purchases.columns:
+        purchases["日期"] = ""
+    purchases["日期_dt"] = _bi_dates(purchases, "日期")
+    if "购买数量" not in purchases.columns:
+        purchases["购买数量"] = 0
+    purchases["购买数量"] = _bi_num(purchases["购买数量"])
+    return purchases
+
+def compute_sku_inventory_diagnostic(stock_df, sales_df, restock_df, staff_purchase_df, start_date, end_date, sku_name, sku_color, opening_stock, current_stock):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    sku_name = str(sku_name).strip()
+    sku_color = str(sku_color).strip()
+
+    sales = _bi_norm_sales(sales_df)
+    restock = _bi_norm_restock(restock_df)
+    purchases = _bi_norm_staff_purchases(staff_purchase_df)
+    sku_sales = sales[
+        (sales["商品名称"].astype(str).str.strip() == sku_name)
+        & (sales["颜色"].astype(str).str.strip() == sku_color)
+        & (sales["日期_dt"] >= start_date)
+        & (sales["日期_dt"] <= end_date)
+    ].copy()
+    sku_restock = restock[
+        (restock["商品名称"].astype(str).str.strip() == sku_name)
+        & (restock["颜色"].astype(str).str.strip() == sku_color)
+        & (restock["记录日期_dt"] >= start_date)
+        & (restock["记录日期_dt"] <= end_date)
+    ].copy()
+    sku_purchases = purchases[
+        (purchases["商品名称"].astype(str).str.strip() == sku_name)
+        & (purchases["颜色"].astype(str).str.strip() == sku_color)
+        & (purchases["日期_dt"] >= start_date)
+        & (purchases["日期_dt"] <= end_date)
+    ].copy()
+
+    normal_sales = sku_sales[~sku_sales["订单号"].astype(str).str.startswith("EXC-", na=False)].copy()
+    exchange_sales = sku_sales[sku_sales["订单号"].astype(str).str.startswith("EXC-", na=False)].copy()
+    inbound = sku_restock[sku_restock["操作类型"].isin(BI_INBOUND_OPS)].copy()
+    adjustments = sku_restock[sku_restock["操作类型"].isin(BI_ADJUSTMENT_OPS)].copy()
+    stock_purchases = sku_purchases[sku_purchases["是否扣库存"].astype(str).str.strip() == "是"].copy()
+
+    normal_sold = float(normal_sales["销售数量"].sum()) if not normal_sales.empty else 0.0
+    exchange_net_out = float(exchange_sales["销售数量"].sum()) if not exchange_sales.empty else 0.0
+    inbound_qty = float(inbound["变动数量"].sum()) if not inbound.empty else 0.0
+    adjustment_qty = float(adjustments["变动数量"].sum()) if not adjustments.empty else 0.0
+    staff_purchase_qty = float(stock_purchases["购买数量"].sum()) if not stock_purchases.empty else 0.0
+    opening_stock = float(opening_stock)
+    current_stock = float(current_stock)
+    main_theory = opening_stock + inbound_qty + adjustment_qty - normal_sold
+    diagnostic_theory = main_theory - exchange_net_out - staff_purchase_qty
+    return {
+        "summary": {
+            "期初库存": round(opening_stock),
+            "本期入库": round(inbound_qty),
+            "本期盘点调整": round(adjustment_qty),
+            "POS正常售出": round(normal_sold),
+            "主公式理论库存": round(main_theory),
+            "换货净出库": round(exchange_net_out),
+            "员工内购扣库存": round(staff_purchase_qty),
+            "诊断理论库存": round(diagnostic_theory),
+            "当前库存": round(current_stock),
+            "主公式差异": round(current_stock - main_theory),
+            "诊断后差异": round(current_stock - diagnostic_theory),
+        },
+        "tables": {
+            "normal_sales": normal_sales,
+            "exchange_sales": exchange_sales,
+            "restock": sku_restock,
+            "staff_purchases": sku_purchases,
+        },
+    }
+
 def compute_period_inventory_reconciliation(stock_df, sales_df, restock_df, start_date, end_date, snapshot_df=None, period_key=None, period_name=None):
     start_date = pd.to_datetime(start_date).date()
     end_date = pd.to_datetime(end_date).date()
@@ -2574,6 +2659,55 @@ if is_admin:
                         mime="text/csv",
                         use_container_width=True,
                     )
+
+                    st.divider()
+                    st.markdown("### 🔍 单 SKU 核账诊断")
+                    st.caption("当某个 SKU 库存差异很大时，在这里逐条查看入库、POS、换货、盘点和员工内购流水。")
+                    diag_labels = recon_view['SKU'].astype(str).tolist()
+                    diag_sku_label = st.selectbox("选择要核账的 SKU", diag_labels, key="inventory_recon_sku_diagnostic")
+                    diag_row = recon_view[recon_view['SKU'].astype(str) == str(diag_sku_label)].iloc[0]
+                    diag = compute_sku_inventory_diagnostic(
+                        df_stock,
+                        df_sales,
+                        df_restock,
+                        df_staff_purchase,
+                        inv_start,
+                        inv_end,
+                        diag_row['商品名称'],
+                        diag_row['颜色'],
+                        diag_row['期初库存'],
+                        diag_row['当前库存'],
+                    )
+                    ds = diag["summary"]
+                    st.info(
+                        f"主复盘公式：期初 {ds['期初库存']} + 入库 {ds['本期入库']} + 盘点调整 {ds['本期盘点调整']} "
+                        f"- POS正常售出 {ds['POS正常售出']} = 主公式理论库存 {ds['主公式理论库存']}。"
+                    )
+                    st.warning(
+                        f"诊断追加影响：换货净出库 {ds['换货净出库']}，员工内购扣库存 {ds['员工内购扣库存']}。"
+                        f"纳入后理论库存 {ds['诊断理论库存']}，当前库存 {ds['当前库存']}，诊断后差异 {ds['诊断后差异']}。"
+                    )
+                    dm1, dm2, dm3, dm4 = st.columns(4)
+                    dm1.metric("主公式差异", f"{ds['主公式差异']} 件")
+                    dm2.metric("换货净出库", f"{ds['换货净出库']} 件")
+                    dm3.metric("员工内购扣库存", f"{ds['员工内购扣库存']} 件")
+                    dm4.metric("诊断后差异", f"{ds['诊断后差异']} 件")
+
+                    raw_tabs = st.tabs(["POS正常销售", "换货 EXC", "入库/盘点/调拨", "员工内购"])
+                    raw_specs = [
+                        ("normal_sales", raw_tabs[0], ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']),
+                        ("exchange_sales", raw_tabs[1], ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']),
+                        ("restock", raw_tabs[2], ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '备注']),
+                        ("staff_purchases", raw_tabs[3], ['内购单号', '日期', '员工姓名', '商品名称', '颜色', '购买数量', '扣款金额', '是否扣库存', '备注']),
+                    ]
+                    for table_key, tab_obj, cols in raw_specs:
+                        with tab_obj:
+                            raw_df = diag["tables"][table_key].copy()
+                            if raw_df.empty:
+                                st.info("这个区间没有相关流水。")
+                            else:
+                                show_cols = [c for c in cols if c in raw_df.columns]
+                                st.dataframe(raw_df[show_cols], use_container_width=True, hide_index=True)
         with inv_logs_tab:
             st.subheader("📜 底单流水")
             st.caption("查看所有补货、调拨、盘盈、盘亏等 ERP 底单记录。")
