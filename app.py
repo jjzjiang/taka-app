@@ -1882,10 +1882,10 @@ else:
 # ================= 🚀 公共核心组件函数化 (防丢利器) =================
 
 def render_inventory_snapshot(role_prefix):
-    st.subheader(t(f"📊 实时库存与期间动销快照", f"📊 Real-time Inventory & Sales Snapshot"))
+    st.subheader(t("📊 实时库存快照", "📊 Real-time Inventory Snapshot"))
     
     t1_start, t1_end = date_range_picker("📅 期间售出日期区间", "📅 Period Sales Date Range", key=f"inventory_range_today_{role_prefix}")
-    st.info(f"📅 此看板的【期间售出】按上方日期区间计算：**{t1_start}** 至 **{t1_end}**")
+    st.info(f"📅 这个日期只影响「期间售出」列：**{t1_start}** 至 **{t1_end}**。库存数量仍为当前实时库存。")
         
     f_stock = get_f(df_stock, q)
     if not f_stock.empty:
@@ -2322,8 +2322,13 @@ if is_admin:
             f_opts_stk['label'] = f_opts_stk['disp_name'] + " (" + f_opts_stk['disp_color'] + ")"
             stock_list_labels = f_opts_stk['label'].tolist()
             
-        st.subheader("📦 专业 ERP 库存与货位管家")
-        t1_a, t1_b, t1_c, t1_d = st.tabs(["📥 1. 补货入库 (Restock)", "🔄 2. 货位调拨 (Transfer)", "⚖️ 3. 盘点平账 (Adjust)", "📦 4. 档期库存复盘"])
+        inv_live_tab, inv_recon_tab, inv_ops_tab, inv_logs_tab = st.tabs(["📍 实时库存", "📦 档期库存复盘", "🧾 出入库/盘点操作", "📜 底单流水"])
+        with inv_live_tab:
+            render_inventory_snapshot('admin')
+
+        with inv_ops_tab:
+            st.subheader("🧾 出入库/盘点操作")
+            t1_a, t1_b, t1_c = st.tabs(["📥 补货入库 (Restock)", "🔄 货位调拨 (Transfer)", "⚖️ 盘点平账 (Adjust)"])
         
         with t1_a:
             with st.form("form_restock"):
@@ -2457,7 +2462,7 @@ if is_admin:
                         else:
                             st.error(f"⚠️ 找不到对应商品：{real_name} ({real_color})。")
 
-        with t1_d:
+        with inv_recon_tab:
             st.subheader("📦 档期库存复盘")
             st.caption("用于查一个档期从期初库存、入库、销售、盘点调整到当前库存的完整链路。旧档期自动倒推；新档期可锁定开档快照。")
 
@@ -2569,12 +2574,9 @@ if is_admin:
                         mime="text/csv",
                         use_container_width=True,
                     )
-        st.divider()
-
-        # 🔥 调用统一的库存快照引擎
-        render_inventory_snapshot('admin')
-        
-        with st.expander("📜 ERP底单：查看所有出入库/平账流水账", expanded=False):
+        with inv_logs_tab:
+            st.subheader("📜 底单流水")
+            st.caption("查看所有补货、调拨、盘盈、盘亏等 ERP 底单记录。")
             df_r_disp = get_f(df_restock, q).copy()
             df_r_disp['操作类型'] = translate_series(df_r_disp['操作类型'])
             df_r_disp['商品名称'] = translate_series(df_r_disp['商品名称'])
