@@ -1827,7 +1827,18 @@ def render_campaign_bi_center():
             daily = dashboard["daily"]
 
             st.markdown(f"### {period[0]}：{period[1]} 至 {period[2]}")
-            st.info("这个看板把「毛利」和「净利润」tab 的核心数据按已保存档期汇总。")
+            dashboard_view_mode = st.radio(
+                "看板视图",
+                ["展示视图", "内部视图"],
+                horizontal=True,
+                key="period_dashboard_view_mode",
+                help="展示视图适合给厂商/合作方看，会隐藏成本、毛利、抽成、回款和净利润。"
+            )
+            is_vendor_view = dashboard_view_mode == "展示视图"
+            if is_vendor_view:
+                st.info("展示视图仅显示对外安全的客流、销售和转化数据；成本、毛利、抽成、回款和净利润已隐藏。")
+            else:
+                st.info("内部视图把「毛利」和「净利润」tab 的核心数据按已保存档期汇总。")
 
             d1, d2, d3 = st.columns(3)
             d1.metric("有效客流", f"{summary['有效客流']} 人")
@@ -1841,36 +1852,54 @@ def render_campaign_bi_center():
             d6.metric("连带率 UPT", f"{summary['连带率']:.2f} 件/单")
 
             st.divider()
-            d7, d8, d9, d10 = st.columns(4)
-            d7.metric("具体毛利", f"${summary['具体毛利']:,.2f}")
-            d8.metric("总售出件数", f"{summary['总售出件数']} 件")
-            d9.metric("平均毛利率", f"{summary['平均毛利率%']:.1f}%")
-            d10.metric("日均营收", f"${summary['日均营收']:,.2f}")
+            if is_vendor_view:
+                d7, d8 = st.columns(2)
+                d7.metric("总售出件数", f"{summary['总售出件数']} 件")
+                d8.metric("日均营收", f"${summary['日均营收']:,.2f}")
+            else:
+                d7, d8, d9, d10 = st.columns(4)
+                d7.metric("具体毛利", f"${summary['具体毛利']:,.2f}")
+                d8.metric("总售出件数", f"{summary['总售出件数']} 件")
+                d9.metric("平均毛利率", f"{summary['平均毛利率%']:.1f}%")
+                d10.metric("日均营收", f"${summary['日均营收']:,.2f}")
 
-            st.divider()
-            d11, d12, d13, d14 = st.columns(4)
-            d11.metric("剥离 GST (9%)", f"${summary['代扣GST(9%)']:,.2f}")
-            d12.metric("商场抽成 (36%)", f"${summary['商场抽成(36%)']:,.2f}")
-            d13.metric("商场实际回款", f"${summary['商场实际回款']:,.2f}")
-            d14.metric("真实净利润", f"${summary['真实净利润']:,.2f}", delta=f"净利率 {summary['含税净利率%']:.1f}%")
+            if not is_vendor_view:
+                st.divider()
+                d11, d12, d13, d14 = st.columns(4)
+                d11.metric("剥离 GST (9%)", f"${summary['代扣GST(9%)']:,.2f}")
+                d12.metric("商场抽成 (36%)", f"${summary['商场抽成(36%)']:,.2f}")
+                d13.metric("商场实际回款", f"${summary['商场实际回款']:,.2f}")
+                d14.metric("真实净利润", f"${summary['真实净利润']:,.2f}", delta=f"净利率 {summary['含税净利率%']:.1f}%")
 
-            st.divider()
-            d15, d16 = st.columns(2)
-            d15.metric("商品进价成本", f"${summary['总进价成本']:,.2f}")
-            d16.metric("打卡人工成本", f"${summary['人工成本']:,.2f}")
+                st.divider()
+                d15, d16 = st.columns(2)
+                d15.metric("商品进价成本", f"${summary['总进价成本']:,.2f}")
+                d16.metric("打卡人工成本", f"${summary['人工成本']:,.2f}")
 
             if not daily.empty:
-                chart_df = daily.set_index("日期")[["总营业额", "具体毛利", "真实净利润"]].sort_index()
-                st.markdown("### 每日营收 / 毛利 / 净利润走势")
-                st.bar_chart(chart_df, use_container_width=True)
-                st.markdown("### 每日明细")
-                st.dataframe(
-                    daily.style.format({
+                if is_vendor_view:
+                    vendor_safe_daily_cols = ["总营业额", "销售数量"]
+                    chart_df = daily.set_index("日期")[vendor_safe_daily_cols].sort_index()
+                    st.markdown("### 每日营收 / 售出件数走势")
+                    daily_display = daily[["日期"] + vendor_safe_daily_cols].copy()
+                    format_dict = {
+                        "总营业额": "${:.2f}",
+                        "销售数量": "{:.0f}",
+                    }
+                else:
+                    chart_df = daily.set_index("日期")[["总营业额", "具体毛利", "真实净利润"]].sort_index()
+                    st.markdown("### 每日营收 / 毛利 / 净利润走势")
+                    daily_display = daily.copy()
+                    format_dict = {
                         "总营业额": "${:.2f}",
                         "具体毛利": "${:.2f}",
                         "真实净利润": "${:.2f}",
                         "销售数量": "{:.0f}",
-                    }),
+                    }
+                st.bar_chart(chart_df, use_container_width=True)
+                st.markdown("### 每日明细")
+                st.dataframe(
+                    daily_display.style.format(format_dict),
                     use_container_width=True,
                     hide_index=True,
                 )
