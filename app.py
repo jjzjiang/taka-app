@@ -2042,16 +2042,20 @@ else:
 
 def render_inventory_snapshot(role_prefix):
     st.subheader(t("📊 实时库存快照", "📊 Real-time Inventory Snapshot"))
-    
-    t1_start, t1_end = date_range_picker("📅 期间售出日期区间", "📅 Period Sales Date Range", key=f"inventory_range_today_{role_prefix}")
-    st.info(f"📅 这个日期只影响「期间售出」列：**{t1_start}** 至 **{t1_end}**。库存数量仍为当前实时库存。")
+
+    if role_prefix == 'supplier':
+        st.info(t("此页面只显示当前实时库存，不含价格、成本或期间售出统计。", "This page only shows live inventory, without prices, costs, or period-sales metrics."))
+        t1_start, t1_end = None, None
+    else:
+        t1_start, t1_end = date_range_picker("📅 期间售出日期区间", "📅 Period Sales Date Range", key=f"inventory_range_today_{role_prefix}")
+        st.info(f"📅 这个日期只影响「期间售出」列：**{t1_start}** 至 **{t1_end}**。库存数量仍为当前实时库存。")
         
     f_stock = get_f(df_stock, q)
     if not f_stock.empty:
         v_df = f_stock.copy()
         
         period_sales = pd.DataFrame()
-        if not df_sales.empty:
+        if role_prefix != 'supplier' and not df_sales.empty:
             df_s_t1 = df_sales.copy()
             df_s_t1['日期_dt'] = pd.to_datetime(df_s_t1['日期'], errors='coerce')
             f_s_t1 = df_s_t1[(df_s_t1['日期_dt'] >= pd.Timestamp(t1_start)) & (df_s_t1['日期_dt'] <= pd.Timestamp(t1_end))]
@@ -2089,11 +2093,15 @@ def render_inventory_snapshot(role_prefix):
         v_df['颜色'] = translate_series(v_df['颜色'])
         
         if role_prefix in ['supplier', 'employee']:
-            display_cols = ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格'] if role_prefix == 'supplier' else ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '售卖价格']
+            supplier_inventory_cols = ['商品名称', '颜色', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量']
+            display_cols = supplier_inventory_cols if role_prefix == 'supplier' else ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '售卖价格']
             df_disp = v_df[display_cols].copy()
             if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
-            p_col = 'Price' if st.session_state.lang == 'en' else '售卖价格'
-            st.dataframe(df_disp.style.format({p_col: '${:.2f}'}), use_container_width=True, hide_index=True)
+            if role_prefix == 'supplier':
+                st.dataframe(df_disp, use_container_width=True, hide_index=True)
+            else:
+                p_col = 'Price' if st.session_state.lang == 'en' else '售卖价格'
+                st.dataframe(df_disp.style.format({p_col: '${:.2f}'}), use_container_width=True, hide_index=True)
             
         elif role_prefix == 'admin':
             display_cols = ['选择', '商品名称', '颜色', '期间售出', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '单品毛利率']
@@ -4054,7 +4062,7 @@ elif is_supplier:
         render_inventory_snapshot('supplier')
         
     with t2:
-        st.subheader(t("💰 销售报表对账查询", "💰 Sales Report Reconciliation"))
+        st.subheader(t("🧾 销售产品对账查询", "🧾 Sold Items Reconciliation"))
         if not df_sales.empty:
             df_s = df_sales.copy()
             df_s['日期_dt'] = pd.to_datetime(df_s['日期'], errors='coerce')
@@ -4066,21 +4074,23 @@ elif is_supplier:
                 f_s = get_f(f_s, q)
                 if not f_s.empty:
                     f_s['销售数量'] = pd.to_numeric(f_s['销售数量'], errors='coerce').fillna(0)
-                    f_s['总营业额'] = pd.to_numeric(f_s['总营业额'], errors='coerce').fillna(0.0)
-                    tot_qty, tot_rev = f_s['销售数量'].sum(), f_s['总营业额'].sum()
+                    tot_qty = f_s['销售数量'].sum()
                     
-                    c1, c2 = st.columns(2)
-                    c1.metric(t("📦 区间总售出件数", "📦 Total Items Sold"), f"{int(tot_qty)}")
-                    c2.metric(t("💰 区间总含税营业额", "💰 Total Sales Amount"), f"${tot_rev:.2f}")
+                    st.metric(t("📦 区间总售出件数", "📦 Total Items Sold"), f"{int(tot_qty)}")
                     
                     f_s['商品名称'] = translate_series(f_s['商品名称'])
                     f_s['颜色'] = translate_series(f_s['颜色'])
+                    supplier_sales_cols = ['日期', '商品名称', '颜色', '销售数量']
+                    supplier_sales = (
+                        f_s[supplier_sales_cols]
+                        .groupby(['日期', '商品名称', '颜色'], as_index=False)['销售数量']
+                        .sum()
+                        .sort_values('日期', ascending=False)
+                    )
                     
-                    show_cols = ['订单号', '日期', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
-                    df_disp = f_s[show_cols].copy()
+                    df_disp = supplier_sales.copy()
                     if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
-                    u_col, t_col = ('Unit Price', 'Total Amount') if st.session_state.lang == 'en' else ('成交单价', '总营业额')
-                    st.dataframe(df_disp.style.format({u_col: '${:.2f}', t_col: '${:.2f}'}), use_container_width=True, hide_index=True)
+                    st.dataframe(df_disp, use_container_width=True, hide_index=True)
                 else: st.info(t("该区间内无符合条件的记录。", "No records found in this range."))
     
     with t3:
