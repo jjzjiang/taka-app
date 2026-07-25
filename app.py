@@ -633,6 +633,44 @@ def compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, star
     summary.update(financials)
     return {"summary": summary, "daily": financial_daily}
 
+def _period_timeline_frame(daily_df, start_date, end_date, label):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    metrics = ["总营业额", "销售数量", "具体毛利", "真实净利润"]
+    base = pd.DataFrame({"日期_dt": pd.date_range(start_date, end_date, freq="D")})
+    daily = daily_df.copy()
+    if daily.empty:
+        daily = pd.DataFrame(columns=["日期"] + metrics)
+    for col in metrics:
+        if col not in daily.columns:
+            daily[col] = 0.0
+        daily[col] = _bi_num(daily[col])
+    if "日期" not in daily.columns:
+        daily["日期"] = ""
+    daily["日期_dt"] = pd.to_datetime(daily["日期"], errors="coerce")
+    daily = daily.dropna(subset=["日期_dt"])
+    if not daily.empty:
+        daily = daily.groupby("日期_dt", as_index=False)[metrics].sum()
+    timeline = base.merge(daily, on="日期_dt", how="left")
+    for col in metrics:
+        timeline[col] = _bi_num(timeline[col])
+        timeline[f"累计{col}"] = timeline[col].cumsum()
+    timeline["日期"] = timeline["日期_dt"].dt.strftime("%Y/%m/%d")
+    timeline["档期第N天"] = range(1, len(timeline) + 1)
+    timeline["档期"] = label
+    return timeline[["档期", "档期第N天", "日期"] + metrics + [f"累计{col}" for col in metrics]]
+
+def build_period_timeline_comparison(stock_df, sales_df, attendance_df, traffic_df, period_a, period_b):
+    name_a, start_a, end_a = period_a
+    name_b, start_b, end_b = period_b
+    dashboard_a = compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, start_a, end_a)
+    dashboard_b = compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, start_b, end_b)
+    timeline_a = _period_timeline_frame(dashboard_a["daily"], start_a, end_a, f"A {name_a}")
+    timeline_b = _period_timeline_frame(dashboard_b["daily"], start_b, end_b, f"B {name_b}")
+    return pd.concat([timeline_a, timeline_b], ignore_index=True)
+
 def _period_change_rate(after, before):
     after = float(after)
     before = float(before)
@@ -1910,13 +1948,43 @@ def render_campaign_bi_center():
 
     with mode_tab3:
         campaigns = _campaign_options()
+        compare_mode_options = []
         if len(campaigns) >= 2:
+            compare_mode_options.append("选择已保存档期")
+        compare_mode_options.append("临时日期范围")
+        compare_mode = st.radio(
+            "选择对比来源",
+            compare_mode_options,
+            horizontal=True,
+            key="period_compare_mode",
+        )
+        if compare_mode == "选择已保存档期":
             c1, c2 = st.columns(2)
             labels = list(campaigns.keys())
             label_a = c1.selectbox("档期 A", labels, index=0, key="compare_period_a")
             label_b = c2.selectbox("档期 B", labels, index=1 if len(labels) > 1 else 0, key="compare_period_b")
             period_a = campaigns[label_a]
             period_b = campaigns[label_b]
+        else:
+            st.caption("临时日期范围适合还没保存成档期的 popup 片段，折线图同样会按「档期第N天」对齐。")
+            today = datetime.now().date()
+            default_a_start = today - timedelta(days=13)
+            default_a_end = today - timedelta(days=7)
+            default_b_start = today - timedelta(days=6)
+            default_b_end = today
+            ca1, ca2, cb1, cb2 = st.columns(4)
+            custom_a_start = ca1.date_input("A 开始日期", value=default_a_start, key="period_compare_custom_a_start")
+            custom_a_end = ca2.date_input("A 结束日期", value=default_a_end, key="period_compare_custom_a_end")
+            custom_b_start = cb1.date_input("B 开始日期", value=default_b_start, key="period_compare_custom_b_start")
+            custom_b_end = cb2.date_input("B 结束日期", value=default_b_end, key="period_compare_custom_b_end")
+            if custom_a_start > custom_a_end:
+                custom_a_start, custom_a_end = custom_a_end, custom_a_start
+            if custom_b_start > custom_b_end:
+                custom_b_start, custom_b_end = custom_b_end, custom_b_start
+            period_a = (f"临时A {custom_a_start} 至 {custom_a_end}", custom_a_start, custom_a_end)
+            period_b = (f"临时B {custom_b_start} 至 {custom_b_end}", custom_b_start, custom_b_end)
+
+        if period_a and period_b:
             compared = compare_periods(df_stock, df_sales, df_restock, period_a, period_b)
             if not compared.empty:
                 compared = get_f(compared, q).copy()
@@ -1933,6 +2001,82 @@ def render_campaign_bi_center():
                 c_top1.metric("售出变化合计", f"{int(pd.to_numeric(compared['售出变化'], errors='coerce').fillna(0).sum())} 件")
                 c_top2.metric("销售额变化合计", f"${pd.to_numeric(compared['销售额变化'], errors='coerce').fillna(0).sum():.2f}")
                 c_top3.metric("毛利变化合计", f"${pd.to_numeric(compared['毛利贡献变化'], errors='coerce').fillna(0).sum():.2f}")
+
+                st.markdown("### 档期时间轴可视化")
+                st.caption("折线图按「档期第N天」对齐；日期不同也可以直接比较两期的起势、后劲和累计表现。")
+                timeline = build_period_timeline_comparison(df_stock, df_sales, df_attendance, df_traffic, period_a, period_b)
+                metric_map = {
+                    "销售额": "总营业额",
+                    "售出件数": "销售数量",
+                    "毛利贡献": "具体毛利",
+                }
+                vc1, vc2 = st.columns([1.2, 1])
+                visual_metric_label = vc1.radio(
+                    "选择走势指标",
+                    list(metric_map.keys()),
+                    horizontal=True,
+                    key="period_compare_visual_metric",
+                )
+                visual_mode = vc2.radio(
+                    "选择走势口径",
+                    ["累计走势", "每日走势"],
+                    horizontal=True,
+                    key="period_compare_visual_mode",
+                )
+                metric_col = metric_map[visual_metric_label]
+                y_col = f"累计{metric_col}" if visual_mode == "累计走势" else metric_col
+                if not timeline.empty:
+                    line_fig = px.line(
+                        timeline,
+                        x="档期第N天",
+                        y=y_col,
+                        color="档期",
+                        markers=True,
+                        hover_data={"日期": True, "档期第N天": True, y_col: ":.2f"},
+                        title=f"{visual_metric_label} {visual_mode}",
+                    )
+                    line_fig.update_layout(
+                        height=360,
+                        margin=dict(l=10, r=10, t=50, b=10),
+                        legend_title_text="档期",
+                        xaxis_title="档期第N天",
+                        yaxis_title=visual_metric_label,
+                    )
+                    st.plotly_chart(line_fig, use_container_width=True)
+
+                st.markdown("### SKU变化 Top 10")
+                sku_metric = st.radio(
+                    "选择 SKU 变化指标",
+                    ["销售额变化", "售出变化", "毛利贡献变化", "售罄率变化%"],
+                    horizontal=True,
+                    key="period_compare_sku_change_metric",
+                )
+                sku_change_df = compared[["SKU", sku_metric]].copy()
+                sku_change_df[sku_metric] = pd.to_numeric(sku_change_df[sku_metric], errors="coerce").fillna(0)
+                sku_change_df["变化绝对值"] = sku_change_df[sku_metric].abs()
+                sku_change_df = sku_change_df[sku_change_df["变化绝对值"] > 0].sort_values("变化绝对值", ascending=False).head(10)
+                if not sku_change_df.empty:
+                    sku_change_df = sku_change_df.sort_values(sku_metric, ascending=True)
+                    bar_fig = px.bar(
+                        sku_change_df,
+                        x=sku_metric,
+                        y="SKU",
+                        orientation="h",
+                        color=sku_metric,
+                        color_continuous_scale=["#d64545", "#f2f2f2", "#238b45"],
+                        title=f"{sku_metric} Top 10",
+                    )
+                    bar_fig.update_layout(
+                        height=360,
+                        margin=dict(l=10, r=10, t=50, b=10),
+                        coloraxis_showscale=False,
+                        xaxis_title=sku_metric,
+                        yaxis_title="",
+                    )
+                    st.plotly_chart(bar_fig, use_container_width=True)
+                else:
+                    st.info("两个档期的 SKU 指标暂无明显变化。")
+
                 st.dataframe(
                     compared[show_cols].style.format({
                         'A_售罄率%': '{:.1f}%',
@@ -1957,8 +2101,6 @@ def render_campaign_bi_center():
                 )
             else:
                 st.info("两个档期没有可比较的 SKU 数据。")
-        else:
-            st.info("请先至少保存 2 个档期，再使用双档期对比。")
 
     with mode_tab4:
         campaigns = _campaign_options()
@@ -3150,7 +3292,16 @@ if is_admin:
                         st.session_state.emp_reset_key += 1
                         st.rerun()
 
-        f_employee = get_f(df_employee, q) 
+        emp_status_filter = st.radio(
+            "人员显示范围",
+            ["在职", "离职", "全部"],
+            horizontal=True,
+            key="emp_status_filter",
+            help="移除人员会设为离职并隐藏在默认列表中，不会删除历史销售、考勤或工资记录。",
+        )
+        f_employee = get_f(df_employee, q)
+        if not f_employee.empty and emp_status_filter != "全部":
+            f_employee = f_employee[f_employee['状态'].fillna('').astype(str).str.strip() == emp_status_filter]
         if not f_employee.empty:
             v_emp = f_employee.copy()
             v_emp.insert(0, "选择", False)
@@ -3199,15 +3350,30 @@ if is_admin:
             
             selected_emp = edited_emp[edited_emp["选择"] == True]
             if not selected_emp.empty:
-                col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
+                col_btn1, col_btn2, _ = st.columns([1.8, 1.5, 4])
                 with col_btn1:
-                    if st.button("🗑️ 彻底删除人员 (不建议)", type="primary", key="del_emp"):
+                    if st.button("🚪 移除选中人员（设为离职）", type="primary", key="deactivate_emp"):
                         fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
-                        for _, row in selected_emp.iterrows():
-                            fresh_emp = fresh_emp[fresh_emp['员工姓名'].astype(str).str.strip() != str(row['员工姓名']).strip()]
+                        selected_names = selected_emp['员工姓名'].fillna('').astype(str).str.strip().tolist()
+                        remove_mask = fresh_emp['员工姓名'].fillna('').astype(str).str.strip().isin(selected_names)
+                        fresh_emp.loc[remove_mask, '状态'] = '离职'
+                        fresh_emp.loc[remove_mask, '登录密码'] = ''
                         save_data(fresh_emp, EMP_SHEET)
-                        st.session_state.emp_reset_key += 1; st.rerun()
+                        st.success(f"✅ 已移除 {int(remove_mask.sum())} 人：设为离职并清空登录密码。")
+                        st.session_state.emp_reset_key += 1
+                        st.rerun()
                 with col_btn2: st.button("🔄 取消所有选中", key="btn_cancel_emp", on_click=clear_emp)
+                with st.expander("危险操作：彻底删除人员记录", expanded=False):
+                    st.warning("彻底删除会移除人员档案本身；历史销售/考勤里的名字仍会保留，但不建议日常使用。")
+                    if st.button("🗑️ 彻底删除选中人员", key="hard_delete_emp"):
+                        fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
+                        selected_names = selected_emp['员工姓名'].fillna('').astype(str).str.strip().tolist()
+                        fresh_emp = fresh_emp[~fresh_emp['员工姓名'].fillna('').astype(str).str.strip().isin(selected_names)]
+                        save_data(fresh_emp, EMP_SHEET)
+                        st.session_state.emp_reset_key += 1
+                        st.rerun()
+        else:
+            st.info("当前筛选范围内暂无人员。")
 
         st.divider()
         st.subheader("⏰ 排班与打卡记录")
