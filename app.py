@@ -3840,7 +3840,16 @@ if is_admin:
                 st.divider()
                 st.markdown("### 📈 每日营收 vs 净利润趋势")
                 chart_data_t5 = daily_np.set_index('日期_str')[['总营业额', '真实净利润']].sort_index(ascending=True)
-                st.bar_chart(chart_data_t5, use_container_width=True)
+                net_profit_chart_mode = st.radio(
+                    "图表显示方式",
+                    ["柱状图", "折线图", "柱状图 + 折线图"],
+                    horizontal=True,
+                    key="net_profit_chart_mode",
+                )
+                if net_profit_chart_mode in ["柱状图", "柱状图 + 折线图"]:
+                    st.bar_chart(chart_data_t5, use_container_width=True)
+                if net_profit_chart_mode in ["折线图", "柱状图 + 折线图"]:
+                    st.line_chart(chart_data_t5, use_container_width=True)
 
                 st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
                 dl_c3, dl_c4 = st.columns([1.5, 4])
