@@ -550,6 +550,702 @@ def compute_period_financials(stock_df, sales_df, attendance_df, start_date, end
         "含税净利率%": round(net_margin, 2),
     }
 
+
+def _daily_financial_values(gross, cogs, wage):
+    gross = float(gross or 0.0)
+    cogs = float(cogs or 0.0)
+    wage = float(wage or 0.0)
+    net_revenue = gross / 1.09
+    settlement = net_revenue * 0.64
+    return {
+        "营业额": round(gross, 2),
+        "商场实际回款": round(settlement, 2),
+        "商品成本": round(cogs, 2),
+        "人工成本": round(wage, 2),
+        "净利润": round(settlement - cogs - wage, 2),
+    }
+
+
+def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_date):
+    target_date = pd.to_datetime(target_date).date()
+    detail_columns = [
+        "商品名称",
+        "颜色",
+        "销售数量",
+        "实际成交单价",
+        "当前商品原价",
+        "折扣率%",
+        "单件成本",
+        "实际单件净贡献",
+        "原价单件净贡献",
+        "利润损失",
+        "状态",
+    ]
+
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for col in BI_SKU_KEYS:
+        if col not in stock.columns:
+            stock[col] = ""
+        stock[col] = stock[col].fillna("").astype(str).str.strip()
+    for col in ["进价成本", "售卖价格"]:
+        if col not in stock.columns:
+            stock[col] = pd.NA
+    stock_cost = pd.to_numeric(stock["进价成本"], errors="coerce")
+    stock_price = pd.to_numeric(stock["售卖价格"], errors="coerce")
+    stock["成本缺失"] = stock_cost.isna() | stock_cost.le(0)
+    stock["原价缺失"] = stock_price.isna() | stock_price.le(0)
+    stock["进价成本"] = stock_cost.where(stock_cost.gt(0), 0.0).fillna(0.0)
+    stock["售卖价格"] = stock_price.where(stock_price.gt(0), 0.0).fillna(0.0)
+    stock = stock.drop_duplicates(subset=BI_SKU_KEYS, keep="last")
+
+    sales = sales_df.copy() if sales_df is not None else pd.DataFrame()
+    for col in BI_SKU_KEYS:
+        if col not in sales.columns:
+            sales[col] = ""
+        sales[col] = sales[col].fillna("").astype(str).str.strip()
+    if "日期" not in sales.columns:
+        sales["日期"] = ""
+    sales["日期_dt"] = _bi_dates(sales, "日期")
+    for col in ["销售数量", "成交单价", "总营业额"]:
+        if col not in sales.columns:
+            sales[col] = 0
+        sales[col] = _bi_num(sales[col])
+    day_sales = sales[sales["日期_dt"] == target_date].copy()
+
+    attendance = attendance_df.copy() if attendance_df is not None else pd.DataFrame()
+    if "日期" not in attendance.columns:
+        attendance["日期"] = ""
+    attendance["日期_dt"] = _bi_dates(attendance, "日期")
+    if "核算薪资" not in attendance.columns:
+        attendance["核算薪资"] = 0
+    attendance["核算薪资"] = _bi_num(attendance["核算薪资"])
+    day_attendance = attendance[attendance["日期_dt"] == target_date]
+    wage = float(day_attendance["核算薪资"].sum()) if not day_attendance.empty else 0.0
+
+    if day_sales.empty:
+        actual = _daily_financial_values(0.0, 0.0, wage)
+        return {
+            "summary": {
+                "实际营业额": actual["营业额"],
+                "原价模拟营业额": actual["营业额"],
+                "商场实际回款": actual["商场实际回款"],
+                "原价模拟回款": actual["商场实际回款"],
+                "商品成本": actual["商品成本"],
+                "人工成本": actual["人工成本"],
+                "实际净利润": actual["净利润"],
+                "原价模拟净利润": actual["净利润"],
+                "折扣减少营业额": 0.0,
+                "折扣减少净利润": 0.0,
+            },
+            "sku_detail": pd.DataFrame(columns=detail_columns),
+            "warnings": [],
+            "has_data": not day_attendance.empty,
+        }
+
+    stock_columns = BI_SKU_KEYS + ["进价成本", "售卖价格", "成本缺失", "原价缺失"]
+    day_sales = day_sales.merge(stock[stock_columns], on=BI_SKU_KEYS, how="left")
+    day_sales["成本缺失"] = (
+        day_sales["成本缺失"].isna() | day_sales["成本缺失"].eq(True)
+    )
+    day_sales["原价缺失"] = (
+        day_sales["原价缺失"].isna() | day_sales["原价缺失"].eq(True)
+    )
+    day_sales["进价成本"] = _bi_num(day_sales["进价成本"])
+    day_sales["售卖价格"] = _bi_num(day_sales["售卖价格"])
+
+    day_sales["实际成交单价"] = day_sales["成交单价"]
+    nonzero_quantity = day_sales["销售数量"] != 0
+    day_sales.loc[nonzero_quantity, "实际成交单价"] = (
+        day_sales.loc[nonzero_quantity, "总营业额"]
+        / day_sales.loc[nonzero_quantity, "销售数量"]
+    )
+    positive_quantity = day_sales["销售数量"] > 0
+    day_sales["成交高于档案价"] = (
+        positive_quantity
+        & ~day_sales["原价缺失"]
+        & (day_sales["实际成交单价"] > day_sales["售卖价格"])
+    )
+    day_sales["模拟单价"] = day_sales["实际成交单价"]
+    repriced = positive_quantity & ~day_sales["原价缺失"]
+    day_sales.loc[repriced, "模拟单价"] = day_sales.loc[
+        repriced, ["售卖价格", "实际成交单价"]
+    ].max(axis=1)
+    day_sales["总进价成本"] = day_sales["销售数量"] * day_sales["进价成本"]
+    day_sales["原价模拟营业额"] = day_sales["总营业额"]
+    day_sales.loc[positive_quantity, "原价模拟营业额"] = (
+        day_sales.loc[positive_quantity, "销售数量"]
+        * day_sales.loc[positive_quantity, "模拟单价"]
+    )
+
+    actual_gross = float(day_sales["总营业额"].sum())
+    simulated_gross = float(day_sales["原价模拟营业额"].sum())
+    discount_gross = max(simulated_gross - actual_gross, 0.0)
+    simulated_gross = actual_gross + discount_gross
+    cogs = float(day_sales["总进价成本"].sum())
+    actual = _daily_financial_values(actual_gross, cogs, wage)
+    simulated = _daily_financial_values(simulated_gross, cogs, wage)
+
+    grouped = day_sales.groupby(BI_SKU_KEYS, as_index=False).agg(
+        {
+            "销售数量": "sum",
+            "总营业额": "sum",
+            "原价模拟营业额": "sum",
+            "进价成本": "last",
+            "售卖价格": "last",
+            "成本缺失": "max",
+            "原价缺失": "max",
+            "成交高于档案价": "max",
+        }
+    )
+    grouped["实际成交单价"] = grouped["总营业额"] / grouped["销售数量"].replace(0, pd.NA)
+    zero_quantity = grouped["销售数量"] == 0
+    grouped.loc[zero_quantity, "实际成交单价"] = 0.0
+    grouped["模拟单价"] = (
+        grouped["原价模拟营业额"] / grouped["销售数量"].replace(0, pd.NA)
+    )
+    grouped.loc[zero_quantity, "模拟单价"] = 0.0
+    grouped["模拟单价"] = grouped[["模拟单价", "实际成交单价"]].max(axis=1)
+    grouped["折扣率%"] = (
+        grouped["实际成交单价"] / grouped["售卖价格"].replace(0, pd.NA) * 100
+    )
+    grouped["折扣率%"] = pd.to_numeric(grouped["折扣率%"], errors="coerce").fillna(100.0)
+    grouped["实际单件净贡献"] = (
+        grouped["实际成交单价"] / 1.09 * 0.64 - grouped["进价成本"]
+    )
+    grouped["原价单件净贡献"] = (
+        grouped["模拟单价"] / 1.09 * 0.64 - grouped["进价成本"]
+    )
+    nonpositive_quantity = grouped["销售数量"] <= 0
+    grouped.loc[
+        nonpositive_quantity,
+        ["实际单件净贡献", "原价单件净贡献"],
+    ] = 0.0
+    grouped["利润损失"] = (
+        grouped["原价模拟营业额"] - grouped["总营业额"]
+    ).clip(lower=0) * 0.64 / 1.09
+
+    def status_for(row):
+        if row["成本缺失"] or row["原价缺失"]:
+            return "资料不完整"
+        if row["销售数量"] <= 0:
+            return "退款/数量冲抵"
+        if row["实际单件净贡献"] < 0:
+            return "亏损销售"
+        if row["成交高于档案价"]:
+            return "成交价高于当前档案价"
+        if row["折扣率%"] < 80:
+            return "深度折扣"
+        if row["折扣率%"] < 95:
+            return "轻度折扣"
+        return "接近原价"
+
+    grouped["状态"] = grouped.apply(status_for, axis=1)
+    detail = grouped.rename(
+        columns={"售卖价格": "当前商品原价", "进价成本": "单件成本"}
+    )[detail_columns]
+    detail = detail.round(
+        {
+            "实际成交单价": 2,
+            "当前商品原价": 2,
+            "折扣率%": 1,
+            "单件成本": 2,
+            "实际单件净贡献": 2,
+            "原价单件净贡献": 2,
+            "利润损失": 2,
+        }
+    )
+
+    warnings = []
+    if bool(day_sales["原价缺失"].any()):
+        warnings.append("部分 SKU 缺少当前原价，相关行按实际成交价保守模拟。")
+    if bool(day_sales["成本缺失"].any()):
+        warnings.append("部分 SKU 缺少进价成本，已按 0 计算，当前净利润可能偏高。")
+    if bool(day_sales["成交高于档案价"].any()):
+        warnings.append("部分成交价高于当前档案价，相关折扣损失按 0 处理。")
+
+    return {
+        "summary": {
+            "实际营业额": actual["营业额"],
+            "原价模拟营业额": simulated["营业额"],
+            "商场实际回款": actual["商场实际回款"],
+            "原价模拟回款": simulated["商场实际回款"],
+            "商品成本": actual["商品成本"],
+            "人工成本": actual["人工成本"],
+            "实际净利润": actual["净利润"],
+            "原价模拟净利润": simulated["净利润"],
+            "折扣减少营业额": round(discount_gross, 2),
+            "折扣减少净利润": round(discount_gross * 0.64 / 1.09, 2),
+        },
+        "sku_detail": detail,
+        "warnings": warnings,
+        "has_data": True,
+    }
+
+
+def allocate_category_wages(revenue_by_system, total_wage):
+    revenues = {}
+    for key, value in (revenue_by_system or {}).items():
+        numeric = _bi_num(value)
+        revenues[str(key)] = max(float(numeric), 0.0)
+
+    wage = max(float(_bi_num(total_wage)), 0.0)
+    wage_cents = int(round(wage * 100))
+    total_revenue = sum(revenues.values())
+    if total_revenue <= 0 or wage_cents <= 0:
+        return {key: 0.0 for key in revenues}
+
+    raw_cents = {
+        key: wage_cents * revenue / total_revenue
+        for key, revenue in revenues.items()
+    }
+    allocated_cents = {
+        key: int(value)
+        for key, value in raw_cents.items()
+    }
+    remaining_cents = wage_cents - sum(allocated_cents.values())
+    remainder_order = sorted(
+        revenues,
+        key=lambda key: (
+            raw_cents[key] - allocated_cents[key],
+            revenues[key],
+        ),
+        reverse=True,
+    )
+    for index in range(remaining_cents):
+        allocated_cents[remainder_order[index % len(remainder_order)]] += 1
+
+    return {
+        key: round(cents / 100, 2)
+        for key, cents in allocated_cents.items()
+    }
+
+
+def _staff_identity(value):
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip().casefold()
+
+
+def build_daily_close_summary(
+    stock_df,
+    sales_df,
+    attendance_df,
+    restock_df,
+    report_date,
+    allocated_wage=None,
+):
+    report_date = pd.to_datetime(report_date).date()
+
+    sales = sales_df.copy() if sales_df is not None else pd.DataFrame()
+    for col in ["订单号", "收银员", "商品名称", "颜色"]:
+        if col not in sales.columns:
+            sales[col] = ""
+        sales[col] = sales[col].fillna("").astype(str).str.strip()
+    if "日期" not in sales.columns:
+        sales["日期"] = ""
+    sales["日期_dt"] = _bi_dates(sales, "日期")
+    for col in ["销售数量", "成交单价", "总营业额"]:
+        if col not in sales.columns:
+            sales[col] = 0
+        sales[col] = _bi_num(sales[col])
+    sales["收银员键"] = sales["收银员"].map(_staff_identity)
+
+    date_sales = sales[sales["日期_dt"] == report_date].copy()
+    exchange_rows = date_sales[
+        date_sales["订单号"].str.startswith("EXC-", na=False)
+    ].copy()
+    excluded_order = date_sales["订单号"].str.startswith(
+        ("EXC-", "EMPBUY-"),
+        na=False,
+    )
+    pos_sales = date_sales[~excluded_order].copy()
+    positive_sales = pos_sales[pos_sales["销售数量"] > 0].copy()
+    refund_rows = pos_sales[pos_sales["销售数量"] < 0].copy()
+
+    attendance = (
+        attendance_df.copy()
+        if attendance_df is not None
+        else pd.DataFrame()
+    )
+    attendance_business_columns = [
+        "员工姓名",
+        "日期",
+        "开始时间",
+        "结束时间",
+        "工作时长",
+        "核算薪资",
+    ]
+    for col in ["员工姓名", "日期", "开始时间", "结束时间"]:
+        if col not in attendance.columns:
+            attendance[col] = ""
+        attendance[col] = attendance[col].fillna("").astype(str).str.strip()
+    for col in ["工作时长", "核算薪资"]:
+        if col not in attendance.columns:
+            attendance[col] = 0
+        attendance[col] = _bi_num(attendance[col])
+    attendance["日期_dt"] = _bi_dates(attendance, "日期")
+    duplicate_attendance = attendance.duplicated(
+        subset=attendance_business_columns,
+        keep="first",
+    )
+    duplicate_attendance_count = int(
+        (
+            duplicate_attendance
+            & attendance["日期_dt"].eq(report_date)
+        ).sum()
+    )
+    attendance = attendance.loc[~duplicate_attendance].copy()
+    attendance["员工键"] = attendance["员工姓名"].map(_staff_identity)
+
+    diagnosis = compute_daily_profit_diagnosis(
+        stock_df,
+        pos_sales.assign(日期=report_date.strftime("%Y/%m/%d")),
+        attendance,
+        report_date,
+    )
+    financial = diagnosis["summary"]
+
+    day_attendance = attendance[
+        attendance["日期_dt"] == report_date
+    ].copy()
+
+    if pos_sales.empty:
+        staff_sales = pd.DataFrame(
+            columns=["员工键", "销售显示名", "个人销售额", "销售件数"]
+        )
+    else:
+        staff_revenue = (
+            pos_sales.groupby("收银员键", as_index=False)
+            .agg(
+                销售显示名=("收银员", "first"),
+                个人销售额=("总营业额", "sum"),
+            )
+        )
+        staff_items = (
+            positive_sales.groupby("收银员键", as_index=False)["销售数量"]
+            .sum()
+            .rename(
+                columns={
+                    "销售数量": "销售件数",
+                }
+            )
+        )
+        staff_sales = pd.merge(
+            staff_revenue,
+            staff_items,
+            on="收银员键",
+            how="outer",
+        ).rename(columns={"收银员键": "员工键"})
+        staff_sales = staff_sales.fillna(
+            {"个人销售额": 0.0, "销售件数": 0.0}
+        )
+
+    if positive_sales.empty:
+        top_skus = pd.DataFrame(
+            columns=["商品名称", "颜色", "销售数量", "总营业额"]
+        )
+        order_count = 0
+        blank_order_count = 0
+    else:
+        top_skus = (
+            positive_sales.groupby(["商品名称", "颜色"], as_index=False)[
+                ["销售数量", "总营业额"]
+            ]
+            .sum()
+            .sort_values(
+                ["销售数量", "总营业额"],
+                ascending=False,
+                kind="stable",
+            )
+            .head(5)
+            .reset_index(drop=True)
+        )
+        blank_order_rows = positive_sales["订单号"].eq("")
+        historical_rows = positive_sales["订单号"].str.contains(
+            "历史单",
+            na=False,
+        )
+        regular_rows = ~(blank_order_rows | historical_rows)
+        blank_order_count = int(blank_order_rows.sum())
+        order_count = int(
+            positive_sales.loc[regular_rows, "订单号"].nunique()
+            + historical_rows.sum()
+            + blank_order_count
+        )
+
+    staff_attendance = (
+        day_attendance.groupby("员工键", as_index=False)
+        .agg(
+            员工姓名=("员工姓名", "first"),
+            工作时长=("工作时长", "sum"),
+            核算薪资=("核算薪资", "sum"),
+        )
+    )
+    staff = pd.merge(
+        staff_attendance,
+        staff_sales,
+        on="员工键",
+        how="outer",
+    )
+    if "员工姓名" not in staff.columns:
+        staff["员工姓名"] = ""
+    if "销售显示名" not in staff.columns:
+        staff["销售显示名"] = ""
+    attendance_name = staff["员工姓名"].fillna("").astype(str).str.strip()
+    sales_name = staff["销售显示名"].fillna("").astype(str).str.strip()
+    staff["员工姓名"] = attendance_name.where(
+        attendance_name.ne(""),
+        sales_name,
+    )
+    staff = staff.drop(columns=["员工键", "销售显示名"], errors="ignore")
+    for col in ["工作时长", "核算薪资", "个人销售额", "销售件数"]:
+        if col not in staff.columns:
+            staff[col] = 0.0
+        staff[col] = _bi_num(staff[col])
+
+    restock = restock_df.copy() if restock_df is not None else pd.DataFrame()
+    if "记录日期" not in restock.columns:
+        restock["记录日期"] = ""
+    restock["记录日期_dt"] = _bi_dates(restock, "记录日期")
+    inventory_events = restock[
+        restock["记录日期_dt"] == report_date
+    ].copy()
+    event_columns = [
+        "记录日期",
+        "操作类型",
+        "商品名称",
+        "颜色",
+        "变动数量",
+        "库位详情",
+        "备注",
+    ]
+    for col in event_columns:
+        if col not in inventory_events.columns:
+            inventory_events[col] = ""
+    inventory_events = inventory_events[event_columns].reset_index(drop=True)
+
+    diagnosed_wage = max(float(_bi_num(financial["人工成本"])), 0.0)
+    wage = (
+        diagnosed_wage
+        if allocated_wage is None
+        else max(float(_bi_num(allocated_wage)), 0.0)
+    )
+    settlement = float(financial["商场实际回款"])
+    product_cost = float(financial["商品成本"])
+    gross = float(financial["实际营业额"])
+    contribution = settlement - product_cost
+    breakeven = round(contribution / wage * 100, 2) if wage > 0 else None
+
+    admin_summary = {
+        "营业额": round(gross, 2),
+        "订单数": order_count,
+        "售出件数": int(positive_sales["销售数量"].sum())
+        if not positive_sales.empty
+        else 0,
+        "商场实际回款": round(settlement, 2),
+        "商场抽成": round(gross / 1.09 * 0.36, 2),
+        "商品成本": round(product_cost, 2),
+        "人工成本": round(wage, 2),
+        "真实净利润": round(contribution - wage, 2),
+        "保本完成度%": breakeven,
+    }
+    public_summary = {
+        key: admin_summary[key]
+        for key in ["营业额", "订单数", "售出件数"]
+    }
+    alert_statuses = {"深度折扣", "亏损销售", "资料不完整"}
+    discount_alerts = diagnosis["sku_detail"]
+    if "状态" in discount_alerts.columns:
+        discount_alerts = discount_alerts[
+            discount_alerts["状态"].isin(alert_statuses)
+        ].copy()
+    else:
+        discount_alerts = discount_alerts.iloc[0:0].copy()
+    warnings = list(diagnosis.get("warnings", []))
+    if blank_order_count:
+        warnings.append(
+            f"发现 {blank_order_count} 条空订单号正向销售，订单数已按逐行口径计算。"
+        )
+    if duplicate_attendance_count:
+        warnings.append(
+            f"发现并忽略 {duplicate_attendance_count} 条完全重复考勤，"
+            "人工成本和工时均按去重后记录计算。"
+        )
+
+    return {
+        "admin_summary": admin_summary,
+        "public_summary": public_summary,
+        "staff": staff.reset_index(drop=True),
+        "top_skus": top_skus,
+        "discount_alerts": discount_alerts.reset_index(drop=True),
+        "inventory_events": inventory_events,
+        "exchange_count": int(len(exchange_rows)),
+        "refund_count": int(len(refund_rows)),
+        "refunded_items": int(abs(refund_rows["销售数量"].sum())),
+        "warnings": warnings,
+    }
+
+
+def get_daily_close_view(close_result, role, staff_name=""):
+    if str(role or "").strip().lower() == "admin":
+        return close_result
+
+    staff_key = _staff_identity(staff_name)
+    staff = close_result.get("staff", pd.DataFrame()).copy()
+    if "员工姓名" in staff.columns:
+        staff = staff[
+            staff["员工姓名"].map(_staff_identity) == staff_key
+        ]
+    else:
+        staff = staff.iloc[0:0]
+    my_sales = (
+        float(_bi_num(staff["个人销售额"]).sum())
+        if "个人销售额" in staff.columns
+        else 0.0
+    )
+    my_hours = (
+        float(_bi_num(staff["工作时长"]).sum())
+        if "工作时长" in staff.columns
+        else 0.0
+    )
+
+    public = close_result.get("public_summary", {})
+    summary = {
+        key: public.get(key, 0)
+        for key in ["营业额", "订单数", "售出件数"]
+    }
+    summary["我的销售额"] = round(my_sales, 2)
+    summary["我的工时"] = round(my_hours, 2)
+
+    top_skus = close_result.get("top_skus", pd.DataFrame()).copy()
+    safe_top_columns = ["商品名称", "颜色", "销售数量", "总营业额"]
+    for col in safe_top_columns:
+        if col not in top_skus.columns:
+            top_skus[col] = "" if col in BI_SKU_KEYS else 0
+    return {
+        "summary": summary,
+        "top_skus": top_skus[safe_top_columns],
+        "exchange_count": int(close_result.get("exchange_count", 0)),
+    }
+
+
+def _close_text(value):
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def validate_daily_close_payload(inventory_status, special_status, explanation):
+    inventory_status = _close_text(inventory_status)
+    special_status = _close_text(special_status)
+    if (
+        inventory_status not in {"正常", "有异常"}
+        or special_status not in {"没有", "有"}
+    ):
+        return False, "库存状态或特殊事项状态无效。"
+    has_abnormal = inventory_status == "有异常" or special_status == "有"
+    if has_abnormal and not _close_text(explanation):
+        return False, "存在异常或特殊事项时，必须填写异常说明。"
+    return True, ""
+
+
+def close_report_status(row):
+    if row is None or not hasattr(row, "get"):
+        return "未提交"
+    inventory_status = _close_text(row.get("库存状态", ""))
+    special_status = _close_text(row.get("特殊事项状态", ""))
+    if (
+        inventory_status not in {"正常", "有异常"}
+        or special_status not in {"没有", "有"}
+    ):
+        return "未提交"
+    if inventory_status == "有异常" or special_status == "有":
+        return "有异常"
+    return "已提交"
+
+
+def daily_close_snapshot_statuses(snapshot):
+    statuses = {"titanium": "待加载", "silk": "待加载"}
+    if not snapshot:
+        return statuses
+
+    report_day = pd.to_datetime(snapshot.get("date"), errors="coerce")
+    records = snapshot.get("records")
+    if pd.isna(report_day) or not isinstance(records, pd.DataFrame):
+        return statuses
+
+    record_dates = pd.to_datetime(
+        records.get("报告日期", pd.Series(dtype="object", index=records.index)),
+        errors="coerce",
+    ).dt.date
+    record_systems = (
+        records.get("品类系统", pd.Series(dtype="object", index=records.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    system_labels = {"titanium": "钛杯系统", "silk": "丝绸系统"}
+    for system_key, system_label in system_labels.items():
+        matching_rows = records.loc[
+            record_dates.eq(report_day.date())
+            & record_systems.isin([system_key, system_label])
+        ]
+        row = matching_rows.iloc[-1] if not matching_rows.empty else None
+        statuses[system_key] = close_report_status(row)
+    return statuses
+
+
+def upsert_daily_close_record(frame, record, columns):
+    frame = (
+        frame.copy()
+        if frame is not None
+        else pd.DataFrame(columns=columns)
+    )
+    for col in columns:
+        if col not in frame.columns:
+            frame[col] = ""
+    frame = frame[columns]
+
+    raw_report_date = record.get("报告日期", "")
+    report_date = pd.to_datetime(
+        raw_report_date,
+        errors="coerce",
+    )
+    normalized_date = (
+        report_date.strftime("%Y-%m-%d")
+        if not pd.isna(report_date)
+        else _close_text(raw_report_date)
+    )
+    system_key = _close_text(record.get("品类系统", ""))
+    frame_dates = pd.to_datetime(
+        frame["报告日期"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    frame_dates = frame_dates.fillna(
+        frame["报告日期"].fillna("").astype(str).str.strip()
+    )
+    frame_systems = frame["品类系统"].map(_close_text)
+    if normalized_date and system_key:
+        keep_mask = ~(
+            frame_dates.eq(normalized_date)
+            & frame_systems.eq(system_key)
+        )
+    else:
+        keep_mask = pd.Series(True, index=frame.index)
+
+    new_record = {
+        col: record.get(col, "")
+        for col in columns
+    }
+    new_record["报告日期"] = normalized_date
+    new_record["品类系统"] = system_key
+    new_row = pd.DataFrame([new_record], columns=columns)
+    return pd.concat(
+        [new_row, frame.loc[keep_mask]],
+        ignore_index=True,
+    )
+
+
 def _dashboard_traffic(traffic_df):
     traffic = traffic_df.copy()
     if traffic.empty:
@@ -1208,6 +1904,7 @@ TRAFFIC_SHEET = ACTIVE_SYSTEM_SHEETS["traffic"]
 CAMP_SHEET = ACTIVE_SYSTEM_SHEETS["campaign"]
 STAFF_PURCHASE_SHEET = ACTIVE_SYSTEM_SHEETS["staff_purchase"]
 INVENTORY_SNAPSHOT_SHEET = ACTIVE_SYSTEM_SHEETS["inventory_snapshot"]
+DAILY_CLOSE_SHEET = "Daily_Close_Reports"
 
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
@@ -1220,6 +1917,17 @@ TRAFFIC_COLS = ['日期', '有效客流']
 CAMP_COLS = ['档期名称', '开始日期', '结束日期']
 STAFF_PURCHASE_COLS = ['内购单号', '日期', '员工姓名', '商品名称', '颜色', '购买数量', '内购单价', '扣款金额', '成本合计', '记录人', '是否扣库存', '备注']
 INVENTORY_SNAPSHOT_COLS = ['档期键', '档期名称', '开始日期', '结束日期', '快照日期', '商品名称', '颜色', '开档库存', '记录人', '备注']
+DAILY_CLOSE_COLS = [
+    '报告日期',
+    '品类系统',
+    '库存状态',
+    '特殊事项状态',
+    '异常说明',
+    '客户反馈',
+    '明日交接事项',
+    '最后提交人',
+    '最后提交时间',
+]
 
 all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET]
 
@@ -1283,6 +1991,173 @@ def load_raw_data(sheet_name, version):
     st.error(f"🔴 读取 {sheet_name} 失败。Error: {last_error}")
     st.stop()
 
+
+def _normalize_daily_close_frame(frame, deduplicate=True):
+    normalized = (
+        frame.copy()
+        if frame is not None
+        else pd.DataFrame(columns=DAILY_CLOSE_COLS)
+    )
+    for col in DAILY_CLOSE_COLS:
+        if col not in normalized.columns:
+            normalized[col] = ""
+    normalized = normalized[DAILY_CLOSE_COLS].fillna("").astype(str)
+    normalized["报告日期"] = normalized["报告日期"].map(
+        lambda value: (
+            pd.to_datetime(value, errors="coerce").strftime("%Y/%m/%d")
+            if not pd.isna(pd.to_datetime(value, errors="coerce"))
+            else ""
+        )
+    )
+    normalized["品类系统"] = normalized["品类系统"].str.strip()
+    if deduplicate and not normalized.empty:
+        normalized = normalized.drop_duplicates(
+            subset=["报告日期", "品类系统"],
+            keep="last",
+        )
+    return normalized.reset_index(drop=True)
+
+
+def _daily_close_row_tuples(frame):
+    normalized = _normalize_daily_close_frame(frame, deduplicate=False)
+    return [
+        tuple(row)
+        for row in normalized[DAILY_CLOSE_COLS].values.tolist()
+    ]
+
+
+def _read_daily_close_records_uncached(worksheet_getter, deduplicate=True):
+    try:
+        worksheet = worksheet_getter()
+    except WorksheetNotFound:
+        return (
+            pd.DataFrame(columns=DAILY_CLOSE_COLS),
+            None,
+            True,
+            "",
+        )
+    except Exception:
+        return (
+            pd.DataFrame(columns=DAILY_CLOSE_COLS),
+            None,
+            False,
+            "关店报告暂时无法读取，请稍后重试。",
+        )
+
+    try:
+        records = worksheet.get_all_records()
+        frame = _normalize_daily_close_frame(
+            pd.DataFrame(records),
+            deduplicate=deduplicate,
+        )
+        return frame, worksheet, True, ""
+    except Exception:
+        return (
+            pd.DataFrame(columns=DAILY_CLOSE_COLS),
+            worksheet,
+            False,
+            "关店报告暂时无法读取，请稍后重试。",
+        )
+
+
+def _ensure_daily_close_header(worksheet):
+    try:
+        header = worksheet.row_values(1)
+    except Exception:
+        return False
+    if header == DAILY_CLOSE_COLS:
+        return True
+    if header:
+        return False
+    try:
+        worksheet.update(
+            values=[DAILY_CLOSE_COLS],
+            range_name="A1",
+        )
+        confirmed_header = worksheet.row_values(1)
+    except Exception:
+        return False
+    return confirmed_header == DAILY_CLOSE_COLS
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_daily_close_records_safe():
+    try:
+        frame, _, read_ok, error = _read_daily_close_records_uncached(
+            lambda: sh.worksheet(DAILY_CLOSE_SHEET),
+            deduplicate=True,
+        )
+        if not read_ok:
+            return pd.DataFrame(columns=DAILY_CLOSE_COLS), error
+        return frame, ""
+    except Exception:
+        return (
+            pd.DataFrame(columns=DAILY_CLOSE_COLS),
+            "关店报告暂时无法读取，请稍后重试。",
+        )
+
+
+def save_daily_close_records_safe(frame):
+    pending = _normalize_daily_close_frame(frame, deduplicate=False)
+    if pending.empty:
+        return False, "没有可保存的关店报告。"
+    pending_rows = _daily_close_row_tuples(pending)
+    if any(not row[0] or not row[1] for row in pending_rows):
+        return False, "报告日期和品类系统不能为空。"
+
+    try:
+        worksheet = sh.worksheet(DAILY_CLOSE_SHEET)
+    except WorksheetNotFound:
+        try:
+            worksheet = sh.add_worksheet(
+                title=DAILY_CLOSE_SHEET,
+                rows="1000",
+                cols=str(max(20, len(DAILY_CLOSE_COLS) + 5)),
+            )
+        except Exception:
+            try:
+                worksheet = sh.worksheet(DAILY_CLOSE_SHEET)
+            except Exception:
+                return False, "关店报告暂时无法保存，请稍后重试。"
+    except Exception:
+        return False, "关店报告暂时无法读取，请稍后重试。"
+
+    if not _ensure_daily_close_header(worksheet):
+        return False, "关店报告表头无法确认，未保存任何业务记录。"
+
+    latest, _, read_ok, error = _read_daily_close_records_uncached(
+        lambda: worksheet,
+        deduplicate=False,
+    )
+    if not read_ok:
+        return False, error
+
+    current_latest = {}
+    for row in _daily_close_row_tuples(latest):
+        key = (row[0], row[1])
+        if key[0] and key[1]:
+            current_latest[key] = row
+    rows_to_append = []
+    for row in pending_rows:
+        key = (row[0], row[1])
+        if current_latest.get(key) == row:
+            continue
+        rows_to_append.append(list(row))
+        current_latest[key] = row
+    if not rows_to_append:
+        return True, ""
+
+    try:
+        worksheet.append_rows(
+            rows_to_append,
+            value_input_option="USER_ENTERED",
+        )
+        load_daily_close_records_safe.clear()
+        return True, ""
+    except Exception:
+        return False, "关店报告暂时无法保存，请稍后重试。"
+
+
 def load_data(sheet_name, columns):
     ver = st.session_state.sheet_versions.get(sheet_name, 0)
     df = load_raw_data(sheet_name, ver)
@@ -1292,6 +2167,118 @@ def load_data(sheet_name, columns):
         if col not in df.columns: 
             df[col] = "" 
     return df[columns]
+
+
+def _load_employee_permissions_uncached_safe():
+    try:
+        worksheet = sh.worksheet(EMP_SHEET)
+        records = worksheet.get_all_records()
+    except Exception:
+        return (
+            pd.DataFrame(columns=EMP_COLS),
+            "员工权限暂时无法确认，请稍后重试或联系管理员。",
+        )
+
+    try:
+        frame = (
+            pd.DataFrame(records)
+            if records
+            else pd.DataFrame(columns=EMP_COLS)
+        )
+        for col in EMP_COLS:
+            if col not in frame.columns:
+                frame[col] = ""
+        frame = frame[EMP_COLS].copy()
+        frame["状态"] = (
+            frame["状态"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace({"0": "", "nan": ""})
+            .replace("", "在职")
+        )
+        frame[SYSTEM_PERMISSION_COL] = (
+            frame[SYSTEM_PERMISSION_COL]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace({"0": "", "nan": ""})
+            .replace(
+                "",
+                CATEGORY_SYSTEMS[DEFAULT_CATEGORY_SYSTEM]["label"],
+            )
+        )
+        frame["登录密码"] = (
+            frame["登录密码"]
+            .fillna("")
+            .astype(str)
+            .replace({"0": "", "nan": ""})
+        )
+        if not frame.empty:
+            formatted_dates = pd.to_datetime(
+                frame["入职日期"],
+                errors="coerce",
+            ).dt.strftime("%Y/%m/%d")
+            frame["入职日期"] = formatted_dates.fillna("")
+        return frame, ""
+    except Exception:
+        return (
+            pd.DataFrame(columns=EMP_COLS),
+            "员工权限暂时无法确认，请稍后重试或联系管理员。",
+        )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_employee_permissions_safe():
+    return _load_employee_permissions_uncached_safe()
+
+
+def _resolve_employee_close_access(
+    employee_frame,
+    current_user,
+    session_systems,
+):
+    user_key = str(current_user or "").strip().casefold()
+    frame = (
+        employee_frame.copy()
+        if employee_frame is not None
+        else pd.DataFrame(columns=EMP_COLS)
+    )
+    if "员工姓名" not in frame.columns or not user_key:
+        return [], "当前员工账号无法确认，请联系管理员。"
+
+    matching_rows = frame[
+        frame["员工姓名"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.casefold()
+        .eq(user_key)
+    ]
+    if len(matching_rows) != 1:
+        if len(matching_rows) > 1:
+            return [], "检测到同名员工账号，请联系管理员处理后再使用关店报告。"
+        return [], "当前员工账号无法确认，请联系管理员。"
+
+    employee_row = matching_rows.iloc[0]
+    if str(employee_row.get("状态", "")).strip() == "离职":
+        return [], "当前员工账号已停用，请联系管理员。"
+
+    safe_session_systems = [
+        system_key
+        for system_key in (session_systems or [])
+        if system_key in CATEGORY_SYSTEMS
+    ]
+    permission_value = employee_row.get(SYSTEM_PERMISSION_COL, "")
+    allowed = [
+        system_key
+        for system_key in safe_session_systems
+        if employee_has_system_access(permission_value, system_key)
+    ]
+    if not allowed:
+        return [], "当前账号没有可使用的品类权限，请联系管理员。"
+    return allowed, ""
+
 
 def save_data(df, sheet_name):
     try:
@@ -1320,6 +2307,11 @@ def save_data(df, sheet_name):
         # 可能命中旧的 load_raw_data(sheet_name, 0) 缓存，导致新销售/SKU/补货看起来消失。
         st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
         invalidate_data_cache(sheet_name)
+        if sheet_name == EMP_SHEET:
+            try:
+                load_employee_permissions_safe.clear()
+            except Exception:
+                pass
     except Exception as e:
         st.error(f"🔴 保存 {sheet_name} 失败，数据没有被清空。请检查网络/Google Sheet权限后重试。Error: {e}")
         st.stop()
@@ -1339,6 +2331,116 @@ def load_safe_sales():
         else:
             df['收银员'] = df['收银员'].fillna('').astype(str).replace('0', '店长/历史').replace('', '店长/历史').replace('nan', '店长/历史')
     return df
+
+
+def load_sales_sheet(sheet_name):
+    df = clean_date_col(load_data(sheet_name, SALES_COLS), '日期')
+    if not df.empty:
+        df['订单号'] = df['订单号'].fillna('').astype(str).replace('0', '历史单').replace('', '历史单').replace('nan', '历史单')
+        if '收银员' not in df.columns:
+            df['收银员'] = '店长/历史'
+        else:
+            df['收银员'] = df['收银员'].fillna('').astype(str).replace('0', '店长/历史').replace('', '店长/历史').replace('nan', '店长/历史')
+    return df
+
+
+def _read_close_source_sheet_safe(sheet_name, columns):
+    empty = pd.DataFrame(columns=columns)
+    try:
+        worksheet = sh.worksheet(sheet_name)
+    except WorksheetNotFound:
+        return empty, ""
+    except Exception:
+        return empty, "关店经营数据暂时无法读取，请稍后重试。"
+
+    try:
+        records = worksheet.get_all_records()
+        frame = pd.DataFrame(records) if records else empty.copy()
+        for col in columns:
+            if col not in frame.columns:
+                frame[col] = ""
+        return frame[columns].copy(), ""
+    except Exception:
+        return empty, "关店经营数据暂时无法读取，请稍后重试。"
+
+
+def load_category_close_data_safe(system_key):
+    sheets = resolve_system_sheets(system_key)
+    source_specs = {
+        "stock": (sheets["stock"], STOCK_COLS),
+        "sales": (sheets["sales"], SALES_COLS),
+        "restock": (sheets["restock"], RESTOCK_COLS),
+    }
+    data = {}
+    source_error = ""
+    for source_key, (sheet_name, columns) in source_specs.items():
+        frame, error = _read_close_source_sheet_safe(sheet_name, columns)
+        data[source_key] = frame
+        if error:
+            source_error = error
+
+    if source_error:
+        return {
+            "stock": pd.DataFrame(columns=STOCK_COLS),
+            "sales": pd.DataFrame(columns=SALES_COLS),
+            "restock": pd.DataFrame(columns=RESTOCK_COLS),
+        }, source_error
+
+    sales = data["sales"].copy()
+    if not sales.empty:
+        formatted_sales_dates = pd.to_datetime(
+            sales["日期"],
+            errors="coerce",
+        ).dt.strftime("%Y/%m/%d")
+        sales["日期"] = formatted_sales_dates.fillna("")
+        sales["订单号"] = (
+            sales["订单号"]
+            .fillna("")
+            .astype(str)
+            .replace({"0": "历史单", "": "历史单", "nan": "历史单"})
+        )
+        sales["收银员"] = (
+            sales["收银员"]
+            .fillna("")
+            .astype(str)
+            .replace(
+                {
+                    "0": "店长/历史",
+                    "": "店长/历史",
+                    "nan": "店长/历史",
+                }
+            )
+        )
+    data["sales"] = sales
+
+    restock = data["restock"].copy()
+    if not restock.empty:
+        formatted_restock_dates = pd.to_datetime(
+            restock["记录日期"],
+            errors="coerce",
+        ).dt.strftime("%Y/%m/%d")
+        restock["记录日期"] = formatted_restock_dates.fillna("")
+    data["restock"] = restock
+    return data, ""
+
+
+def load_category_close_data(system_key, force_refresh=False):
+    sheets = resolve_system_sheets(system_key)
+    if force_refresh:
+        for key in ("stock", "sales", "restock"):
+            sheet_name = sheets[key]
+            st.session_state.sheet_versions[sheet_name] = (
+                st.session_state.sheet_versions.get(sheet_name, 0) + 1
+            )
+    return {
+        "stock": load_data(sheets["stock"], STOCK_COLS),
+        "sales": load_sales_sheet(sheets["sales"]),
+        "restock": clean_date_col(
+            load_data(sheets["restock"], RESTOCK_COLS),
+            "记录日期",
+        ),
+    }
+
 
 def load_safe_emp():
     df = clean_date_col(load_data(EMP_SHEET, EMP_COLS), '入职日期') 
@@ -1511,6 +2613,8 @@ with st.sidebar:
             st.session_state.role = None
             st.session_state.current_user = None
             st.session_state.allowed_category_systems = []
+            st.session_state.pop("employee_daily_close_snapshot", None)
+            st.session_state.pop("employee_daily_close_flash", None)
             st.query_params.clear()
             st.rerun()
             
@@ -3281,16 +4385,34 @@ if is_admin:
                     help="只授权丝绸系统的员工，登录后会直接进入丝绸系统；授权两个系统的员工可自行切换。",
                 )
                 if st.form_submit_button("保存人员信息"):
-                    if e_name.strip() == "": st.warning("⚠️ 姓名不能为空！")
+                    employee_name_key = e_name.strip().casefold()
+                    existing_employee_name_keys = (
+                        df_employee["员工姓名"]
+                        .fillna("")
+                        .astype(str)
+                        .str.strip()
+                        .str.casefold()
+                    )
+                    if employee_name_key == "": st.warning("⚠️ 姓名不能为空！")
                     elif not e_systems: st.warning("⚠️ 请至少选择一个可进入系统。")
-                    elif e_name in df_employee['员工姓名'].values: st.warning(f"⚠️ 人员 {e_name} 已经存在！")
+                    elif existing_employee_name_keys.eq(employee_name_key).any(): st.warning(f"⚠️ 人员 {e_name.strip()} 已经存在！")
                     else:
                         fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
-                        new_emp = pd.DataFrame([[e_name, e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d"), "", "在职", ", ".join(e_systems)]], columns=EMP_COLS)
-                        fresh_emp = pd.concat([fresh_emp, new_emp], ignore_index=True)
-                        save_data(fresh_emp, EMP_SHEET) 
-                        st.session_state.emp_reset_key += 1
-                        st.rerun()
+                        fresh_employee_name_keys = (
+                            fresh_emp["员工姓名"]
+                            .fillna("")
+                            .astype(str)
+                            .str.strip()
+                            .str.casefold()
+                        )
+                        if fresh_employee_name_keys.eq(employee_name_key).any():
+                            st.warning(f"⚠️ 人员 {e_name.strip()} 已经存在！")
+                        else:
+                            new_emp = pd.DataFrame([[e_name.strip(), e_role, e_wage, e_phone, e_date.strftime("%Y/%m/%d"), "", "在职", ", ".join(e_systems)]], columns=EMP_COLS)
+                            fresh_emp = pd.concat([fresh_emp, new_emp], ignore_index=True)
+                            save_data(fresh_emp, EMP_SHEET) 
+                            st.session_state.emp_reset_key += 1
+                            st.rerun()
 
         emp_status_filter = st.radio(
             "人员显示范围",
@@ -3380,7 +4502,7 @@ if is_admin:
         
         if df_employee.empty:
             st.info("💡 请先在上方添加人员。")
-        else:
+        if not df_employee.empty:
             with st.expander("➕ 帮员工补录打卡", expanded=True):
                 with st.form("add_attendance_admin"):
                     c1, c2 = st.columns(2)
@@ -3456,6 +4578,540 @@ if is_admin:
                 c_t2.metric("当前列表总工时", f"{total_hours:.1f} 小时")
                 c_t3.metric("当前列表总薪资支出", f"${total_wage:.2f}")
 
+        admin_daily_close_title_statuses = daily_close_snapshot_statuses(
+            st.session_state.get("admin_daily_close_snapshot")
+        )
+        with st.expander(
+            (
+                "🧾 每日关店报告｜"
+                f"钛杯：{admin_daily_close_title_statuses['titanium']}｜"
+                f"丝绸：{admin_daily_close_title_statuses['silk']}"
+            ),
+            expanded=False,
+        ):
+            with st.form("admin_daily_close_query_form"):
+                admin_close_c1, admin_close_c2 = st.columns(2)
+                admin_daily_close_date = admin_close_c1.date_input(
+                    "报告日期",
+                    value=datetime.now().date(),
+                    key="admin_daily_close_date",
+                )
+                admin_daily_close_scope = admin_close_c2.selectbox(
+                    "查看范围",
+                    ["全部", "钛杯系统", "丝绸系统"],
+                    key="admin_daily_close_scope",
+                )
+                admin_daily_close_submitted = st.form_submit_button(
+                    "生成/刷新关店报告",
+                    use_container_width=True,
+                )
+
+            if admin_daily_close_submitted:
+                admin_daily_close_date_value = pd.to_datetime(
+                    admin_daily_close_date,
+                    errors="coerce",
+                )
+                if pd.isna(admin_daily_close_date_value):
+                    st.warning("报告日期无法识别，请重新选择。")
+                else:
+                    admin_daily_close_day = (
+                        admin_daily_close_date_value.date()
+                    )
+                    load_daily_close_records_safe.clear()
+                    (
+                        admin_daily_close_records,
+                        admin_daily_close_record_error,
+                    ) = load_daily_close_records_safe()
+
+                    admin_daily_close_data = {}
+                    admin_daily_close_preliminary = {}
+                    admin_daily_close_source_error = ""
+                    for system_key in CATEGORY_SYSTEMS:
+                        (
+                            system_data,
+                            system_source_error,
+                        ) = load_category_close_data_safe(
+                            system_key
+                        )
+                        if system_source_error:
+                            admin_daily_close_source_error = (
+                                system_source_error
+                            )
+                        admin_daily_close_data[system_key] = system_data
+                        admin_daily_close_preliminary[system_key] = (
+                            build_daily_close_summary(
+                                system_data["stock"],
+                                system_data["sales"],
+                                df_attendance,
+                                system_data["restock"],
+                                admin_daily_close_day,
+                                allocated_wage=None,
+                            )
+                        )
+
+                    admin_daily_close_first_system = next(
+                        iter(CATEGORY_SYSTEMS),
+                        None,
+                    )
+                    admin_daily_close_total_wage = (
+                        float(
+                            admin_daily_close_preliminary[
+                                admin_daily_close_first_system
+                            ]["admin_summary"]["人工成本"]
+                        )
+                        if admin_daily_close_first_system is not None
+                        else 0.0
+                    )
+                    admin_daily_close_revenue = {
+                        system_key: result["admin_summary"]["营业额"]
+                        for system_key, result
+                        in admin_daily_close_preliminary.items()
+                    }
+                    admin_daily_close_wage_allocations = (
+                        allocate_category_wages(
+                            admin_daily_close_revenue,
+                            admin_daily_close_total_wage,
+                        )
+                    )
+                    admin_daily_close_results = {}
+                    for system_key, system_data in (
+                        admin_daily_close_data.items()
+                    ):
+                        admin_daily_close_results[system_key] = (
+                            build_daily_close_summary(
+                                system_data["stock"],
+                                system_data["sales"],
+                                df_attendance,
+                                system_data["restock"],
+                                admin_daily_close_day,
+                                allocated_wage=admin_daily_close_wage_allocations.get(system_key, 0.0),
+                            )
+                        )
+
+                    if admin_daily_close_scope == "全部":
+                        admin_daily_close_scope_keys = list(
+                            CATEGORY_SYSTEMS.keys()
+                        )
+                        admin_daily_close_settlement = sum(
+                            admin_daily_close_results[key]["admin_summary"][
+                                "商场实际回款"
+                            ]
+                            for key in admin_daily_close_scope_keys
+                        )
+                        admin_daily_close_product_cost = sum(
+                            admin_daily_close_results[key]["admin_summary"][
+                                "商品成本"
+                            ]
+                            for key in admin_daily_close_scope_keys
+                        )
+                        admin_daily_close_contribution = (
+                            admin_daily_close_settlement
+                            - admin_daily_close_product_cost
+                        )
+                        admin_daily_close_overview = {
+                            "营业额": round(
+                                sum(
+                                    admin_daily_close_results[key][
+                                        "admin_summary"
+                                    ]["营业额"]
+                                    for key in admin_daily_close_scope_keys
+                                ),
+                                2,
+                            ),
+                            "订单数": sum(
+                                admin_daily_close_results[key][
+                                    "admin_summary"
+                                ]["订单数"]
+                                for key in admin_daily_close_scope_keys
+                            ),
+                            "售出件数": sum(
+                                admin_daily_close_results[key][
+                                    "admin_summary"
+                                ]["售出件数"]
+                                for key in admin_daily_close_scope_keys
+                            ),
+                            "商场实际回款": round(
+                                admin_daily_close_settlement,
+                                2,
+                            ),
+                            "商场抽成": round(
+                                sum(
+                                    admin_daily_close_results[key][
+                                        "admin_summary"
+                                    ]["商场抽成"]
+                                    for key in admin_daily_close_scope_keys
+                                ),
+                                2,
+                            ),
+                            "商品成本": round(
+                                admin_daily_close_product_cost,
+                                2,
+                            ),
+                            "人工成本": round(admin_daily_close_total_wage, 2),
+                            "真实净利润": round(
+                                admin_daily_close_contribution
+                                - admin_daily_close_total_wage,
+                                2,
+                            ),
+                            "保本完成度%": (
+                                round(
+                                    admin_daily_close_contribution
+                                    / admin_daily_close_total_wage
+                                    * 100,
+                                    2,
+                                )
+                                if admin_daily_close_total_wage > 0
+                                else None
+                            ),
+                        }
+                    else:
+                        admin_daily_close_selected_key = next(
+                            key
+                            for key, config in CATEGORY_SYSTEMS.items()
+                            if config["label"]
+                            == admin_daily_close_scope
+                        )
+                        admin_daily_close_scope_keys = [
+                            admin_daily_close_selected_key
+                        ]
+                        admin_daily_close_overview = (
+                            admin_daily_close_results[
+                                admin_daily_close_selected_key
+                            ]["admin_summary"]
+                        )
+
+                    if admin_daily_close_source_error:
+                        st.warning(admin_daily_close_source_error)
+                    else:
+                        st.session_state[
+                            "admin_daily_close_snapshot"
+                        ] = {
+                            "date": admin_daily_close_day,
+                            "scope": admin_daily_close_scope,
+                            "records": admin_daily_close_records,
+                            "record_error": (
+                                admin_daily_close_record_error
+                            ),
+                            "results": admin_daily_close_results,
+                            "overview": admin_daily_close_overview,
+                            "scope_keys": admin_daily_close_scope_keys,
+                            "total_wage": admin_daily_close_total_wage,
+                            "wage_allocations": (
+                                admin_daily_close_wage_allocations
+                            ),
+                        }
+                        st.rerun()
+
+            admin_daily_close_snapshot = st.session_state.get("admin_daily_close_snapshot")
+            if admin_daily_close_snapshot is None:
+                st.info(
+                    "选择日期和范围后，点击“生成/刷新关店报告”。"
+                    "未生成时不会读取 Sheet 或重新计算。"
+                )
+            else:
+                admin_daily_close_render_day = admin_daily_close_snapshot["date"]
+                admin_daily_close_render_scope = admin_daily_close_snapshot["scope"]
+                admin_daily_close_day = admin_daily_close_render_day
+                admin_daily_close_scope = admin_daily_close_render_scope
+                admin_daily_close_records = admin_daily_close_snapshot["records"]
+                admin_daily_close_record_error = admin_daily_close_snapshot[
+                    "record_error"
+                ]
+                admin_daily_close_results = admin_daily_close_snapshot["results"]
+                admin_daily_close_overview = admin_daily_close_snapshot["overview"]
+                admin_daily_close_scope_keys = admin_daily_close_snapshot[
+                    "scope_keys"
+                ]
+                if admin_daily_close_record_error:
+                    st.warning(admin_daily_close_record_error)
+
+                if admin_daily_close_snapshot:
+                    st.caption(
+                        "人工口径：全部视图只扣一次当日 Attendance 总工资；"
+                        "单品类按钛杯/丝绸当日正常 POS 营业额比例分摊。"
+                        "若两边营业额均为 0，全部仍扣实际工资，单品类分摊为 $0。"
+                    )
+                    st.markdown(
+                        f"#### {admin_daily_close_render_scope}｜"
+                        f"{admin_daily_close_render_day.strftime('%Y/%m/%d')}"
+                    )
+                    admin_close_m1, admin_close_m2, admin_close_m3 = (
+                        st.columns(3)
+                    )
+                    admin_close_m1.metric(
+                        "营业额",
+                        f"${admin_daily_close_overview['营业额']:.2f}",
+                    )
+                    admin_close_m2.metric(
+                        "订单",
+                        f"{int(admin_daily_close_overview['订单数'])} 单",
+                    )
+                    admin_close_m3.metric(
+                        "售出件数",
+                        f"{int(admin_daily_close_overview['售出件数'])} 件",
+                    )
+                    admin_close_m4, admin_close_m5, admin_close_m6 = (
+                        st.columns(3)
+                    )
+                    admin_close_m4.metric(
+                        "商场实际回款",
+                        f"${admin_daily_close_overview['商场实际回款']:.2f}",
+                    )
+                    admin_close_m5.metric(
+                        "商场抽成",
+                        f"${admin_daily_close_overview['商场抽成']:.2f}",
+                    )
+                    admin_close_m6.metric(
+                        "商品成本",
+                        f"${admin_daily_close_overview['商品成本']:.2f}",
+                    )
+                    admin_close_m7, admin_close_m8, admin_close_m9 = (
+                        st.columns(3)
+                    )
+                    admin_close_m7.metric(
+                        "人工成本",
+                        f"${admin_daily_close_overview['人工成本']:.2f}",
+                    )
+                    admin_close_m8.metric(
+                        "真实净利润",
+                        f"${admin_daily_close_overview['真实净利润']:.2f}",
+                    )
+                    admin_daily_close_breakeven = (
+                        admin_daily_close_overview["保本完成度%"]
+                    )
+                    admin_close_m9.metric(
+                        "保本完成度",
+                        (
+                            f"{admin_daily_close_breakeven:.1f}%"
+                            if admin_daily_close_breakeven is not None
+                            else "无需人工保本"
+                        ),
+                    )
+
+                    admin_daily_close_tabs = st.tabs(
+                        [
+                            CATEGORY_SYSTEMS[key]["label"]
+                            for key in admin_daily_close_scope_keys
+                        ]
+                    )
+                    admin_daily_close_record_dates = pd.to_datetime(
+                        admin_daily_close_records.get(
+                            "报告日期",
+                            pd.Series(
+                                dtype="object",
+                                index=admin_daily_close_records.index,
+                            ),
+                        ),
+                        errors="coerce",
+                    ).dt.date
+                    admin_daily_close_record_systems = (
+                        admin_daily_close_records.get(
+                            "品类系统",
+                            pd.Series(
+                                dtype="object",
+                                index=admin_daily_close_records.index,
+                            ),
+                        )
+                        .fillna("")
+                        .astype(str)
+                        .str.strip()
+                    )
+
+                    for system_tab, system_key in zip(
+                        admin_daily_close_tabs,
+                        admin_daily_close_scope_keys,
+                    ):
+                        with system_tab:
+                            system_label = CATEGORY_SYSTEMS[system_key][
+                                "label"
+                            ]
+                            system_result = admin_daily_close_results[
+                                system_key
+                            ]
+                            system_summary = system_result["admin_summary"]
+
+                            system_record_mask = (
+                                admin_daily_close_record_dates.eq(
+                                    admin_daily_close_day
+                                )
+                                & admin_daily_close_record_systems.isin(
+                                    [system_key, system_label]
+                                )
+                            )
+                            system_record_rows = (
+                                admin_daily_close_records.loc[
+                                    system_record_mask
+                                ]
+                            )
+                            system_record = (
+                                system_record_rows.iloc[-1]
+                                if not system_record_rows.empty
+                                else None
+                            )
+                            system_record_status = close_report_status(
+                                system_record
+                            )
+                            status_icon = {
+                                "未提交": "⚪",
+                                "已提交": "✅",
+                                "有异常": "⚠️",
+                            }.get(system_record_status, "⚪")
+                            st.markdown(
+                                f"##### {status_icon} 员工备注状态："
+                                f"{system_record_status}"
+                            )
+                            if system_record is None:
+                                st.caption("该日期尚无员工保存的关店备注。")
+                            else:
+                                raw_status_c1, raw_status_c2 = st.columns(2)
+                                raw_status_c1.markdown(
+                                    "**库存状态**  \n"
+                                    f"{system_record.get('库存状态', '') or '未记录'}"
+                                )
+                                raw_status_c2.markdown(
+                                    "**特殊事项状态**  \n"
+                                    f"{system_record.get('特殊事项状态', '') or '未记录'}"
+                                )
+                                record_c1, record_c2 = st.columns(2)
+                                record_c1.markdown(
+                                    "**异常说明**  \n"
+                                    f"{system_record.get('异常说明', '') or '无'}"
+                                )
+                                record_c2.markdown(
+                                    "**客户反馈**  \n"
+                                    f"{system_record.get('客户反馈', '') or '无'}"
+                                )
+                                st.markdown(
+                                    "**明日交接事项**  \n"
+                                    f"{system_record.get('明日交接事项', '') or '无'}"
+                                )
+                                st.caption(
+                                    "最后提交："
+                                    f"{system_record.get('最后提交人', '') or '未记录'}"
+                                    "｜"
+                                    f"{system_record.get('最后提交时间', '') or '未记录'}"
+                                )
+
+                            st.markdown("##### 品类财务")
+                            category_financial = pd.DataFrame(
+                                [
+                                    {
+                                        "营业额": system_summary["营业额"],
+                                        "订单": system_summary["订单数"],
+                                        "件数": system_summary["售出件数"],
+                                        "商场实际回款": system_summary[
+                                            "商场实际回款"
+                                        ],
+                                        "商场抽成": system_summary["商场抽成"],
+                                        "商品成本": system_summary["商品成本"],
+                                        "人工": system_summary["人工成本"],
+                                        "真实净利润": system_summary[
+                                            "真实净利润"
+                                        ],
+                                        "保本完成度%": system_summary[
+                                            "保本完成度%"
+                                        ],
+                                    }
+                                ]
+                            )
+                            st.dataframe(
+                                category_financial.style.format(
+                                    {
+                                        "营业额": "${:.2f}",
+                                        "商场实际回款": "${:.2f}",
+                                        "商场抽成": "${:.2f}",
+                                        "商品成本": "${:.2f}",
+                                        "人工": "${:.2f}",
+                                        "真实净利润": "${:.2f}",
+                                        "保本完成度%": (
+                                            lambda value: (
+                                                f"{value:.1f}%"
+                                                if pd.notna(value)
+                                                else "无需人工保本"
+                                            )
+                                        ),
+                                    }
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                            staff_frame = system_result["staff"].copy()
+                            st.markdown("##### 员工贡献")
+                            if staff_frame.empty:
+                                st.caption("当日暂无员工销售或考勤记录。")
+                            else:
+                                st.dataframe(
+                                    staff_frame.style.format(
+                                        {
+                                            "工作时长": "{:.1f}",
+                                            "核算薪资": "${:.2f}",
+                                            "个人销售额": "${:.2f}",
+                                            "销售件数": "{:.0f}",
+                                        }
+                                    ),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                            detail_c1, detail_c2 = st.columns(2)
+                            with detail_c1:
+                                st.markdown("##### Top 5 SKU")
+                                top_skus = system_result["top_skus"]
+                                if top_skus.empty:
+                                    st.caption("当日暂无正向 POS 销售。")
+                                else:
+                                    st.dataframe(
+                                        top_skus.style.format(
+                                            {
+                                                "销售数量": "{:.0f}",
+                                                "总营业额": "${:.2f}",
+                                            }
+                                        ),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+                            with detail_c2:
+                                st.markdown("##### 换货与退款")
+                                st.write(
+                                    f"换货流水：{system_result['exchange_count']} 条"
+                                )
+                                st.write(
+                                    "退款流水："
+                                    f"{system_result['refund_count']} 条，"
+                                    f"共 {system_result['refunded_items']} 件"
+                                )
+
+                            st.markdown("##### 折扣 / 亏损 / 资料警示")
+                            discount_alerts = system_result[
+                                "discount_alerts"
+                            ]
+                            if discount_alerts.empty:
+                                st.caption("当日没有需特别复核的 SKU。")
+                            else:
+                                st.dataframe(
+                                    discount_alerts,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                            st.markdown("##### 当日库存流水")
+                            inventory_events = system_result[
+                                "inventory_events"
+                            ]
+                            if inventory_events.empty:
+                                st.caption("当日没有入库、调拨或盘点流水。")
+                            else:
+                                st.dataframe(
+                                    inventory_events,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                            for warning_text in system_result["warnings"]:
+                                st.warning(warning_text)
+
+        if not df_employee.empty:
             st.divider()
             st.subheader("🛍️ 员工内购扣款")
             st.caption("用于记录员工拿货/内购金额。发工资时可直接从薪资中扣除；如勾选扣库存，系统会同步从库存中出库。")
@@ -3890,6 +5546,137 @@ if is_admin:
                 st.info("暂无有效销售数据进行核算。")
         else:
             st.info("💡 目前没有流水记录，无法计算利润。")
+
+        with st.expander("🔍 单日利润诊断", expanded=False):
+            diagnosis_start = pd.Timestamp(t5_start).date()
+            diagnosis_end = pd.Timestamp(t5_end).date()
+            diagnosis_dates = set()
+
+            for diagnosis_source in (df_sales, df_attendance):
+                if diagnosis_source is None or diagnosis_source.empty or "日期" not in diagnosis_source.columns:
+                    continue
+                source_dates = pd.to_datetime(
+                    diagnosis_source["日期"], errors="coerce"
+                ).dropna().dt.date
+                diagnosis_dates.update(
+                    source_date
+                    for source_date in source_dates
+                    if diagnosis_start <= source_date <= diagnosis_end
+                )
+
+            diagnosis_dates = sorted(diagnosis_dates, reverse=True)
+            if not diagnosis_dates:
+                st.info("当前净利润查询范围内暂无销售或考勤记录，暂时没有可诊断的日期。")
+            else:
+                selected_diagnosis_date = st.selectbox(
+                    "选择诊断日期",
+                    diagnosis_dates,
+                    index=0,
+                    format_func=lambda value: value.strftime("%Y/%m/%d"),
+                    key="daily_profit_diagnosis_date",
+                )
+                diagnosis = compute_daily_profit_diagnosis(
+                    df_stock,
+                    df_sales,
+                    df_attendance,
+                    selected_diagnosis_date,
+                )
+                diagnosis_summary = diagnosis["summary"]
+
+                for warning_message in diagnosis["warnings"]:
+                    st.warning(warning_message)
+
+                st.markdown("#### 实际 vs 按当前档案原价模拟")
+                dg1, dg2, dg3, dg4 = st.columns(4)
+                dg1.metric(
+                    "实际营业额",
+                    f"${diagnosis_summary['实际营业额']:,.2f}",
+                )
+                dg2.metric(
+                    "原价模拟营业额",
+                    f"${diagnosis_summary['原价模拟营业额']:,.2f}",
+                )
+                dg3.metric(
+                    "实际净利润",
+                    f"${diagnosis_summary['实际净利润']:,.2f}",
+                )
+                dg4.metric(
+                    "原价模拟净利润",
+                    f"${diagnosis_summary['原价模拟净利润']:,.2f}",
+                )
+
+                dg_return1, dg_return2 = st.columns(2)
+                dg_return1.metric(
+                    "实际商场回款",
+                    f"${diagnosis_summary['商场实际回款']:,.2f}",
+                )
+                dg_return2.metric(
+                    "原价模拟商场回款",
+                    f"${diagnosis_summary['原价模拟回款']:,.2f}",
+                )
+
+                dg5, dg6, dg7, dg8 = st.columns(4)
+                dg5.metric(
+                    "折扣减少营业额",
+                    f"${diagnosis_summary['折扣减少营业额']:,.2f}",
+                )
+                dg6.metric(
+                    "折扣减少净利润",
+                    f"${diagnosis_summary['折扣减少净利润']:,.2f}",
+                )
+                dg7.metric(
+                    "商品成本",
+                    f"${diagnosis_summary['商品成本']:,.2f}",
+                )
+                dg8.metric(
+                    "人工成本",
+                    f"${diagnosis_summary['人工成本']:,.2f}",
+                )
+
+                diagnosis_detail = diagnosis["sku_detail"]
+                if diagnosis_detail.empty:
+                    st.info("该日没有 SKU 销售明细；如有考勤记录，上方仍会计入人工成本。")
+                else:
+                    diagnosis_status_styles = {
+                        "资料不完整": "background-color: #fff3cd; color: #664d03;",
+                        "亏损销售": "background-color: #f8d7da; color: #842029;",
+                        "深度折扣": "background-color: #ffe5d0; color: #7a3e00;",
+                        "轻度折扣": "background-color: #fff3cd; color: #664d03;",
+                        "接近原价": "background-color: #d1e7dd; color: #0f5132;",
+                        "成交价高于当前档案价": "background-color: #cff4fc; color: #055160;",
+                        "退款/数量冲抵": "background-color: #e9ecef; color: #495057;",
+                    }
+
+                    def color_diagnosis_status(value):
+                        return diagnosis_status_styles.get(str(value), "")
+
+                    diagnosis_format = {
+                        "销售数量": "{:.2f}",
+                        "实际成交单价": "${:.2f}",
+                        "当前商品原价": "${:.2f}",
+                        "折扣率%": "{:.1f}%",
+                        "单件成本": "${:.2f}",
+                        "实际单件净贡献": "${:.2f}",
+                        "原价单件净贡献": "${:.2f}",
+                        "利润损失": "${:.2f}",
+                    }
+                    try:
+                        styled_diagnosis = (
+                            diagnosis_detail.style
+                            .format(diagnosis_format)
+                            .map(color_diagnosis_status, subset=["状态"])
+                        )
+                    except AttributeError:
+                        styled_diagnosis = (
+                            diagnosis_detail.style
+                            .format(diagnosis_format)
+                            .applymap(color_diagnosis_status, subset=["状态"])
+                        )
+                    st.dataframe(
+                        styled_diagnosis,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
     with t6:
         st.subheader("🤝 B2B 大客户与企采订单管理")
@@ -4429,6 +6216,603 @@ elif is_employee:
             c4.metric(t("预估总薪资", "Total Est. Wage"), f"${tot_w:.2f}")
         else:
             st.info(t("暂无打卡记录。", "No time logs found."))
+
+        with st.expander("🧾 我的每日关店报告", expanded=False):
+            employee_daily_close_user = str(
+                st.session_state.get("current_user", "")
+            ).strip()
+            employee_daily_close_user_key = (
+                employee_daily_close_user.casefold()
+            )
+            (
+                employee_daily_close_permission_frame,
+                employee_daily_close_permission_error,
+            ) = load_employee_permissions_safe()
+            employee_daily_close_session_systems = [
+                system_key
+                for system_key in st.session_state.get(
+                    "allowed_category_systems",
+                    [],
+                )
+                if system_key in CATEGORY_SYSTEMS
+            ]
+            if employee_daily_close_permission_error:
+                employee_daily_close_allowed_systems = []
+                employee_daily_close_access_error = (
+                    employee_daily_close_permission_error
+                )
+            else:
+                (
+                    employee_daily_close_allowed_systems,
+                    employee_daily_close_access_error,
+                ) = _resolve_employee_close_access(
+                    employee_daily_close_permission_frame,
+                    employee_daily_close_user,
+                    employee_daily_close_session_systems,
+                )
+
+            if not employee_daily_close_allowed_systems:
+                st.session_state.pop(
+                    "employee_daily_close_snapshot",
+                    None,
+                )
+                st.session_state.pop(
+                    "employee_daily_close_flash",
+                    None,
+                )
+                st.warning(
+                    employee_daily_close_access_error
+                    or "当前账号没有可提交关店报告的品类权限。"
+                )
+            else:
+                employee_daily_close_flash = st.session_state.pop(
+                    "employee_daily_close_flash",
+                    "",
+                )
+                if employee_daily_close_flash:
+                    st.success(employee_daily_close_flash)
+
+                with st.form("employee_daily_close_query_form"):
+                    employee_daily_close_date = st.date_input(
+                        "报告日期",
+                        value=datetime.now().date(),
+                        key="employee_daily_close_date",
+                    )
+                    if len(employee_daily_close_allowed_systems) == 1:
+                        employee_daily_close_system = (
+                            employee_daily_close_allowed_systems[0]
+                        )
+                        st.caption(
+                            "当前品类："
+                            f"{CATEGORY_SYSTEMS[employee_daily_close_system]['label']}"
+                        )
+                    else:
+                        employee_daily_close_system_labels = {
+                            CATEGORY_SYSTEMS[system_key]["label"]: system_key
+                            for system_key in employee_daily_close_allowed_systems
+                        }
+                        employee_daily_close_selected_label = st.selectbox(
+                            "品类系统",
+                            list(employee_daily_close_system_labels.keys()),
+                            key="employee_daily_close_system",
+                        )
+                        employee_daily_close_system = (
+                            employee_daily_close_system_labels[
+                                employee_daily_close_selected_label
+                            ]
+                        )
+                    employee_daily_close_query_submitted = (
+                        st.form_submit_button(
+                            "查看/刷新关店数据",
+                            use_container_width=True,
+                        )
+                    )
+
+                if employee_daily_close_query_submitted:
+                    load_employee_permissions_safe.clear()
+                    (
+                        employee_daily_close_query_permissions,
+                        employee_daily_close_query_permission_error,
+                    ) = load_employee_permissions_safe()
+                    if employee_daily_close_query_permission_error:
+                        employee_daily_close_query_allowed = []
+                        employee_daily_close_query_access_error = (
+                            employee_daily_close_query_permission_error
+                        )
+                    else:
+                        (
+                            employee_daily_close_query_allowed,
+                            employee_daily_close_query_access_error,
+                        ) = _resolve_employee_close_access(
+                            employee_daily_close_query_permissions,
+                            employee_daily_close_user,
+                            employee_daily_close_session_systems,
+                        )
+                    employee_daily_close_day_value = pd.to_datetime(
+                        employee_daily_close_date,
+                        errors="coerce",
+                    )
+                    if (
+                        employee_daily_close_system
+                        not in employee_daily_close_query_allowed
+                    ):
+                        st.session_state.pop(
+                            "employee_daily_close_snapshot",
+                            None,
+                        )
+                        st.session_state.pop(
+                            "employee_daily_close_flash",
+                            None,
+                        )
+                        st.warning(
+                            employee_daily_close_query_access_error
+                            or "当前账号没有该品类权限，未读取关店数据。"
+                        )
+                    elif pd.isna(employee_daily_close_day_value):
+                        st.warning("报告日期无法识别，请重新选择。")
+                    else:
+                        employee_daily_close_allowed_systems = (
+                            employee_daily_close_query_allowed
+                        )
+                        employee_daily_close_day = (
+                            employee_daily_close_day_value.date()
+                        )
+                        (
+                            employee_daily_close_data,
+                            employee_daily_close_source_error,
+                        ) = load_category_close_data_safe(
+                            employee_daily_close_system
+                        )
+                        if employee_daily_close_source_error:
+                            st.warning(employee_daily_close_source_error)
+                        load_daily_close_records_safe.clear()
+                        (
+                            employee_daily_close_records,
+                            employee_daily_close_record_error,
+                        ) = load_daily_close_records_safe()
+                        employee_daily_close_summary = (
+                            build_daily_close_summary(
+                                employee_daily_close_data["stock"],
+                                employee_daily_close_data["sales"],
+                                df_attendance,
+                                employee_daily_close_data["restock"],
+                                employee_daily_close_day,
+                                allocated_wage=None,
+                            )
+                        )
+                        employee_daily_close_safe_view = get_daily_close_view(
+                            employee_daily_close_summary,
+                            "employee",
+                            employee_daily_close_user,
+                        )
+                        employee_daily_close_saved_record = None
+                        if (
+                            not employee_daily_close_records.empty
+                            and not employee_daily_close_record_error
+                        ):
+                            employee_daily_close_record_dates = pd.to_datetime(
+                                employee_daily_close_records["报告日期"],
+                                errors="coerce",
+                            ).dt.date
+                            employee_daily_close_record_systems = (
+                                employee_daily_close_records["品类系统"]
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
+                            )
+                            employee_daily_close_system_label = (
+                                CATEGORY_SYSTEMS[
+                                    employee_daily_close_system
+                                ]["label"]
+                            )
+                            employee_daily_close_record_rows = (
+                                employee_daily_close_records.loc[
+                                    employee_daily_close_record_dates.eq(
+                                        employee_daily_close_day
+                                    )
+                                    & employee_daily_close_record_systems.isin(
+                                        [
+                                            employee_daily_close_system,
+                                            employee_daily_close_system_label,
+                                        ]
+                                    )
+                                ]
+                            )
+                            if not employee_daily_close_record_rows.empty:
+                                employee_daily_close_saved_record = (
+                                    employee_daily_close_record_rows.iloc[
+                                        -1
+                                    ].to_dict()
+                                )
+                        if not employee_daily_close_source_error:
+                            st.session_state[
+                                "employee_daily_close_snapshot"
+                            ] = {
+                                "safe_view": employee_daily_close_safe_view,
+                                "date": employee_daily_close_day,
+                                "system": employee_daily_close_system,
+                                "saved_record": (
+                                    employee_daily_close_saved_record
+                                ),
+                                "record_error": (
+                                    employee_daily_close_record_error
+                                ),
+                                "status": close_report_status(
+                                    employee_daily_close_saved_record
+                                ),
+                            }
+
+                employee_daily_close_snapshot = st.session_state.get(
+                    "employee_daily_close_snapshot"
+                )
+                if (
+                    employee_daily_close_snapshot is not None
+                    and employee_daily_close_snapshot.get("system")
+                    not in employee_daily_close_allowed_systems
+                ):
+                    st.session_state.pop("employee_daily_close_snapshot", None)
+                    employee_daily_close_snapshot = None
+                    st.warning(
+                        "原关店快照不在当前品类权限内，请重新查询。"
+                    )
+                if employee_daily_close_snapshot is None:
+                    st.info(
+                        "选择日期后点击“查看/刷新关店数据”。"
+                        "未点击时不会读取后台或重新计算。"
+                    )
+                else:
+                    employee_daily_close_render_system = (
+                        employee_daily_close_snapshot["system"]
+                    )
+                    employee_daily_close_render_day = (
+                        employee_daily_close_snapshot["date"]
+                    )
+                    employee_daily_close_safe_view = (
+                        employee_daily_close_snapshot["safe_view"]
+                    )
+                    employee_daily_close_saved_record = (
+                        employee_daily_close_snapshot.get("saved_record")
+                    )
+                    employee_daily_close_record_error = (
+                        employee_daily_close_snapshot.get("record_error", "")
+                    )
+                    if employee_daily_close_record_error:
+                        st.warning(employee_daily_close_record_error)
+
+                    st.markdown(
+                        f"#### "
+                        f"{CATEGORY_SYSTEMS[employee_daily_close_render_system]['label']}"
+                        f"｜{employee_daily_close_render_day.strftime('%Y/%m/%d')}"
+                    )
+                    employee_daily_close_public = (
+                        employee_daily_close_safe_view["summary"]
+                    )
+                    employee_close_m1, employee_close_m2, employee_close_m3 = (
+                        st.columns(3)
+                    )
+                    employee_close_m1.metric(
+                        "营业额",
+                        f"${employee_daily_close_public['营业额']:.2f}",
+                    )
+                    employee_close_m2.metric(
+                        "订单数",
+                        f"{int(employee_daily_close_public['订单数'])} 单",
+                    )
+                    employee_close_m3.metric(
+                        "售出件数",
+                        f"{int(employee_daily_close_public['售出件数'])} 件",
+                    )
+                    employee_close_m4, employee_close_m5 = st.columns(2)
+                    employee_close_m4.metric(
+                        "我的销售额",
+                        f"${employee_daily_close_public['我的销售额']:.2f}",
+                    )
+                    employee_close_m5.metric(
+                        "我的工时",
+                        f"{employee_daily_close_public['我的工时']:.2f} 小时",
+                    )
+
+                    st.markdown("##### Top SKU")
+                    employee_daily_close_top = (
+                        employee_daily_close_safe_view["top_skus"]
+                    )
+                    if employee_daily_close_top.empty:
+                        st.caption("该日期暂无销售商品。")
+                    else:
+                        st.dataframe(
+                            employee_daily_close_top,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    employee_daily_close_status = close_report_status(
+                        employee_daily_close_saved_record
+                    )
+                    employee_daily_close_status_icon = {
+                        "未提交": "⚪",
+                        "已提交": "✅",
+                        "有异常": "⚠️",
+                    }.get(employee_daily_close_status, "⚪")
+                    st.markdown(
+                        f"##### {employee_daily_close_status_icon} "
+                        f"当前提交状态：{employee_daily_close_status}"
+                    )
+                    if employee_daily_close_saved_record:
+                        st.caption(
+                            "最后提交："
+                            f"{employee_daily_close_saved_record.get('最后提交人', '')}"
+                            "｜"
+                            f"{employee_daily_close_saved_record.get('最后提交时间', '')}"
+                        )
+
+                    employee_daily_close_existing = (
+                        employee_daily_close_saved_record or {}
+                    )
+                    employee_daily_close_inventory_default = (
+                        employee_daily_close_existing.get("库存状态", "正常")
+                    )
+                    if employee_daily_close_inventory_default not in {
+                        "正常",
+                        "有异常",
+                    }:
+                        employee_daily_close_inventory_default = "正常"
+                    employee_daily_close_special_default = (
+                        employee_daily_close_existing.get(
+                            "特殊事项状态",
+                            "没有",
+                        )
+                    )
+                    if employee_daily_close_special_default not in {
+                        "没有",
+                        "有",
+                    }:
+                        employee_daily_close_special_default = "没有"
+
+                    employee_daily_close_saved_revision = str(
+                        employee_daily_close_existing.get(
+                            "最后提交时间",
+                            "",
+                        )
+                    ).strip()
+                    employee_daily_close_form_context = "|".join(
+                        [
+                            employee_daily_close_user_key,
+                            employee_daily_close_render_day.isoformat(),
+                            employee_daily_close_render_system,
+                            employee_daily_close_saved_revision,
+                            json.dumps(
+                                {
+                                    key: str(
+                                        employee_daily_close_existing.get(
+                                            key,
+                                            "",
+                                        )
+                                    )
+                                    for key in (
+                                        "库存状态",
+                                        "特殊事项状态",
+                                        "异常说明",
+                                        "客户反馈",
+                                        "明日交接事项",
+                                    )
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                        ]
+                    )
+                    employee_daily_close_form_token = hashlib.sha256(
+                        employee_daily_close_form_context.encode("utf-8")
+                    ).hexdigest()[:16]
+                    employee_daily_close_form_key = (
+                        "employee_daily_close_form_"
+                        f"{employee_daily_close_form_token}"
+                    )
+
+                    with st.form(employee_daily_close_form_key):
+                        employee_close_f1, employee_close_f2 = st.columns(2)
+                        employee_daily_close_inventory_status = (
+                            employee_close_f1.radio(
+                                "库存状态",
+                                ["正常", "有异常"],
+                                index=(
+                                    1
+                                    if employee_daily_close_inventory_default
+                                    == "有异常"
+                                    else 0
+                                ),
+                                horizontal=True,
+                                key=(
+                                    "employee_daily_close_inventory_"
+                                    f"{employee_daily_close_form_token}"
+                                ),
+                            )
+                        )
+                        employee_daily_close_special_status = (
+                            employee_close_f2.radio(
+                                "坏货、换货或待处理订单",
+                                ["没有", "有"],
+                                index=(
+                                    1
+                                    if employee_daily_close_special_default
+                                    == "有"
+                                    else 0
+                                ),
+                                horizontal=True,
+                                key=(
+                                    "employee_daily_close_special_"
+                                    f"{employee_daily_close_form_token}"
+                                ),
+                            )
+                        )
+                        employee_daily_close_explanation = st.text_area(
+                            "异常说明",
+                            value=employee_daily_close_existing.get(
+                                "异常说明",
+                                "",
+                            ),
+                            key=(
+                                "employee_daily_close_explanation_"
+                                f"{employee_daily_close_form_token}"
+                            ),
+                        )
+                        employee_daily_close_feedback = st.text_area(
+                            "客户反馈",
+                            value=employee_daily_close_existing.get(
+                                "客户反馈",
+                                "",
+                            ),
+                            key=(
+                                "employee_daily_close_feedback_"
+                                f"{employee_daily_close_form_token}"
+                            ),
+                        )
+                        employee_daily_close_handover = st.text_area(
+                            "明日交接",
+                            value=employee_daily_close_existing.get(
+                                "明日交接事项",
+                                "",
+                            ),
+                            key=(
+                                "employee_daily_close_handover_"
+                                f"{employee_daily_close_form_token}"
+                            ),
+                        )
+                        employee_daily_close_save_submitted = (
+                            st.form_submit_button(
+                                "保存关店备注",
+                                type="primary",
+                                use_container_width=True,
+                            )
+                        )
+
+                    if employee_daily_close_save_submitted:
+                        (
+                            employee_daily_close_latest_employees,
+                            employee_daily_close_latest_permission_error,
+                        ) = _load_employee_permissions_uncached_safe()
+                        if employee_daily_close_latest_permission_error:
+                            st.session_state.pop(
+                                "employee_daily_close_snapshot",
+                                None,
+                            )
+                            st.session_state.pop(
+                                "employee_daily_close_flash",
+                                None,
+                            )
+                            employee_daily_close_latest_allowed = []
+                            employee_daily_close_latest_access_error = (
+                                employee_daily_close_latest_permission_error
+                            )
+                        else:
+                            (
+                                employee_daily_close_latest_allowed,
+                                employee_daily_close_latest_access_error,
+                            ) = _resolve_employee_close_access(
+                                employee_daily_close_latest_employees,
+                                employee_daily_close_user,
+                                employee_daily_close_session_systems,
+                            )
+                        employee_daily_close_permission_ok = (
+                            employee_daily_close_render_system
+                            in employee_daily_close_latest_allowed
+                        )
+
+                        if not employee_daily_close_permission_ok:
+                            st.session_state.pop(
+                                "employee_daily_close_snapshot",
+                                None,
+                            )
+                            st.session_state.pop(
+                                "employee_daily_close_flash",
+                                None,
+                            )
+                            st.error(
+                                employee_daily_close_latest_access_error
+                                or "当前账号已没有该品类权限，关店备注未保存。"
+                            )
+                        else:
+                            (
+                                employee_daily_close_payload_ok,
+                                employee_daily_close_payload_error,
+                            ) = validate_daily_close_payload(
+                                employee_daily_close_inventory_status,
+                                employee_daily_close_special_status,
+                                employee_daily_close_explanation,
+                            )
+                            if not employee_daily_close_payload_ok:
+                                st.warning(
+                                    employee_daily_close_payload_error
+                                )
+                            else:
+                                employee_daily_close_record = {
+                                    "报告日期": (
+                                        employee_daily_close_render_day.strftime(
+                                            "%Y/%m/%d"
+                                        )
+                                    ),
+                                    "品类系统": (
+                                        employee_daily_close_render_system
+                                    ),
+                                    "库存状态": (
+                                        employee_daily_close_inventory_status
+                                    ),
+                                    "特殊事项状态": (
+                                        employee_daily_close_special_status
+                                    ),
+                                    "异常说明": (
+                                        employee_daily_close_explanation.strip()
+                                    ),
+                                    "客户反馈": (
+                                        employee_daily_close_feedback.strip()
+                                    ),
+                                    "明日交接事项": (
+                                        employee_daily_close_handover.strip()
+                                    ),
+                                    "最后提交人": employee_daily_close_user,
+                                    "最后提交时间": datetime.now().strftime(
+                                        "%Y/%m/%d %H:%M:%S"
+                                    ),
+                                }
+                                employee_daily_close_latest_close = (
+                                    upsert_daily_close_record(
+                                        pd.DataFrame(
+                                            columns=DAILY_CLOSE_COLS
+                                        ),
+                                        employee_daily_close_record,
+                                        DAILY_CLOSE_COLS,
+                                    )
+                                )
+                                (
+                                    employee_daily_close_saved,
+                                    employee_daily_close_save_error,
+                                ) = save_daily_close_records_safe(
+                                    employee_daily_close_latest_close
+                                )
+                                if employee_daily_close_saved:
+                                    employee_daily_close_snapshot[
+                                        "saved_record"
+                                    ] = employee_daily_close_record
+                                    employee_daily_close_snapshot[
+                                        "status"
+                                    ] = close_report_status(
+                                        employee_daily_close_record
+                                    )
+                                    employee_daily_close_snapshot[
+                                        "record_error"
+                                    ] = ""
+                                    st.session_state[
+                                        "employee_daily_close_snapshot"
+                                    ] = employee_daily_close_snapshot
+                                    st.session_state[
+                                        "employee_daily_close_flash"
+                                    ] = "关店备注已安全保存。"
+                                    st.rerun()
+                                else:
+                                    st.error(
+                                        employee_daily_close_save_error
+                                        or "关店备注暂时无法保存，请稍后重试。"
+                                    )
 
         st.divider()
         st.markdown(t("### 💵 我的提成与工资", "### 💵 My Commission & Wage"))
