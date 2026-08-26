@@ -9,6 +9,8 @@ import hashlib
 import math
 import time as pytime
 import plotly.express as px
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 
 # Popup BI is kept inside app.py so Streamlit Cloud can run even when only this file is deployed.
 BI_SKU_KEYS = ["商品名称", "颜色"]
@@ -17,6 +19,100 @@ BI_ADJUSTMENT_OPS = {"盘盈", "盘亏", "Surplus (+)", "Shortage (-)"}
 CUSTOMER_GST_RATE = 0.09
 TAKASHIMAYA_COMMISSION_RATE = 0.36
 TAKASHIMAYA_COMMISSION_GST_RATE = 0.09
+ECB_DAILY_FX_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+
+
+def _parse_ecb_cny_per_sgd(xml_payload):
+    root = ET.fromstring(xml_payload)
+    observation_date = ""
+    currency_rates = {}
+    for node in root.iter():
+        if node.attrib.get("time"):
+            observation_date = str(node.attrib["time"])
+        currency = str(node.attrib.get("currency", "")).upper()
+        if currency in {"CNY", "SGD"}:
+            try:
+                currency_rates[currency] = float(node.attrib["rate"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    cny_rate = currency_rates.get("CNY")
+    sgd_rate = currency_rates.get("SGD")
+    if (
+        not observation_date
+        or cny_rate is None
+        or sgd_rate is None
+        or not math.isfinite(cny_rate)
+        or not math.isfinite(sgd_rate)
+        or cny_rate <= 0
+        or sgd_rate <= 0
+    ):
+        raise ValueError("ECB 汇率数据不完整")
+    return {
+        "rate": cny_rate / sgd_rate,
+        "date": observation_date,
+        "source": "ECB",
+    }
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _fetch_daily_cny_per_sgd():
+    request = Request(
+        ECB_DAILY_FX_URL,
+        headers={"User-Agent": "Takashimaya-Retail-Manager/1.0"},
+    )
+    with urlopen(request, timeout=4) as response:
+        return _parse_ecb_cny_per_sgd(response.read())
+
+
+def _apply_sales_fx_model(sales_df, stock_df, benchmark_rate, current_rate):
+    try:
+        benchmark_rate = float(benchmark_rate)
+        current_rate = float(current_rate)
+    except (TypeError, ValueError):
+        raise ValueError("汇率必须是有效数字")
+    if (
+        not math.isfinite(benchmark_rate)
+        or not math.isfinite(current_rate)
+        or benchmark_rate <= 0
+        or current_rate <= 0
+    ):
+        raise ValueError("汇率必须大于 0")
+
+    result = sales_df.copy()
+    for column in ("商品名称", "颜色"):
+        if column not in result.columns:
+            result[column] = ""
+    result["_fx_sku_name"] = result["商品名称"].fillna("").astype(str).str.strip()
+    result["_fx_sku_color"] = result["颜色"].fillna("").astype(str).str.strip()
+
+    stock = stock_df.copy()
+    for column in ("商品名称", "颜色"):
+        if column not in stock.columns:
+            stock[column] = ""
+    if "进价成本" not in stock.columns:
+        stock["进价成本"] = pd.NA
+    stock["_fx_sku_name"] = stock["商品名称"].fillna("").astype(str).str.strip()
+    stock["_fx_sku_color"] = stock["颜色"].fillna("").astype(str).str.strip()
+    stock["档案进价 SGD"] = pd.to_numeric(stock["进价成本"], errors="coerce")
+    stock.loc[stock["档案进价 SGD"] <= 0, "档案进价 SGD"] = pd.NA
+    stock = stock.drop_duplicates(
+        subset=["_fx_sku_name", "_fx_sku_color"], keep="last"
+    )
+
+    result = result.merge(
+        stock[["_fx_sku_name", "_fx_sku_color", "档案进价 SGD"]],
+        on=["_fx_sku_name", "_fx_sku_color"],
+        how="left",
+    )
+    quantity = pd.to_numeric(result.get("销售数量", 0), errors="coerce").fillna(0.0)
+    revenue = pd.to_numeric(result.get("总营业额", 0), errors="coerce").fillna(0.0)
+    estimated_cost = result["档案进价 SGD"] * benchmark_rate / current_rate
+    result["今日汇率估算进价 SGD"] = estimated_cost
+    result["汇率成本差/件"] = estimated_cost - result["档案进价 SGD"]
+    result["本单汇率影响"] = result["汇率成本差/件"] * quantity
+    result["汇率后估算毛利"] = revenue - estimated_cost * quantity
+    return result.drop(columns=["_fx_sku_name", "_fx_sku_color"], errors="ignore")
 
 
 def _takashimaya_cash_values(gross):
@@ -4296,6 +4392,46 @@ if is_admin:
             st.rerun()
         f_sl = sort_sales_latest_first(get_f(df_sales, q))
         if not f_sl.empty:
+            try:
+                fx_feed = _fetch_daily_cny_per_sgd()
+                fx_feed_error = False
+            except Exception:
+                fx_feed = {"rate": 0.0, "date": "", "source": "ECB"}
+                fx_feed_error = True
+
+            with st.expander("💱 汇率成本模型（管理员估算）", expanded=False):
+                fx_c1, fx_c2 = st.columns(2)
+                fx_benchmark_rate = fx_c1.number_input(
+                    "原进价基准汇率（1 SGD = CNY）",
+                    min_value=0.0001,
+                    value=5.3000,
+                    step=0.0100,
+                    format="%.4f",
+                    key="admin_sales_fx_benchmark_rate",
+                )
+                fx_current_rate = fx_c2.number_input(
+                    "当日参考汇率（1 SGD = CNY）",
+                    min_value=0.0000,
+                    value=round(float(fx_feed.get("rate", 0.0)), 4),
+                    step=0.0100,
+                    format="%.4f",
+                    key="admin_sales_fx_current_rate",
+                )
+                if fx_feed_error:
+                    st.warning("ECB 当日参考汇率暂时无法取得；输入手动汇率后仍可使用估算模型。")
+                else:
+                    st.caption(
+                        f"参考数据：{fx_feed['source']} · {fx_feed['date']} · "
+                        f"1 SGD = {fx_feed['rate']:.4f} CNY"
+                    )
+                st.caption("该结果是参考汇率估算，不代表银行或厂商最终结算汇率。")
+
+            fx_model_enabled = (
+                math.isfinite(float(fx_benchmark_rate))
+                and math.isfinite(float(fx_current_rate))
+                and float(fx_benchmark_rate) > 0
+                and float(fx_current_rate) > 0
+            )
             f_sl_sel = f_sl.copy()
             # 保留这条流水在 Sales 表里的原始行号，用来做“单条精确撤销”。
             # 这列会被隐藏，不展示给用户。
@@ -4303,6 +4439,14 @@ if is_admin:
             
             f_sl_sel['成交单价'] = pd.to_numeric(f_sl_sel['成交单价'], errors='coerce').fillna(0.0)
             f_sl_sel['总营业额'] = pd.to_numeric(f_sl_sel['总营业额'], errors='coerce').fillna(0.0)
+
+            if fx_model_enabled:
+                f_sl_sel = _apply_sales_fx_model(
+                    f_sl_sel,
+                    df_stock,
+                    benchmark_rate=fx_benchmark_rate,
+                    current_rate=fx_current_rate,
+                )
             
             f_sl_sel['商品名称'] = translate_series(f_sl_sel['商品名称'])
             f_sl_sel['颜色'] = translate_series(f_sl_sel['颜色'])
@@ -4310,12 +4454,22 @@ if is_admin:
             sel_col_name = "Sel" if st.session_state.lang == 'en' else "选择"
             f_sl_sel.insert(0, sel_col_name, False)
             
-            if st.session_state.lang == 'en': f_sl_sel.rename(columns=col_map, inplace=True)
+            fx_column_map = {
+                '档案进价 SGD': 'Recorded Cost SGD',
+                '今日汇率估算进价 SGD': 'FX-estimated Cost SGD',
+                '汇率成本差/件': 'FX Cost Difference / Item',
+                '本单汇率影响': 'FX Impact / Sale',
+                '汇率后估算毛利': 'FX-adjusted Estimated Margin',
+            }
+            if st.session_state.lang == 'en':
+                f_sl_sel.rename(columns={**col_map, **fx_column_map}, inplace=True)
             
             u_col = 'Unit Price' if st.session_state.lang == 'en' else '成交单价'
             t_col = 'Total Amount' if st.session_state.lang == 'en' else '总营业额'
-            
-            styled_sl = f_sl_sel.style.format({u_col: '${:.2f}', t_col: '${:.2f}'})
+            fx_money_cols = list(fx_column_map.values()) if st.session_state.lang == 'en' else list(fx_column_map.keys())
+            money_formats = {u_col: '${:.2f}', t_col: '${:.2f}'}
+            money_formats.update({column: '${:.2f}' for column in fx_money_cols if column in f_sl_sel.columns})
+            styled_sl = f_sl_sel.style.format(money_formats, na_rep='—')
             
             d_disable = [c for c in f_sl_sel.columns if c != sel_col_name]
             visible_sales_cols = [c for c in f_sl_sel.columns if c != '__sales_source_index']
