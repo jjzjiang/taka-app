@@ -6,6 +6,7 @@ from gspread.exceptions import WorksheetNotFound, APIError
 import json
 import hmac
 import hashlib
+import math
 import time as pytime
 import plotly.express as px
 
@@ -13,6 +14,34 @@ import plotly.express as px
 BI_SKU_KEYS = ["商品名称", "颜色"]
 BI_INBOUND_OPS = {"入库", "初始建档", "Inbound", "Initial Setup"}
 BI_ADJUSTMENT_OPS = {"盘盈", "盘亏", "Surplus (+)", "Shortage (-)"}
+CUSTOMER_GST_RATE = 0.09
+TAKASHIMAYA_COMMISSION_RATE = 0.36
+TAKASHIMAYA_COMMISSION_GST_RATE = 0.09
+
+
+def _takashimaya_cash_values(gross):
+    try:
+        gross = float(gross)
+    except (TypeError, ValueError):
+        gross = 0.0
+    if not math.isfinite(gross):
+        gross = 0.0
+
+    net = gross / (1 + CUSTOMER_GST_RATE)
+    customer_gst = gross - net
+    commission = net * TAKASHIMAYA_COMMISSION_RATE
+    commission_gst = commission * TAKASHIMAYA_COMMISSION_GST_RATE
+    after_commission = net - commission
+    bank_receipt = after_commission - commission_gst
+    return {
+        "免税净营业额": net,
+        "代扣GST(9%)": customer_gst,
+        "商场抽成(36%)": commission,
+        "高岛屋抽成GST(9%)": commission_gst,
+        "抽成后金额(未扣抽成GST)": after_commission,
+        "预计银行到账": bank_receipt,
+        "商场实际回款": bank_receipt,
+    }
 
 def _bi_empty_frame():
     return pd.DataFrame(columns=[
@@ -512,7 +541,8 @@ def compute_period_financials(stock_df, sales_df, attendance_df, start_date, end
     attendance = attendance_df.copy()
     period_sales = sales[(sales["日期_dt"] >= start_date) & (sales["日期_dt"] <= end_date)].copy()
     if not period_sales.empty:
-        period_sales = period_sales.merge(stock[BI_SKU_KEYS + ["进价成本"]], on=BI_SKU_KEYS, how="left")
+        cost_lookup = stock[BI_SKU_KEYS + ["进价成本"]].copy()
+        period_sales = period_sales.merge(cost_lookup, on=BI_SKU_KEYS, how="left")
         period_sales["进价成本"] = _bi_num(period_sales["进价成本"])
         period_sales["总进价成本"] = period_sales["销售数量"] * period_sales["进价成本"]
     else:
@@ -530,19 +560,21 @@ def compute_period_financials(stock_df, sales_df, attendance_df, start_date, end
         wage_total = float(period_att["核算薪资"].sum()) if not period_att.empty else 0.0
     gross = float(period_sales["总营业额"].sum()) if not period_sales.empty else 0.0
     cogs = float(period_sales["总进价成本"].sum()) if not period_sales.empty else 0.0
-    net_revenue = gross / 1.09 if gross else 0.0
-    gst = gross - net_revenue
-    commission = net_revenue * 0.36
-    settlement = net_revenue - commission
-    gross_profit = settlement - cogs
+    cash_values = _takashimaya_cash_values(gross)
+    gross_profit = cash_values["预计银行到账"] - cogs
     net_profit = gross_profit - wage_total
     net_margin = (net_profit / gross * 100) if gross > 0 else 0.0
     return {
         "总营业额": round(gross, 2),
-        "免税净营业额": round(net_revenue, 2),
-        "代扣GST(9%)": round(gst, 2),
-        "商场抽成(36%)": round(commission, 2),
-        "商场实际回款": round(settlement, 2),
+        "免税净营业额": round(cash_values["免税净营业额"], 2),
+        "代扣GST(9%)": round(cash_values["代扣GST(9%)"], 2),
+        "商场抽成(36%)": round(cash_values["商场抽成(36%)"], 2),
+        "高岛屋抽成GST(9%)": round(cash_values["高岛屋抽成GST(9%)"], 2),
+        "抽成后金额(未扣抽成GST)": round(
+            cash_values["抽成后金额(未扣抽成GST)"], 2
+        ),
+        "预计银行到账": round(cash_values["预计银行到账"], 2),
+        "商场实际回款": round(cash_values["预计银行到账"], 2),
         "总进价成本": round(cogs, 2),
         "人工成本": round(wage_total, 2),
         "毛利润": round(gross_profit, 2),
@@ -552,17 +584,24 @@ def compute_period_financials(stock_df, sales_df, attendance_df, start_date, end
 
 
 def _daily_financial_values(gross, cogs, wage):
-    gross = float(gross or 0.0)
+    cash_values = _takashimaya_cash_values(gross)
+    gross = cash_values["免税净营业额"] * (1 + CUSTOMER_GST_RATE)
     cogs = float(cogs or 0.0)
     wage = float(wage or 0.0)
-    net_revenue = gross / 1.09
-    settlement = net_revenue * 0.64
     return {
         "营业额": round(gross, 2),
-        "商场实际回款": round(settlement, 2),
+        "免税净营业额": round(cash_values["免税净营业额"], 2),
+        "代扣GST(9%)": round(cash_values["代扣GST(9%)"], 2),
+        "商场抽成(36%)": round(cash_values["商场抽成(36%)"], 2),
+        "高岛屋抽成GST(9%)": round(cash_values["高岛屋抽成GST(9%)"], 2),
+        "抽成后金额(未扣抽成GST)": round(
+            cash_values["抽成后金额(未扣抽成GST)"], 2
+        ),
+        "预计银行到账": round(cash_values["预计银行到账"], 2),
+        "商场实际回款": round(cash_values["预计银行到账"], 2),
         "商品成本": round(cogs, 2),
         "人工成本": round(wage, 2),
-        "净利润": round(settlement - cogs - wage, 2),
+        "净利润": round(cash_values["预计银行到账"] - cogs - wage, 2),
     }
 
 
@@ -606,10 +645,43 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
     if "日期" not in sales.columns:
         sales["日期"] = ""
     sales["日期_dt"] = _bi_dates(sales, "日期")
-    for col in ["销售数量", "成交单价", "总营业额"]:
+    for col in ["销售数量", "成交单价"]:
         if col not in sales.columns:
             sales[col] = 0
+    quantity_values = pd.to_numeric(sales["销售数量"], errors="coerce")
+    unit_price_values = pd.to_numeric(sales["成交单价"], errors="coerce")
+    for col in ["销售数量", "成交单价"]:
         sales[col] = _bi_num(sales[col])
+    if "总营业额" not in sales.columns:
+        sales["总营业额"] = pd.NA
+    reported_revenue = pd.to_numeric(sales["总营业额"], errors="coerce")
+    invalid_reported_revenue = (
+        reported_revenue.isna()
+        | reported_revenue.eq(float("inf"))
+        | reported_revenue.eq(float("-inf"))
+    )
+    finite_quantity = (
+        quantity_values.notna()
+        & quantity_values.ne(float("inf"))
+        & quantity_values.ne(float("-inf"))
+    )
+    finite_unit_price = (
+        unit_price_values.notna()
+        & unit_price_values.ne(float("inf"))
+        & unit_price_values.ne(float("-inf"))
+    )
+    sales["营业额已重建"] = (
+        invalid_reported_revenue
+        & finite_quantity
+        & quantity_values.ne(0)
+        & finite_unit_price
+    )
+    sales["总营业额"] = reported_revenue.mask(invalid_reported_revenue)
+    sales.loc[sales["营业额已重建"], "总营业额"] = (
+        quantity_values[sales["营业额已重建"]]
+        * unit_price_values[sales["营业额已重建"]]
+    )
+    sales["总营业额"] = _bi_num(sales["总营业额"])
     day_sales = sales[sales["日期_dt"] == target_date].copy()
 
     attendance = attendance_df.copy() if attendance_df is not None else pd.DataFrame()
@@ -628,6 +700,16 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
             "summary": {
                 "实际营业额": actual["营业额"],
                 "原价模拟营业额": actual["营业额"],
+                "实际抽成后金额(未扣抽成GST)": actual[
+                    "抽成后金额(未扣抽成GST)"
+                ],
+                "原价模拟抽成后金额(未扣抽成GST)": actual[
+                    "抽成后金额(未扣抽成GST)"
+                ],
+                "实际高岛屋抽成GST(9%)": actual["高岛屋抽成GST(9%)"],
+                "原价模拟高岛屋抽成GST(9%)": actual["高岛屋抽成GST(9%)"],
+                "实际预计银行到账": actual["预计银行到账"],
+                "原价模拟预计银行到账": actual["预计银行到账"],
                 "商场实际回款": actual["商场实际回款"],
                 "原价模拟回款": actual["商场实际回款"],
                 "商品成本": actual["商品成本"],
@@ -660,11 +742,6 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
         / day_sales.loc[nonzero_quantity, "销售数量"]
     )
     positive_quantity = day_sales["销售数量"] > 0
-    day_sales["成交高于档案价"] = (
-        positive_quantity
-        & ~day_sales["原价缺失"]
-        & (day_sales["实际成交单价"] > day_sales["售卖价格"])
-    )
     day_sales["模拟单价"] = day_sales["实际成交单价"]
     repriced = positive_quantity & ~day_sales["原价缺失"]
     day_sales.loc[repriced, "模拟单价"] = day_sales.loc[
@@ -694,12 +771,16 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
             "售卖价格": "last",
             "成本缺失": "max",
             "原价缺失": "max",
-            "成交高于档案价": "max",
         }
     )
     grouped["实际成交单价"] = grouped["总营业额"] / grouped["销售数量"].replace(0, pd.NA)
     zero_quantity = grouped["销售数量"] == 0
     grouped.loc[zero_quantity, "实际成交单价"] = 0.0
+    grouped["成交高于档案价"] = (
+        grouped["销售数量"].gt(0)
+        & ~grouped["原价缺失"]
+        & grouped["实际成交单价"].gt(grouped["售卖价格"])
+    )
     grouped["模拟单价"] = (
         grouped["原价模拟营业额"] / grouped["销售数量"].replace(0, pd.NA)
     )
@@ -709,11 +790,16 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
         grouped["实际成交单价"] / grouped["售卖价格"].replace(0, pd.NA) * 100
     )
     grouped["折扣率%"] = pd.to_numeric(grouped["折扣率%"], errors="coerce").fillna(100.0)
+    retained_cash_factor = (
+        1
+        - TAKASHIMAYA_COMMISSION_RATE
+        - TAKASHIMAYA_COMMISSION_RATE * TAKASHIMAYA_COMMISSION_GST_RATE
+    ) / (1 + CUSTOMER_GST_RATE)
     grouped["实际单件净贡献"] = (
-        grouped["实际成交单价"] / 1.09 * 0.64 - grouped["进价成本"]
+        grouped["实际成交单价"] * retained_cash_factor - grouped["进价成本"]
     )
     grouped["原价单件净贡献"] = (
-        grouped["模拟单价"] / 1.09 * 0.64 - grouped["进价成本"]
+        grouped["模拟单价"] * retained_cash_factor - grouped["进价成本"]
     )
     nonpositive_quantity = grouped["销售数量"] <= 0
     grouped.loc[
@@ -722,7 +808,7 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
     ] = 0.0
     grouped["利润损失"] = (
         grouped["原价模拟营业额"] - grouped["总营业额"]
-    ).clip(lower=0) * 0.64 / 1.09
+    ).clip(lower=0) * retained_cash_factor
 
     def status_for(row):
         if row["成本缺失"] or row["原价缺失"]:
@@ -756,17 +842,29 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
     )
 
     warnings = []
+    if bool(day_sales["营业额已重建"].any()):
+        warnings.append("部分交易缺少有效总营业额，已按销售数量乘以成交单价重建。")
     if bool(day_sales["原价缺失"].any()):
         warnings.append("部分 SKU 缺少当前原价，相关行按实际成交价保守模拟。")
     if bool(day_sales["成本缺失"].any()):
         warnings.append("部分 SKU 缺少进价成本，已按 0 计算，当前净利润可能偏高。")
-    if bool(day_sales["成交高于档案价"].any()):
-        warnings.append("部分成交价高于当前档案价，相关折扣损失按 0 处理。")
+    if bool(grouped["成交高于档案价"].any()):
+        warnings.append("部分 SKU 的平均成交价高于当前档案价，请核对当前档案价。")
 
     return {
         "summary": {
             "实际营业额": actual["营业额"],
             "原价模拟营业额": simulated["营业额"],
+            "实际抽成后金额(未扣抽成GST)": actual[
+                "抽成后金额(未扣抽成GST)"
+            ],
+            "原价模拟抽成后金额(未扣抽成GST)": simulated[
+                "抽成后金额(未扣抽成GST)"
+            ],
+            "实际高岛屋抽成GST(9%)": actual["高岛屋抽成GST(9%)"],
+            "原价模拟高岛屋抽成GST(9%)": simulated["高岛屋抽成GST(9%)"],
+            "实际预计银行到账": actual["预计银行到账"],
+            "原价模拟预计银行到账": simulated["预计银行到账"],
             "商场实际回款": actual["商场实际回款"],
             "原价模拟回款": simulated["商场实际回款"],
             "商品成本": actual["商品成本"],
@@ -774,7 +872,7 @@ def compute_daily_profit_diagnosis(stock_df, sales_df, attendance_df, target_dat
             "实际净利润": actual["净利润"],
             "原价模拟净利润": simulated["净利润"],
             "折扣减少营业额": round(discount_gross, 2),
-            "折扣减少净利润": round(discount_gross * 0.64 / 1.09, 2),
+            "折扣减少净利润": round(discount_gross * retained_cash_factor, 2),
         },
         "sku_detail": detail,
         "warnings": warnings,
@@ -1273,6 +1371,109 @@ def _dashboard_sales_with_cost(stock_df, sales_df, start_date, end_date):
     period_sales["具体毛利"] = period_sales["总营业额"] - period_sales["总进价成本"]
     return period_sales
 
+
+def _period_daily_financials(period_sales, attendance_df, start_date, end_date):
+    output_columns = [
+        "日期",
+        "总营业额",
+        "销售数量",
+        "具体毛利",
+        "总进价成本",
+        "人工成本",
+        "免税净营业额",
+        "代扣GST(9%)",
+        "商场抽成(36%)",
+        "抽成后金额(未扣抽成GST)",
+        "高岛屋抽成GST(9%)",
+        "预计银行到账",
+        "商场实际回款",
+        "毛利润",
+        "真实净利润",
+    ]
+
+    if period_sales.empty:
+        daily_sales = pd.DataFrame(
+            columns=[
+                "日期_dt",
+                "总营业额",
+                "销售数量",
+                "具体毛利",
+                "总进价成本",
+            ]
+        )
+    else:
+        daily_sales = period_sales.copy()
+        for col in ("总营业额", "销售数量", "具体毛利", "总进价成本"):
+            if col not in daily_sales.columns:
+                daily_sales[col] = 0.0
+            daily_sales[col] = _bi_num(daily_sales[col])
+        daily_sales = daily_sales.groupby("日期_dt", as_index=False).agg(
+            {
+                "总营业额": "sum",
+                "销售数量": "sum",
+                "具体毛利": "sum",
+                "总进价成本": "sum",
+            }
+        )
+
+    attendance = (
+        attendance_df.copy()
+        if attendance_df is not None
+        else pd.DataFrame()
+    )
+    if attendance.empty:
+        daily_wages = pd.DataFrame(columns=["日期_dt", "人工成本"])
+    else:
+        if "日期" not in attendance.columns:
+            attendance["日期"] = ""
+        attendance["日期_dt"] = _bi_dates(attendance, "日期")
+        if "核算薪资" not in attendance.columns:
+            attendance["核算薪资"] = 0.0
+        attendance["核算薪资"] = _bi_num(attendance["核算薪资"])
+        attendance = attendance[
+            (attendance["日期_dt"] >= start_date)
+            & (attendance["日期_dt"] <= end_date)
+        ]
+        daily_wages = (
+            attendance.groupby("日期_dt", as_index=False)["核算薪资"].sum()
+            .rename(columns={"核算薪资": "人工成本"})
+        )
+
+    daily = pd.merge(daily_sales, daily_wages, on="日期_dt", how="outer")
+    if daily.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    numeric_columns = [
+        "总营业额",
+        "销售数量",
+        "具体毛利",
+        "总进价成本",
+        "人工成本",
+    ]
+    for col in numeric_columns:
+        if col not in daily.columns:
+            daily[col] = 0.0
+        daily[col] = _bi_num(daily[col])
+
+    daily_cash = daily["总营业额"].apply(
+        _takashimaya_cash_values
+    ).apply(pd.Series)
+    for cash_field in (
+        "免税净营业额",
+        "代扣GST(9%)",
+        "商场抽成(36%)",
+        "抽成后金额(未扣抽成GST)",
+        "高岛屋抽成GST(9%)",
+        "预计银行到账",
+    ):
+        daily[cash_field] = daily_cash[cash_field]
+    daily["商场实际回款"] = daily["预计银行到账"]
+    daily["毛利润"] = daily["预计银行到账"] - daily["总进价成本"]
+    daily["真实净利润"] = daily["毛利润"] - daily["人工成本"]
+    daily["日期"] = pd.to_datetime(daily["日期_dt"]).dt.strftime("%Y/%m/%d")
+    return daily[output_columns].sort_values("日期").reset_index(drop=True)
+
+
 def compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, start_date, end_date):
     start_date = pd.to_datetime(start_date).date()
     end_date = pd.to_datetime(end_date).date()
@@ -1300,20 +1501,12 @@ def compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, star
     upt = total_items / order_count if order_count > 0 else 0.0
     avg_margin_rate = (gross_margin / total_revenue * 100) if total_revenue > 0 else 0.0
     days = max((end_date - start_date).days + 1, 1)
-    if period_sales.empty:
-        daily_sales = pd.DataFrame(columns=["日期", "总营业额", "具体毛利", "销售数量"])
-    else:
-        daily_sales = period_sales.copy()
-        daily_sales["日期"] = pd.to_datetime(daily_sales["日期_dt"]).dt.strftime("%Y/%m/%d")
-        daily_sales = daily_sales.groupby("日期", as_index=False).agg({"总营业额": "sum", "具体毛利": "sum", "销售数量": "sum"})
-    financial_daily = daily_sales.copy()
-    if not financial_daily.empty:
-        financial_daily["免税净营业额"] = financial_daily["总营业额"] / 1.09
-        financial_daily["商场抽成(36%)"] = financial_daily["免税净营业额"] * 0.36
-        financial_daily["商场实际回款"] = financial_daily["免税净营业额"] - financial_daily["商场抽成(36%)"]
-        financial_daily["真实净利润"] = financial_daily["商场实际回款"] - (financial_daily["总营业额"] - financial_daily["具体毛利"])
-    else:
-        financial_daily["真实净利润"] = pd.Series(dtype="float64")
+    financial_daily = _period_daily_financials(
+        period_sales,
+        attendance_df,
+        start_date,
+        end_date,
+    )
     summary = {
         "有效客流": int(total_traffic),
         "交易单数": int(order_count),
@@ -1379,7 +1572,20 @@ def compare_financial_periods(stock_df, sales_df, attendance_df, period_a, perio
     name_b, start_b, end_b = period_b
     summary_a = compute_period_financials(stock_df, sales_df, attendance_df, start_a, end_a)
     summary_b = compute_period_financials(stock_df, sales_df, attendance_df, start_b, end_b)
-    metric_order = ["总营业额", "免税净营业额", "代扣GST(9%)", "商场抽成(36%)", "商场实际回款", "总进价成本", "人工成本", "毛利润", "真实净利润", "含税净利率%"]
+    metric_order = [
+        "总营业额",
+        "免税净营业额",
+        "代扣GST(9%)",
+        "商场抽成(36%)",
+        "抽成后金额(未扣抽成GST)",
+        "高岛屋抽成GST(9%)",
+        "预计银行到账",
+        "总进价成本",
+        "人工成本",
+        "毛利润",
+        "真实净利润",
+        "含税净利率%",
+    ]
     rows = []
     for metric in metric_order:
         a_val = summary_a.get(metric, 0.0)
@@ -1491,7 +1697,7 @@ def _commission_period_financials(stock_df, sales_df, attendance_df, start_date,
         wage_total = float(period_att["核算薪资"].sum()) if not period_att.empty else 0.0
 
     gross = float(period_sales["总营业额"].sum()) if not period_sales.empty else 0.0
-    settlement = (gross / 1.09) * 0.64 if gross else 0.0
+    settlement = _takashimaya_cash_values(gross)["预计银行到账"]
     return {
         "总营业额": round(gross, 2),
         "总进价成本": round(cogs, 2),
@@ -3007,16 +3213,30 @@ def render_campaign_bi_center():
 
             if not is_vendor_view:
                 st.divider()
-                d11, d12, d13, d14 = st.columns(4)
-                d11.metric("剥离 GST (9%)", f"${summary['代扣GST(9%)']:,.2f}")
+                d11, d12, d13 = st.columns(3)
+                d11.metric("顾客销售GST (9%)", f"${summary['代扣GST(9%)']:,.2f}")
                 d12.metric("商场抽成 (36%)", f"${summary['商场抽成(36%)']:,.2f}")
-                d13.metric("商场实际回款", f"${summary['商场实际回款']:,.2f}")
-                d14.metric("真实净利润", f"${summary['真实净利润']:,.2f}", delta=f"净利率 {summary['含税净利率%']:.1f}%")
+                d13.metric(
+                    "抽成后金额（未扣抽成GST）",
+                    f"${summary['抽成后金额(未扣抽成GST)']:,.2f}",
+                )
+
+                d14, d15, d16 = st.columns(3)
+                d14.metric(
+                    "高岛屋抽成GST (9%)",
+                    f"${summary['高岛屋抽成GST(9%)']:,.2f}",
+                )
+                d15.metric("预计银行到账", f"${summary['预计银行到账']:,.2f}")
+                d16.metric(
+                    "现金口径净利润",
+                    f"${summary['真实净利润']:,.2f}",
+                    delta=f"净利率 {summary['含税净利率%']:.1f}%",
+                )
 
                 st.divider()
-                d15, d16 = st.columns(2)
-                d15.metric("商品进价成本", f"${summary['总进价成本']:,.2f}")
-                d16.metric("打卡人工成本", f"${summary['人工成本']:,.2f}")
+                d17, d18 = st.columns(2)
+                d17.metric("商品进价成本", f"${summary['总进价成本']:,.2f}")
+                d18.metric("打卡人工成本", f"${summary['人工成本']:,.2f}")
 
             if not daily.empty:
                 if is_vendor_view:
@@ -3209,7 +3429,11 @@ def render_campaign_bi_center():
     with mode_tab4:
         campaigns = _campaign_options()
         if len(campaigns) >= 2:
-            st.info("财务口径沿用「净利润」tab：含税营业额剥离 9% GST，商场 36% 抽成按免税净额计算，再扣商品成本和打卡人工成本。")
+            st.info(
+                "现金口径沿用「净利润」tab：先从含税营业额剥离顾客销售 GST，"
+                "再扣按免税净额计算的 36% 商场抽成及该抽成的 9% GST，"
+                "得到预计银行到账；现金口径净利润再扣商品成本和打卡人工成本。"
+            )
             c1, c2 = st.columns(2)
             labels = list(campaigns.keys())
             label_a = c1.selectbox("财务档期 A", labels, index=0, key="finance_period_a")
@@ -3236,12 +3460,19 @@ def render_campaign_bi_center():
 
             top1, top2, top3, top4 = st.columns(4)
             top1.metric("B 总营业额", _fmt_money(summary_b["总营业额"]), delta=_fmt_delta("总营业额"))
-            top2.metric("B 商场实际回款", _fmt_money(summary_b["商场实际回款"]), delta=_fmt_delta("商场实际回款"))
-            top3.metric("B 真实净利润", _fmt_money(summary_b["真实净利润"]), delta=_fmt_delta("真实净利润"))
+            top2.metric("B 预计银行到账", _fmt_money(summary_b["预计银行到账"]), delta=_fmt_delta("预计银行到账"))
+            top3.metric("B 现金口径净利润", _fmt_money(summary_b["真实净利润"]), delta=_fmt_delta("真实净利润"))
             top4.metric("B 含税净利率", f"{summary_b['含税净利率%']:.1f}%", delta=_fmt_delta("含税净利率%"))
 
             st.divider()
             compare_view = finance_compare.copy()
+            compare_view["指标"] = compare_view["指标"].replace({
+                "代扣GST(9%)": "顾客销售GST (9%)",
+                "商场抽成(36%)": "商场抽成 (36%)",
+                "抽成后金额(未扣抽成GST)": "抽成后金额（未扣抽成GST）",
+                "高岛屋抽成GST(9%)": "高岛屋抽成GST (9%)",
+                "真实净利润": "现金口径净利润",
+            })
             compare_view["A值显示"] = compare_view.apply(lambda r: f"{r['A值']:.1f}%" if r["指标"] == "含税净利率%" else f"${r['A值']:,.2f}", axis=1)
             compare_view["B值显示"] = compare_view.apply(lambda r: f"{r['B值']:.1f}%" if r["指标"] == "含税净利率%" else f"${r['B值']:,.2f}", axis=1)
             compare_view["变化显示"] = compare_view.apply(lambda r: f"{r['变化']:+.1f} pct" if r["指标"] == "含税净利率%" else f"${r['变化']:+,.2f}", axis=1)
@@ -3258,8 +3489,8 @@ def render_campaign_bi_center():
             )
 
             chart_df = pd.DataFrame([
-                {"档期": "A", "总营业额": summary_a["总营业额"], "真实净利润": summary_a["真实净利润"], "商场实际回款": summary_a["商场实际回款"]},
-                {"档期": "B", "总营业额": summary_b["总营业额"], "真实净利润": summary_b["真实净利润"], "商场实际回款": summary_b["商场实际回款"]},
+                {"档期": "A", "总营业额": summary_a["总营业额"], "现金口径净利润": summary_a["真实净利润"], "预计银行到账": summary_a["预计银行到账"]},
+                {"档期": "B", "总营业额": summary_b["总营业额"], "现金口径净利润": summary_b["真实净利润"], "预计银行到账": summary_b["预计银行到账"]},
             ]).set_index("档期")
             st.bar_chart(chart_df, use_container_width=True)
 
@@ -4826,6 +5057,9 @@ if is_admin:
                     st.warning(admin_daily_close_record_error)
 
                 if admin_daily_close_snapshot:
+                    admin_daily_close_cash = _takashimaya_cash_values(
+                        admin_daily_close_overview["营业额"]
+                    )
                     st.caption(
                         "人工口径：全部视图只扣一次当日 Attendance 总工资；"
                         "单品类按钛杯/丝绸当日正常 POS 营业额比例分摊。"
@@ -4854,32 +5088,41 @@ if is_admin:
                         st.columns(3)
                     )
                     admin_close_m4.metric(
-                        "商场实际回款",
-                        f"${admin_daily_close_overview['商场实际回款']:.2f}",
+                        "商场抽成 (36%)",
+                        f"${admin_daily_close_cash['商场抽成(36%)']:.2f}",
                     )
                     admin_close_m5.metric(
-                        "商场抽成",
-                        f"${admin_daily_close_overview['商场抽成']:.2f}",
+                        "抽成后金额（未扣抽成GST）",
+                        f"${admin_daily_close_cash['抽成后金额(未扣抽成GST)']:.2f}",
                     )
                     admin_close_m6.metric(
-                        "商品成本",
-                        f"${admin_daily_close_overview['商品成本']:.2f}",
+                        "高岛屋抽成GST (9%)",
+                        f"${admin_daily_close_cash['高岛屋抽成GST(9%)']:.2f}",
                     )
                     admin_close_m7, admin_close_m8, admin_close_m9 = (
                         st.columns(3)
                     )
                     admin_close_m7.metric(
+                        "预计银行到账",
+                        f"${admin_daily_close_cash['预计银行到账']:.2f}",
+                    )
+                    admin_close_m8.metric(
+                        "商品成本",
+                        f"${admin_daily_close_overview['商品成本']:.2f}",
+                    )
+                    admin_close_m9.metric(
                         "人工成本",
                         f"${admin_daily_close_overview['人工成本']:.2f}",
                     )
-                    admin_close_m8.metric(
-                        "真实净利润",
+                    admin_close_m10, admin_close_m11 = st.columns(2)
+                    admin_close_m10.metric(
+                        "现金口径净利润",
                         f"${admin_daily_close_overview['真实净利润']:.2f}",
                     )
                     admin_daily_close_breakeven = (
                         admin_daily_close_overview["保本完成度%"]
                     )
-                    admin_close_m9.metric(
+                    admin_close_m11.metric(
                         "保本完成度",
                         (
                             f"{admin_daily_close_breakeven:.1f}%"
@@ -4929,6 +5172,9 @@ if is_admin:
                                 system_key
                             ]
                             system_summary = system_result["admin_summary"]
+                            system_cash = _takashimaya_cash_values(
+                                system_summary["营业额"]
+                            )
 
                             system_record_mask = (
                                 admin_daily_close_record_dates.eq(
@@ -4999,13 +5245,21 @@ if is_admin:
                                         "营业额": system_summary["营业额"],
                                         "订单": system_summary["订单数"],
                                         "件数": system_summary["售出件数"],
-                                        "商场实际回款": system_summary[
-                                            "商场实际回款"
+                                        "商场抽成 (36%)": system_cash[
+                                            "商场抽成(36%)"
                                         ],
-                                        "商场抽成": system_summary["商场抽成"],
+                                        "抽成后金额（未扣抽成GST）": system_cash[
+                                            "抽成后金额(未扣抽成GST)"
+                                        ],
+                                        "高岛屋抽成GST (9%)": system_cash[
+                                            "高岛屋抽成GST(9%)"
+                                        ],
+                                        "预计银行到账": system_cash[
+                                            "预计银行到账"
+                                        ],
                                         "商品成本": system_summary["商品成本"],
                                         "人工": system_summary["人工成本"],
-                                        "真实净利润": system_summary[
+                                        "现金口径净利润": system_summary[
                                             "真实净利润"
                                         ],
                                         "保本完成度%": system_summary[
@@ -5018,11 +5272,13 @@ if is_admin:
                                 category_financial.style.format(
                                     {
                                         "营业额": "${:.2f}",
-                                        "商场实际回款": "${:.2f}",
-                                        "商场抽成": "${:.2f}",
+                                        "商场抽成 (36%)": "${:.2f}",
+                                        "抽成后金额（未扣抽成GST）": "${:.2f}",
+                                        "高岛屋抽成GST (9%)": "${:.2f}",
+                                        "预计银行到账": "${:.2f}",
                                         "商品成本": "${:.2f}",
                                         "人工": "${:.2f}",
-                                        "真实净利润": "${:.2f}",
+                                        "现金口径净利润": "${:.2f}",
                                         "保本完成度%": (
                                             lambda value: (
                                                 f"{value:.1f}%"
@@ -5413,60 +5669,40 @@ if is_admin:
                 )
 
     with t5:
-        st.subheader(f"💎 真实净利润核算 (9% GST 剥离版)")
+        st.subheader("💎 现金口径净利润核算")
         
         t5_start, t5_end = date_range_picker("📅 净利润核算日期区间", "📅 Net Profit Date Range", key="admin_net_profit_range_today")
         st.info(f"📅 此看板的净利数据按上方日期区间计算：**{t5_start}** 至 **{t5_end}**")
 
-        if not df_sales.empty:
-            df_s_np = df_sales.copy()
-            df_s_np['日期_dt'] = pd.to_datetime(df_s_np['日期'], errors='coerce')
-            df_s_np = df_s_np.dropna(subset=['日期_dt'])
-
-            df_a_np = df_attendance.copy()
-            if not df_a_np.empty:
-                df_a_np['日期_dt'] = pd.to_datetime(df_a_np['日期'], errors='coerce')
-                df_a_np = df_a_np.dropna(subset=['日期_dt'])
-            else:
-                df_a_np['日期_dt'] = pd.Series(dtype='datetime64[ns]')
-
-            if not df_s_np.empty:
-                fs = df_s_np[(df_s_np['日期_dt'] >= pd.Timestamp(t5_start)) & (df_s_np['日期_dt'] <= pd.Timestamp(t5_end))].copy()
-                fa = df_a_np[(df_a_np['日期_dt'] >= pd.Timestamp(t5_start)) & (df_a_np['日期_dt'] <= pd.Timestamp(t5_end))].copy()
-
-                fs['销售数量'] = pd.to_numeric(fs['销售数量'], errors='coerce').fillna(0)
-                fs['总营业额'] = pd.to_numeric(fs['总营业额'], errors='coerce').fillna(0.0)
-
-                df_stock_cost = df_stock[['商品名称', '颜色', '进价成本']].copy()
-                df_stock_cost['进价成本'] = pd.to_numeric(df_stock_cost['进价成本'], errors='coerce').fillna(0.0)
-                fs = fs.merge(df_stock_cost, on=['商品名称', '颜色'], how='left')
-                fs['总进价成本'] = fs['销售数量'] * fs['进价成本']
-
-                fs['日期_str'] = fs['日期_dt'].dt.strftime('%Y/%m/%d')
-                daily_sales = fs.groupby('日期_str').agg({'总营业额': 'sum', '总进价成本': 'sum'}).reset_index()
-
-                if not fa.empty:
-                    fa['核算薪资'] = pd.to_numeric(fa['核算薪资'], errors='coerce').fillna(0.0)
-                    fa['日期_str'] = fa['日期_dt'].dt.strftime('%Y/%m/%d')
-                    daily_att = fa.groupby('日期_str').agg({'核算薪资': 'sum'}).reset_index()
-                    daily_att.rename(columns={'核算薪资': '人工成本'}, inplace=True)
-                else:
-                    daily_att = pd.DataFrame(columns=['日期_str', '人工成本'])
-
-                daily_np = pd.merge(daily_sales, daily_att, on='日期_str', how='outer').fillna(0.0).sort_values('日期_str', ascending=False)
-
-                daily_np['免税净营业额'] = daily_np['总营业额'] / 1.09
-                daily_np['代扣GST(9%)'] = daily_np['总营业额'] - daily_np['免税净营业额']
-                daily_np['商场抽成(36%)'] = daily_np['免税净营业额'] * 0.36
-                daily_np['商场实际回款'] = daily_np['免税净营业额'] - daily_np['商场抽成(36%)']
-                daily_np['毛利润'] = daily_np['商场实际回款'] - daily_np['总进价成本']
-                daily_np['真实净利润'] = daily_np['毛利润'] - daily_np['人工成本']
-
+        period_sales_np = _dashboard_sales_with_cost(
+            df_stock,
+            df_sales,
+            pd.Timestamp(t5_start).date(),
+            pd.Timestamp(t5_end).date(),
+        )
+        if not period_sales_np.empty or not df_attendance.empty:
+            daily_np = _period_daily_financials(
+                period_sales_np,
+                df_attendance,
+                pd.Timestamp(t5_start).date(),
+                pd.Timestamp(t5_end).date(),
+            ).rename(columns={
+                '日期': '日期_str',
+                '代扣GST(9%)': '顾客销售GST (9%)',
+                '商场抽成(36%)': '商场抽成 (36%)',
+                '抽成后金额(未扣抽成GST)': '抽成后金额（未扣抽成GST）',
+                '高岛屋抽成GST(9%)': '高岛屋抽成GST (9%)',
+            })
+            if not daily_np.empty:
                 tot_gross = daily_np['总营业额'].sum()
                 tot_net_rev = daily_np['免税净营业额'].sum()
-                tot_gst = daily_np['代扣GST(9%)'].sum()
-                tot_comm = daily_np['商场抽成(36%)'].sum()
-                tot_settlement = daily_np['商场实际回款'].sum()
+                tot_gst = daily_np['顾客销售GST (9%)'].sum()
+                tot_comm = daily_np['商场抽成 (36%)'].sum()
+                tot_after_commission = daily_np[
+                    '抽成后金额（未扣抽成GST）'
+                ].sum()
+                tot_commission_gst = daily_np['高岛屋抽成GST (9%)'].sum()
+                tot_settlement = daily_np['预计银行到账'].sum()
                 tot_cogs = daily_np['总进价成本'].sum()
                 tot_wage = daily_np['人工成本'].sum()
                 tot_net = daily_np['真实净利润'].sum()
@@ -5477,25 +5713,43 @@ if is_admin:
                 pct_wage = (tot_wage / tot_gross * 100) if tot_gross > 0 else 0
                 pct_net = (tot_net / tot_gross * 100) if tot_gross > 0 else 0
 
-                st.info("💡 财务脱水逻辑：顾客支付的含税总额中，9% 为政府消费税 (GST)。高岛屋的 36% 抽成基于**免税净额**计算。实际回款 = 免税净额 - 抽成。")
+                st.info(
+                    "💡 现金口径说明：预计银行到账 = 顾客含税营业额剥离销售 GST 后，"
+                    "扣除按免税净额计算的 36% 商场抽成，以及该抽成的 9% GST。"
+                    "现金口径净利润再扣商品成本与打卡人工。进项 GST 是否可抵扣尚未确认，"
+                    "当前不预先计入任何税务返还。"
+                )
                 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("💰 选中期间总营业额", f"${tot_gross:.2f}", delta="100.0% (营收基准)", delta_color="off")
-                m2.metric("🏛️ 剥离 GST (9%)", f"${tot_gst:.2f}", delta=f"占比: {pct_gst:.1f}%", delta_color="off")
+                m2.metric("🏛️ 顾客销售GST (9%)", f"${tot_gst:.2f}", delta=f"占比: {pct_gst:.1f}%", delta_color="off")
                 m3.metric("📉 商场抽成 (36%)", f"${tot_comm:.2f}", delta=f"占比: {pct_comm:.1f}%", delta_color="off")
-                m4.metric("💵 商场实际回款", f"${tot_settlement:.2f}", help="免税额减去抽成后，高岛屋真正打给你的钱")
+                m4.metric("抽成后金额（未扣抽成GST）", f"${tot_after_commission:.2f}")
                 
                 st.divider()
                 
                 m5, m6, m7, m8 = st.columns(4)
-                m5.metric("📦 商品进价成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
-                m6.metric("👥 打卡人工成本", f"${tot_wage:.2f}", delta=f"占比: {pct_wage:.1f}%", delta_color="off")
-                m7.metric("💎 选中期间纯利润", f"${tot_net:.2f}", delta=f"含税净利率: {pct_net:.1f}%", delta_color="normal")
-                m8.empty()
+                m5.metric("高岛屋抽成GST (9%)", f"${tot_commission_gst:.2f}")
+                m6.metric("💵 预计银行到账", f"${tot_settlement:.2f}")
+                m7.metric("📦 商品进价成本", f"${tot_cogs:.2f}", delta=f"占比: {pct_cogs:.1f}%", delta_color="off")
+                m8.metric("👥 打卡人工成本", f"${tot_wage:.2f}", delta=f"占比: {pct_wage:.1f}%", delta_color="off")
 
                 st.divider()
-                st.markdown("### 📈 每日营收 vs 净利润趋势")
-                chart_data_t5 = daily_np.set_index('日期_str')[['总营业额', '真实净利润']].sort_index(ascending=True)
+                np_metric, _ = st.columns([1, 3])
+                np_metric.metric(
+                    "💎 现金口径净利润",
+                    f"${tot_net:.2f}",
+                    delta=f"含税净利率: {pct_net:.1f}%",
+                    delta_color="normal",
+                )
+
+                st.divider()
+                st.markdown("### 📈 每日营收 vs 现金口径净利润趋势")
+                chart_data_t5 = (
+                    daily_np.set_index('日期_str')[['总营业额', '真实净利润']]
+                    .rename(columns={'真实净利润': '现金口径净利润'})
+                    .sort_index(ascending=True)
+                )
                 net_profit_chart_mode = st.radio(
                     "图表显示方式",
                     ["柱状图", "折线图", "柱状图 + 折线图"],
@@ -5510,7 +5764,10 @@ if is_admin:
                 st.markdown("### 📅 每日盈亏明细榜 (Daily P&L)")
                 dl_c3, dl_c4 = st.columns([1.5, 4])
                 with dl_c3:
-                    csv_t5 = convert_df_to_csv(daily_np)
+                    export_np = daily_np.rename(
+                        columns={'真实净利润': '现金口径净利润'}
+                    )
+                    csv_t5 = convert_df_to_csv(export_np)
                     st.download_button(
                         label="⬇️ 一键导出净利润明细 (CSV)",
                         data=csv_t5,
@@ -5519,7 +5776,10 @@ if is_admin:
                         type="primary"
                     )
 
-                show_np = daily_np.rename(columns={'日期_str': '日期'})
+                show_np = daily_np.rename(columns={
+                    '日期_str': '日期',
+                    '真实净利润': '现金口径净利润',
+                })
                 
                 def color_net_profit(val):
                     try:
@@ -5530,22 +5790,23 @@ if is_admin:
                     return ''
                 
                 format_dict = {
-                    '总营业额': '${:.2f}', '免税净营业额': '${:.2f}', '代扣GST(9%)': '${:.2f}',
-                    '商场抽成(36%)': '${:.2f}', '商场实际回款': '${:.2f}',
+                    '总营业额': '${:.2f}', '免税净营业额': '${:.2f}', '顾客销售GST (9%)': '${:.2f}',
+                    '商场抽成 (36%)': '${:.2f}', '抽成后金额（未扣抽成GST）': '${:.2f}',
+                    '高岛屋抽成GST (9%)': '${:.2f}', '预计银行到账': '${:.2f}',
                     '总进价成本': '${:.2f}', '人工成本': '${:.2f}',
-                    '毛利润': '${:.2f}', '真实净利润': '${:.2f}'
+                    '毛利润': '${:.2f}', '现金口径净利润': '${:.2f}'
                 }
                 
                 try:
-                    styled_np = show_np.style.format(format_dict).map(color_net_profit, subset=['真实净利润'])
+                    styled_np = show_np.style.format(format_dict).map(color_net_profit, subset=['现金口径净利润'])
                 except AttributeError:
-                    styled_np = show_np.style.format(format_dict).applymap(color_net_profit, subset=['真实净利润'])
+                    styled_np = show_np.style.format(format_dict).applymap(color_net_profit, subset=['现金口径净利润'])
 
                 st.dataframe(styled_np, use_container_width=True, hide_index=True)
             else:
-                st.info("暂无有效销售数据进行核算。")
+                st.info("该日期范围内暂无销售或考勤记录。")
         else:
-            st.info("💡 目前没有流水记录，无法计算利润。")
+            st.info("该日期范围内暂无销售或考勤记录。")
 
         with st.expander("🔍 单日利润诊断", expanded=False):
             diagnosis_start = pd.Timestamp(t5_start).date()
@@ -5597,22 +5858,30 @@ if is_admin:
                     f"${diagnosis_summary['原价模拟营业额']:,.2f}",
                 )
                 dg3.metric(
-                    "实际净利润",
+                    "实际现金口径净利润",
                     f"${diagnosis_summary['实际净利润']:,.2f}",
                 )
                 dg4.metric(
-                    "原价模拟净利润",
+                    "原价模拟现金口径净利润",
                     f"${diagnosis_summary['原价模拟净利润']:,.2f}",
                 )
 
-                dg_return1, dg_return2 = st.columns(2)
+                dg_return1, dg_return2, dg_return3, dg_return4 = st.columns(4)
                 dg_return1.metric(
-                    "实际商场回款",
-                    f"${diagnosis_summary['商场实际回款']:,.2f}",
+                    "实际高岛屋抽成GST (9%)",
+                    f"${diagnosis_summary['实际高岛屋抽成GST(9%)']:,.2f}",
                 )
                 dg_return2.metric(
-                    "原价模拟商场回款",
-                    f"${diagnosis_summary['原价模拟回款']:,.2f}",
+                    "原价模拟高岛屋抽成GST (9%)",
+                    f"${diagnosis_summary['原价模拟高岛屋抽成GST(9%)']:,.2f}",
+                )
+                dg_return3.metric(
+                    "实际预计银行到账",
+                    f"${diagnosis_summary['实际预计银行到账']:,.2f}",
+                )
+                dg_return4.metric(
+                    "原价模拟预计银行到账",
+                    f"${diagnosis_summary['原价模拟预计银行到账']:,.2f}",
                 )
 
                 dg5, dg6, dg7, dg8 = st.columns(4)
