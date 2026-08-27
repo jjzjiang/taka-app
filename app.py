@@ -94,20 +94,28 @@ def _apply_sales_fx_model(sales_df, stock_df, benchmark_rate, current_rate):
         stock["进价成本"] = pd.NA
     stock["_fx_sku_name"] = stock["商品名称"].fillna("").astype(str).str.strip()
     stock["_fx_sku_color"] = stock["颜色"].fillna("").astype(str).str.strip()
+    if "人民币进价" not in stock.columns:
+        stock["人民币进价"] = pd.NA
     stock["档案进价 SGD"] = pd.to_numeric(stock["进价成本"], errors="coerce")
+    stock["人民币进价"] = pd.to_numeric(stock["人民币进价"], errors="coerce")
     stock.loc[stock["档案进价 SGD"] <= 0, "档案进价 SGD"] = pd.NA
+    stock.loc[stock["人民币进价"] <= 0, "人民币进价"] = pd.NA
     stock = stock.drop_duplicates(
         subset=["_fx_sku_name", "_fx_sku_color"], keep="last"
     )
 
     result = result.merge(
-        stock[["_fx_sku_name", "_fx_sku_color", "档案进价 SGD"]],
+        stock[["_fx_sku_name", "_fx_sku_color", "档案进价 SGD", "人民币进价"]],
         on=["_fx_sku_name", "_fx_sku_color"],
         how="left",
     )
     quantity = pd.to_numeric(result.get("销售数量", 0), errors="coerce").fillna(0.0)
     revenue = pd.to_numeric(result.get("总营业额", 0), errors="coerce").fillna(0.0)
-    estimated_cost = result["档案进价 SGD"] * benchmark_rate / current_rate
+    estimated_rmb_cost = result["人民币进价"].where(
+        result["人民币进价"].notna(),
+        result["档案进价 SGD"] * benchmark_rate,
+    )
+    estimated_cost = estimated_rmb_cost / current_rate
     result["今日汇率估算进价 SGD"] = estimated_cost
     result["汇率成本差/件"] = estimated_cost - result["档案进价 SGD"]
     result["本单汇率影响"] = result["汇率成本差/件"] * quantity
@@ -1946,7 +1954,7 @@ def t(cn_text, en_text):
     return cn_text if st.session_state.lang == "cn" else en_text
 
 col_map = {
-    '商品名称': 'Product', '颜色': 'Variant', '进价成本': 'Cost', '售卖价格': 'Price',
+    '商品名称': 'Product', '颜色': 'Variant', '进价成本': 'Cost', '人民币进价': 'Purchase Cost CNY', '售卖价格': 'Price',
     '应收到数量': 'Expected', '展示数量': 'Display', '货柜数量': 'Cabinet', '储物间数量': 'Storage', 
     '坏货数量': 'Damaged', '已售出数量': 'Total Sold', '总库存': 'Total Stock', '期间售出': 'Period Sales',
     '订单号': 'Order ID', '日期': 'Date', '收银员': 'Cashier', '销售数量': 'Qty', '成交单价': 'Unit Price', 
@@ -2208,7 +2216,7 @@ STAFF_PURCHASE_SHEET = ACTIVE_SYSTEM_SHEETS["staff_purchase"]
 INVENTORY_SNAPSHOT_SHEET = ACTIVE_SYSTEM_SHEETS["inventory_snapshot"]
 DAILY_CLOSE_SHEET = "Daily_Close_Reports"
 
-STOCK_COLS = ['商品名称', '颜色', '进价成本', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
+STOCK_COLS = ['商品名称', '颜色', '进价成本', '人民币进价', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期', '登录密码', '状态', SYSTEM_PERMISSION_COL]
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
@@ -2953,7 +2961,7 @@ with st.sidebar:
                             fresh = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
                             latest_stock, latest_restock = fresh[STOCK_SHEET], fresh[RESTOCK_SHEET]
                             total = n_disp + n_shelf + n_stor 
-                            new_r = pd.DataFrame([[n_name, n_color, n_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
+                            new_r = pd.DataFrame([[n_name, n_color, n_cost, "", n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
                             latest_stock = pd.concat([latest_stock, new_r], ignore_index=True)
                             if total > 0 or n_dmg > 0:
                                 log_date = datetime.now().strftime("%Y/%m/%d")
@@ -4455,6 +4463,7 @@ if is_admin:
             f_sl_sel.insert(0, sel_col_name, False)
             
             fx_column_map = {
+                '人民币进价': 'Purchase Cost CNY',
                 '档案进价 SGD': 'Recorded Cost SGD',
                 '今日汇率估算进价 SGD': 'FX-estimated Cost SGD',
                 '汇率成本差/件': 'FX Cost Difference / Item',
@@ -4466,9 +4475,12 @@ if is_admin:
             
             u_col = 'Unit Price' if st.session_state.lang == 'en' else '成交单价'
             t_col = 'Total Amount' if st.session_state.lang == 'en' else '总营业额'
+            rmb_cost_col = 'Purchase Cost CNY' if st.session_state.lang == 'en' else '人民币进价'
             fx_money_cols = list(fx_column_map.values()) if st.session_state.lang == 'en' else list(fx_column_map.keys())
             money_formats = {u_col: '${:.2f}', t_col: '${:.2f}'}
-            money_formats.update({column: '${:.2f}' for column in fx_money_cols if column in f_sl_sel.columns})
+            money_formats.update({column: '${:.2f}' for column in fx_money_cols if column in f_sl_sel.columns and column != rmb_cost_col})
+            if rmb_cost_col in f_sl_sel.columns:
+                money_formats[rmb_cost_col] = '¥{:.2f}'
             styled_sl = f_sl_sel.style.format(money_formats, na_rep='—')
             
             d_disable = [c for c in f_sl_sel.columns if c != sel_col_name]
