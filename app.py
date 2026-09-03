@@ -9,8 +9,11 @@ import hashlib
 import math
 import time as pytime
 import plotly.express as px
+from io import BytesIO
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 # Popup BI is kept inside app.py so Streamlit Cloud can run even when only this file is deployed.
 BI_SKU_KEYS = ["商品名称", "颜色"]
@@ -20,6 +23,25 @@ CUSTOMER_GST_RATE = 0.09
 TAKASHIMAYA_COMMISSION_RATE = 0.36
 TAKASHIMAYA_COMMISSION_GST_RATE = 0.09
 ECB_DAILY_FX_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+BULK_INVENTORY_IMPORT_COLUMNS = [
+    "商品名称",
+    "颜色",
+    "入库日期",
+    "进价成本 SGD",
+    "人民币进价 CNY",
+    "售卖价格 SGD",
+    "应收到数量",
+    "展示数量",
+    "货柜数量",
+    "储物间数量",
+    "坏货数量",
+    "备注",
+]
+BULK_INVENTORY_IMPORT_ALIASES = {
+    "进价成本": "进价成本 SGD",
+    "人民币进价": "人民币进价 CNY",
+    "售卖价格": "售卖价格 SGD",
+}
 
 
 def _parse_ecb_cny_per_sgd(xml_payload):
@@ -121,6 +143,524 @@ def _apply_sales_fx_model(sales_df, stock_df, benchmark_rate, current_rate):
     result["本单汇率影响"] = result["汇率成本差/件"] * quantity
     result["汇率后估算毛利"] = revenue - estimated_cost * quantity
     return result.drop(columns=["_fx_sku_name", "_fx_sku_color"], errors="ignore")
+
+
+def _compute_period_rmb_cost_reference(period_sales, stock_df, current_rate):
+    try:
+        current_rate = float(current_rate)
+    except (TypeError, ValueError):
+        raise ValueError("汇率必须是有效数字")
+    if not math.isfinite(current_rate) or current_rate <= 0:
+        raise ValueError("汇率必须大于 0")
+
+    sales = period_sales.copy() if period_sales is not None else pd.DataFrame()
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for frame in (sales, stock):
+        for column in BI_SKU_KEYS:
+            if column not in frame.columns:
+                frame[column] = ""
+            frame[column] = frame[column].fillna("").astype(str).str.strip()
+
+    if "销售数量" not in sales.columns:
+        sales["销售数量"] = 0.0
+    if "进价成本" not in sales.columns:
+        sales["进价成本"] = 0.0
+    if "人民币进价" not in stock.columns:
+        stock["人民币进价"] = pd.NA
+
+    stock["人民币进价"] = pd.to_numeric(stock["人民币进价"], errors="coerce")
+    stock.loc[stock["人民币进价"] <= 0, "人民币进价"] = pd.NA
+    stock = stock.drop_duplicates(subset=BI_SKU_KEYS, keep="last")
+    sales = sales.merge(
+        stock[BI_SKU_KEYS + ["人民币进价"]],
+        on=BI_SKU_KEYS,
+        how="left",
+    )
+
+    quantity = pd.to_numeric(sales["销售数量"], errors="coerce").fillna(0.0)
+    system_unit_cost = pd.to_numeric(
+        sales["进价成本"], errors="coerce"
+    ).fillna(0.0)
+    valid_rmb = sales["人民币进价"].notna()
+    comparable_quantity = quantity.where(valid_rmb, 0.0)
+    rmb_total = float(
+        (sales["人民币进价"].fillna(0.0) * comparable_quantity).sum()
+    )
+    converted_cost = rmb_total / current_rate
+    comparable_system_cost = float(
+        (system_unit_cost * comparable_quantity).sum()
+    )
+
+    return {
+        "人民币成本合计": rmb_total,
+        "折算新币成本": converted_cost,
+        "可比系统成本": comparable_system_cost,
+        "成本差额": converted_cost - comparable_system_cost,
+        "可比销售件数": float(comparable_quantity.sum()),
+        "缺少人民币进价件数": float(quantity.where(~valid_rmb, 0.0).abs().sum()),
+    }
+
+
+def _normalize_bulk_inventory_import(raw_df, default_date):
+    errors = []
+    warnings = []
+    if raw_df is None or raw_df.empty:
+        return {
+            "rows": pd.DataFrame(columns=BULK_INVENTORY_IMPORT_COLUMNS),
+            "errors": ["文件没有可读取的数据。"],
+            "warnings": warnings,
+        }
+
+    rows = raw_df.copy()
+    rows.columns = [str(column).strip() for column in rows.columns]
+    for alias, canonical in BULK_INVENTORY_IMPORT_ALIASES.items():
+        if canonical not in rows.columns and alias in rows.columns:
+            rows = rows.rename(columns={alias: canonical})
+    for column in BULK_INVENTORY_IMPORT_COLUMNS:
+        if column not in rows.columns:
+            rows[column] = ""
+    rows = rows[BULK_INVENTORY_IMPORT_COLUMNS].copy()
+    non_empty = rows.apply(
+        lambda row: any(
+            not pd.isna(value) and str(value).strip() != ""
+            for value in row
+        ),
+        axis=1,
+    )
+    rows = rows.loc[non_empty].copy()
+    rows["_Excel行号"] = rows.index.to_series().astype(int) + 2
+    rows = rows.reset_index(drop=True)
+    if rows.empty:
+        return {
+            "rows": rows,
+            "errors": ["文件没有可读取的数据。"],
+            "warnings": warnings,
+        }
+
+    for column in ("商品名称", "颜色", "备注"):
+        rows[column] = rows[column].fillna("").astype(str).str.strip()
+
+    for _, row in rows.iterrows():
+        excel_row = int(row["_Excel行号"])
+        if not row["商品名称"]:
+            errors.append(f"第 {excel_row} 行缺少商品名称。")
+        if not row["颜色"]:
+            errors.append(f"第 {excel_row} 行缺少颜色。")
+
+    parsed_default_date = pd.to_datetime(default_date, errors="coerce")
+    if pd.isna(parsed_default_date):
+        return {
+            "rows": rows,
+            "errors": errors + ["页面默认入库日期无效。"],
+            "warnings": warnings,
+        }
+
+    normalized_dates = []
+    for _, row in rows.iterrows():
+        value = row["入库日期"]
+        parsed = (
+            parsed_default_date
+            if pd.isna(value) or str(value).strip() == ""
+            else pd.to_datetime(value, errors="coerce")
+        )
+        if pd.isna(parsed):
+            errors.append(f"第 {int(row['_Excel行号'])} 行入库日期无法识别。")
+            normalized_dates.append("")
+        else:
+            normalized_dates.append(parsed.strftime("%Y/%m/%d"))
+    rows["入库日期"] = normalized_dates
+
+    quantity_columns = ["展示数量", "货柜数量", "储物间数量", "坏货数量"]
+    optional_number_columns = [
+        "进价成本 SGD",
+        "人民币进价 CNY",
+        "售卖价格 SGD",
+        "应收到数量",
+    ]
+    for column in quantity_columns + optional_number_columns:
+        normalized_values = []
+        for _, row in rows.iterrows():
+            value = row[column]
+            blank = pd.isna(value) or str(value).strip() == ""
+            if blank:
+                normalized_values.append(0 if column in quantity_columns else pd.NA)
+                continue
+            number = pd.to_numeric(value, errors="coerce")
+            excel_row = int(row["_Excel行号"])
+            if pd.isna(number):
+                errors.append(f"第 {excel_row} 行「{column}」不是有效数字。")
+                normalized_values.append(0 if column in quantity_columns else pd.NA)
+                continue
+            number = float(number)
+            if number < 0:
+                errors.append(f"第 {excel_row} 行「{column}」不能为负数。")
+            if column in quantity_columns and not number.is_integer():
+                errors.append(f"第 {excel_row} 行「{column}」必须是整数。")
+            normalized_values.append(
+                int(number) if column in quantity_columns and number.is_integer() else number
+            )
+        rows[column] = normalized_values
+
+    duplicate_mask = rows.duplicated(
+        subset=["商品名称", "颜色"], keep=False
+    ) & rows["商品名称"].ne("") & rows["颜色"].ne("")
+    for (name, color), duplicate_rows in rows.loc[duplicate_mask].groupby(
+        ["商品名称", "颜色"], sort=False
+    ):
+        row_numbers = ", ".join(
+            str(int(value)) for value in duplicate_rows["_Excel行号"]
+        )
+        errors.append(
+            f"商品「{name} ({color})」在文件第 {row_numbers} 行重复，请合并为一行。"
+        )
+
+    zero_quantity = rows[["展示数量", "货柜数量", "储物间数量", "坏货数量"]].sum(axis=1).eq(0)
+    for excel_row in rows.loc[zero_quantity, "_Excel行号"]:
+        warnings.append(f"第 {int(excel_row)} 行本批入库数量为 0。")
+
+    return {"rows": rows, "errors": errors, "warnings": warnings}
+
+
+def _build_bulk_inventory_preview(normalized_rows, stock_df):
+    preview = normalized_rows.copy()
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for column in STOCK_COLS:
+        if column not in stock.columns:
+            stock[column] = ""
+    for frame in (preview, stock):
+        for column in ("商品名称", "颜色"):
+            frame[column] = frame[column].fillna("").astype(str).str.strip()
+
+    statuses = []
+    price_updates = []
+    changes = []
+    update_pairs = [
+        ("进价成本 SGD", "进价成本"),
+        ("人民币进价 CNY", "人民币进价"),
+        ("售卖价格 SGD", "售卖价格"),
+        ("应收到数量", "应收到数量"),
+    ]
+    for _, row in preview.iterrows():
+        matches = stock[
+            stock["商品名称"].eq(row["商品名称"])
+            & stock["颜色"].eq(row["颜色"])
+        ]
+        if len(matches) > 1:
+            statuses.append("后台重复 SKU")
+            price_updates.append(False)
+            changes.append("请先处理后台重复档案")
+            continue
+        if matches.empty:
+            statuses.append("新增 SKU")
+            price_updates.append(False)
+            changes.append("")
+            continue
+
+        statuses.append("已有 SKU 补货")
+        current = matches.iloc[0]
+        row_changes = []
+        for source_column, stock_column in update_pairs:
+            incoming = row[source_column]
+            if pd.isna(incoming):
+                continue
+            current_number = pd.to_numeric(current[stock_column], errors="coerce")
+            if pd.isna(current_number) or float(current_number) != float(incoming):
+                row_changes.append(stock_column)
+        price_updates.append(bool(row_changes))
+        changes.append("、".join(row_changes))
+
+    preview["状态"] = statuses
+    preview["价格将更新"] = price_updates
+    preview["更新字段"] = changes
+    preview["本批入库"] = preview[
+        ["展示数量", "货柜数量", "储物间数量", "坏货数量"]
+    ].sum(axis=1)
+    return preview
+
+
+def _apply_bulk_inventory_import(
+    normalized_rows,
+    stock_df,
+    restock_df,
+    batch_id,
+    upload_timestamp,
+    batch_name,
+    file_fingerprint,
+):
+    rows = normalized_rows.copy()
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    restock = restock_df.copy() if restock_df is not None else pd.DataFrame()
+    for column in STOCK_COLS:
+        if column not in stock.columns:
+            stock[column] = ""
+    stock = stock[STOCK_COLS].copy()
+    for column in RESTOCK_COLS:
+        if column not in restock.columns:
+            restock[column] = ""
+    restock = restock[RESTOCK_COLS].copy()
+    for column in ("商品名称", "颜色"):
+        stock[column] = stock[column].fillna("").astype(str).str.strip()
+
+    new_sku_count = 0
+    restock_sku_count = 0
+    price_update_count = 0
+    total_quantity = 0
+    new_logs = []
+    quantity_map = {
+        "展示数量": "展示数量",
+        "货柜数量": "货柜数量",
+        "储物间数量": "储物间数量",
+        "坏货数量": "坏货数量",
+    }
+    value_map = {
+        "进价成本 SGD": "进价成本",
+        "人民币进价 CNY": "人民币进价",
+        "售卖价格 SGD": "售卖价格",
+        "应收到数量": "应收到数量",
+    }
+
+    for _, row in rows.iterrows():
+        name = str(row["商品名称"]).strip()
+        color = str(row["颜色"]).strip()
+        matches = stock[
+            stock["商品名称"].eq(name) & stock["颜色"].eq(color)
+        ].index
+        if len(matches) > 1:
+            raise ValueError(f"后台存在重复 SKU：{name} ({color})")
+
+        quantities = {
+            target: (
+                0
+                if pd.isna(pd.to_numeric(row[source], errors="coerce"))
+                else int(pd.to_numeric(row[source], errors="coerce"))
+            )
+            for source, target in quantity_map.items()
+        }
+        row_total = sum(quantities.values())
+        total_quantity += row_total
+
+        if matches.empty:
+            new_sku_count += 1
+            new_row = {
+                "商品名称": name,
+                "颜色": color,
+                "进价成本": 0,
+                "人民币进价": "",
+                "售卖价格": 0,
+                "应收到数量": 0,
+                "展示数量": quantities["展示数量"],
+                "货柜数量": quantities["货柜数量"],
+                "储物间数量": quantities["储物间数量"],
+                "坏货数量": quantities["坏货数量"],
+                "已售出数量": 0,
+                "总库存": quantities["展示数量"]
+                + quantities["货柜数量"]
+                + quantities["储物间数量"],
+            }
+            for source, target in value_map.items():
+                if not pd.isna(row[source]):
+                    new_row[target] = row[source]
+            stock = pd.concat(
+                [stock, pd.DataFrame([new_row], columns=STOCK_COLS)],
+                ignore_index=True,
+            )
+            operation = "初始建档"
+        else:
+            restock_sku_count += 1
+            idx = matches[0]
+            for target, added in quantities.items():
+                current = pd.to_numeric(stock.at[idx, target], errors="coerce")
+                stock.at[idx, target] = (0 if pd.isna(current) else float(current)) + added
+            changed = False
+            for source, target in value_map.items():
+                if not pd.isna(row[source]):
+                    current = pd.to_numeric(stock.at[idx, target], errors="coerce")
+                    if pd.isna(current) or float(current) != float(row[source]):
+                        changed = True
+                    stock.at[idx, target] = row[source]
+            if changed:
+                price_update_count += 1
+            stock.at[idx, "总库存"] = sum(
+                (
+                    0.0
+                    if pd.isna(pd.to_numeric(stock.at[idx, column], errors="coerce"))
+                    else float(pd.to_numeric(stock.at[idx, column], errors="coerce"))
+                )
+                for column in ("展示数量", "货柜数量", "储物间数量")
+            )
+            operation = "入库"
+
+        if row_total > 0:
+            location_detail = "; ".join(
+                [
+                    f"展示:{quantities['展示数量']}",
+                    f"货柜:{quantities['货柜数量']}",
+                    f"储物间:{quantities['储物间数量']}",
+                    f"坏货:{quantities['坏货数量']}",
+                ]
+            )
+            user_note = str(row.get("备注", "") or "").strip()
+            batch_label = str(batch_name or "").strip() or "未命名批次"
+            note_parts = [
+                f"[批量入库:{batch_id}]",
+                f"[上传时间:{upload_timestamp}]",
+                f"[批次:{batch_label}]",
+                f"[文件指纹:{file_fingerprint}]",
+            ]
+            if user_note:
+                note_parts.append(user_note)
+            unit_cost = row["进价成本 SGD"]
+            new_logs.append(
+                [
+                    row["入库日期"],
+                    operation,
+                    name,
+                    color,
+                    row_total,
+                    location_detail,
+                    0 if pd.isna(unit_cost) else unit_cost,
+                    " ".join(note_parts),
+                ]
+            )
+
+    if new_logs:
+        new_logs_frame = pd.DataFrame(new_logs, columns=RESTOCK_COLS)
+        restock = (
+            new_logs_frame
+            if restock.empty
+            else pd.concat([new_logs_frame, restock], ignore_index=True)
+        )
+    return {
+        "stock": stock[STOCK_COLS],
+        "restock": restock[RESTOCK_COLS],
+        "summary": {
+            "新增SKU数": new_sku_count,
+            "补货SKU数": restock_sku_count,
+            "本批入库件数": total_quantity,
+            "价格更新数": price_update_count,
+            "流水数": len(new_logs),
+        },
+    }
+
+
+def _verify_bulk_inventory_commit(
+    expected_stock,
+    actual_stock,
+    actual_restock,
+    normalized_rows,
+    batch_id,
+    expected_log_count,
+):
+    notes = (
+        actual_restock.get("备注", pd.Series(dtype="object"))
+        .fillna("")
+        .astype(str)
+    )
+    actual_log_count = int(notes.str.contains(str(batch_id), regex=False).sum())
+    if actual_log_count != int(expected_log_count):
+        return False, f"批次流水回读为 {actual_log_count} 条，预期 {expected_log_count} 条。"
+
+    expected = expected_stock.copy()
+    actual = actual_stock.copy()
+    for frame in (expected, actual):
+        for column in STOCK_COLS:
+            if column not in frame.columns:
+                frame[column] = ""
+        for column in ("商品名称", "颜色"):
+            frame[column] = frame[column].fillna("").astype(str).str.strip()
+
+    numeric_columns = [
+        "进价成本",
+        "人民币进价",
+        "售卖价格",
+        "应收到数量",
+        "展示数量",
+        "货柜数量",
+        "储物间数量",
+        "坏货数量",
+        "已售出数量",
+        "总库存",
+    ]
+    touched = normalized_rows[["商品名称", "颜色"]].drop_duplicates()
+    for _, key in touched.iterrows():
+        name = str(key["商品名称"]).strip()
+        color = str(key["颜色"]).strip()
+        expected_match = expected[
+            expected["商品名称"].eq(name) & expected["颜色"].eq(color)
+        ]
+        actual_match = actual[
+            actual["商品名称"].eq(name) & actual["颜色"].eq(color)
+        ]
+        if len(expected_match) != 1 or len(actual_match) != 1:
+            return False, f"SKU 回读无法唯一匹配：{name} ({color})。"
+        expected_row = expected_match.iloc[0]
+        actual_row = actual_match.iloc[0]
+        for column in numeric_columns:
+            expected_number = pd.to_numeric(expected_row[column], errors="coerce")
+            actual_number = pd.to_numeric(actual_row[column], errors="coerce")
+            both_blank = pd.isna(expected_number) and pd.isna(actual_number)
+            if both_blank:
+                continue
+            if pd.isna(expected_number) or pd.isna(actual_number):
+                return False, f"{name} ({color}) 的「{column}」回读不一致。"
+            if abs(float(expected_number) - float(actual_number)) > 0.0001:
+                return False, f"{name} ({color}) 的「{column}」回读不一致。"
+    return True, ""
+
+
+def _build_bulk_inventory_template_bytes():
+    workbook = Workbook()
+    template = workbook.active
+    template.title = "批量入库模板"
+    template.append(BULK_INVENTORY_IMPORT_COLUMNS)
+    template.freeze_panes = "A2"
+    template.auto_filter.ref = "A1:L1"
+
+    header_fill = PatternFill("solid", fgColor="DDEBF7")
+    for cell in template[1]:
+        cell.font = Font(bold=True, color="1F2937")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    widths = [20, 14, 14, 16, 17, 16, 14, 12, 12, 14, 12, 28]
+    for index, width in enumerate(widths, start=1):
+        template.column_dimensions[_sheet_column_letter(index)].width = width
+    template.row_dimensions[1].height = 26
+
+    instructions = workbook.create_sheet("填写说明")
+    instructions["A1"] = "Taka 批量建档与入库模板"
+    instructions["A1"].font = Font(size=16, bold=True, color="1F4E78")
+    instructions["A3"] = "必填"
+    instructions["B3"] = "商品名称、颜色"
+    instructions["A4"] = "空白规则"
+    instructions["B4"] = "日期空白采用页面默认日期；库存数量空白视为 0；已有 SKU 的价格空白时保留原值。"
+    instructions["A5"] = "数量规则"
+    instructions["B5"] = "展示、货柜、储物间和坏货数量必须是大于等于 0 的整数。"
+    instructions["A6"] = "重复规则"
+    instructions["B6"] = "同一文件内商品名称和颜色不可重复，请先合并成一行。"
+    instructions["A8"] = "填写示例（不要复制表头以外的说明文字到上传页）"
+    instructions["A8"].font = Font(bold=True, color="9C0006")
+    for column_index, header in enumerate(BULK_INVENTORY_IMPORT_COLUMNS, start=1):
+        cell = instructions.cell(row=9, column=column_index, value=header)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="E2F0D9")
+    examples = [
+        ["示例新品", "蓝色", "2026-09-02", 25, 135, 79, 5, 1, 2, 2, 0, "新品首批"],
+        ["示例已有SKU", "黑色", "", "", "", "", "", 0, 3, 2, 0, "晚间补货"],
+    ]
+    for row in examples:
+        instructions.append(row)
+    instructions.freeze_panes = "A9"
+    for index, width in enumerate(widths, start=1):
+        instructions.column_dimensions[_sheet_column_letter(index)].width = width
+    instructions.column_dimensions["A"].width = 22
+    instructions.column_dimensions["B"].width = 42
+    for row in range(3, 7):
+        instructions.cell(row=row, column=1).font = Font(bold=True)
+        instructions.cell(row=row, column=2).alignment = Alignment(wrap_text=True)
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
 
 
 def _takashimaya_cash_values(gross):
@@ -2590,6 +3130,76 @@ def _resolve_employee_close_access(
     return allowed, ""
 
 
+def _sheet_column_letter(column_number):
+    column_number = int(column_number)
+    if column_number < 1:
+        raise ValueError("列号必须大于 0")
+    letters = ""
+    while column_number:
+        column_number, remainder = divmod(column_number - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _save_bulk_inventory_frames(
+    stock_df,
+    restock_df,
+    stock_sheet,
+    restock_sheet,
+    spreadsheet=None,
+    worksheet_getter=None,
+    version_state=None,
+    cache_invalidator=None,
+):
+    spreadsheet = sh if spreadsheet is None else spreadsheet
+    worksheet_getter = (
+        get_worksheet_cached if worksheet_getter is None else worksheet_getter
+    )
+    version_state = (
+        st.session_state.sheet_versions
+        if version_state is None
+        else version_state
+    )
+    cache_invalidator = (
+        invalidate_data_cache
+        if cache_invalidator is None
+        else cache_invalidator
+    )
+
+    frames = [(stock_sheet, stock_df), (restock_sheet, restock_df)]
+    batch_data = []
+    for sheet_name, frame in frames:
+        worksheet = worksheet_getter(sheet_name)
+        safe_frame = frame.fillna("").astype(str)
+        values = [safe_frame.columns.tolist()] + safe_frame.values.tolist()
+        required_rows = max(1000, len(values) + 100)
+        required_cols = max(20, len(safe_frame.columns) + 5)
+        if (
+            worksheet.row_count < required_rows
+            or worksheet.col_count < required_cols
+        ):
+            worksheet.resize(
+                rows=max(worksheet.row_count, required_rows),
+                cols=max(worksheet.col_count, required_cols),
+            )
+        escaped_title = str(worksheet.title).replace("'", "''")
+        last_column = _sheet_column_letter(len(safe_frame.columns))
+        batch_data.append(
+            {
+                "range": f"'{escaped_title}'!A1:{last_column}{len(values)}",
+                "majorDimension": "ROWS",
+                "values": values,
+            }
+        )
+
+    spreadsheet.values_batch_update(
+        {"valueInputOption": "USER_ENTERED", "data": batch_data}
+    )
+    for sheet_name, _ in frames:
+        version_state[sheet_name] = version_state.get(sheet_name, 0) + 1
+        cache_invalidator(sheet_name)
+
+
 def save_data(df, sheet_name):
     try:
         worksheet = get_worksheet_cached(sheet_name)
@@ -4076,7 +4686,7 @@ if is_admin:
 
         with inv_ops_tab:
             st.subheader("🧾 出入库/盘点操作")
-            t1_a, t1_b, t1_c = st.tabs(["📥 补货入库 (Restock)", "🔄 货位调拨 (Transfer)", "⚖️ 盘点平账 (Adjust)"])
+            t1_a, t1_d, t1_b, t1_c = st.tabs(["📥 补货入库 (Restock)", "📤 批量入库", "🔄 货位调拨 (Transfer)", "⚖️ 盘点平账 (Adjust)"])
         
         with t1_a:
             with st.form("form_restock"):
@@ -4120,6 +4730,252 @@ if is_admin:
                             st.rerun()
                         else:
                             st.error(f"⚠️ 找不到对应商品：{real_name} ({real_color})，请检查是否已被删除。")
+
+        with t1_d:
+            st.markdown("### 📤 批量建档与入库")
+            st.info(
+                f"本次文件只会写入当前的 **{ACTIVE_SYSTEM_CONFIG['label']}**。"
+                "上传后先预览，点击确认前不会修改后台。"
+            )
+            bulk_flash = st.session_state.pop("bulk_inventory_import_flash", None)
+            if bulk_flash:
+                if bulk_flash.get("verified"):
+                    st.success(bulk_flash.get("message", "批量入库完成。"))
+                else:
+                    st.warning(bulk_flash.get("message", "批量写入后回读核对未完成。"))
+
+            bulk_top1, bulk_top2 = st.columns(2)
+            bulk_default_date = bulk_top1.date_input(
+                "默认入库日期",
+                value=datetime.now().date(),
+                key="bulk_inventory_default_date",
+                help="模板中的入库日期留空时，采用这里的日期。",
+            )
+            bulk_batch_name = bulk_top2.text_input(
+                "批次名称（选填）",
+                placeholder="例如：早班到货、晚间补货、厂商第二箱",
+                key="bulk_inventory_batch_name",
+            )
+            st.download_button(
+                "⬇️ 下载标准模板",
+                data=_build_bulk_inventory_template_bytes(),
+                file_name="Taka_批量入库模板.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="download_bulk_inventory_template",
+            )
+            bulk_upload = st.file_uploader(
+                "上传入库文件",
+                type=["xlsx", "csv"],
+                key="bulk_inventory_file",
+                help="请使用标准模板；完全空白行会自动忽略。",
+            )
+
+            if bulk_upload is not None:
+                bulk_file_bytes = bulk_upload.getvalue()
+                bulk_file_fingerprint = hashlib.sha256(bulk_file_bytes).hexdigest()[:12]
+                try:
+                    if bulk_upload.name.lower().endswith(".csv"):
+                        bulk_raw = pd.read_csv(BytesIO(bulk_file_bytes), dtype=object)
+                    else:
+                        bulk_raw = pd.read_excel(
+                            BytesIO(bulk_file_bytes),
+                            sheet_name=0,
+                            dtype=object,
+                        )
+                except Exception as bulk_read_error:
+                    bulk_raw = None
+                    st.error(f"文件无法读取，请检查格式或重新下载模板。错误：{bulk_read_error}")
+
+                if bulk_raw is not None:
+                    bulk_normalized = _normalize_bulk_inventory_import(
+                        bulk_raw,
+                        bulk_default_date,
+                    )
+                    bulk_rows = bulk_normalized["rows"]
+                    bulk_errors = list(bulk_normalized["errors"])
+                    bulk_warnings = list(bulk_normalized["warnings"])
+                    bulk_preview = _build_bulk_inventory_preview(
+                        bulk_rows,
+                        df_stock,
+                    )
+                    duplicate_backend = bulk_preview[
+                        bulk_preview["状态"].eq("后台重复 SKU")
+                    ]
+                    for _, duplicate_row in duplicate_backend.iterrows():
+                        bulk_errors.append(
+                            f"后台存在重复 SKU：{duplicate_row['商品名称']} "
+                            f"({duplicate_row['颜色']})，请先整理档案。"
+                        )
+
+                    history_notes = (
+                        df_restock.get("备注", pd.Series(dtype="object"))
+                        .fillna("")
+                        .astype(str)
+                    )
+                    fingerprint_marker = f"[文件指纹:{bulk_file_fingerprint}]"
+                    bulk_seen_before = history_notes.str.contains(
+                        fingerprint_marker,
+                        regex=False,
+                    ).any()
+                    if bulk_seen_before:
+                        st.warning(
+                            "这份文件的内容以前导入过。若它确实代表另一批新到货，"
+                            "可以在下方二次确认后继续。"
+                        )
+
+                    total_inbound = (
+                        int(bulk_preview["本批入库"].sum())
+                        if not bulk_preview.empty
+                        else 0
+                    )
+                    new_count = int(bulk_preview["状态"].eq("新增 SKU").sum())
+                    restock_count = int(
+                        bulk_preview["状态"].eq("已有 SKU 补货").sum()
+                    )
+                    price_update_count = int(
+                        bulk_preview["价格将更新"].fillna(False).sum()
+                    ) if not bulk_preview.empty else 0
+                    bm1, bm2, bm3, bm4 = st.columns(4)
+                    bm1.metric("有效 SKU", len(bulk_preview))
+                    bm2.metric("新增 / 补货", f"{new_count} / {restock_count}")
+                    bm3.metric("本批入库", f"{total_inbound} 件")
+                    bm4.metric("价格资料更新", f"{price_update_count} 个 SKU")
+
+                    for message in bulk_errors:
+                        st.error(message)
+                    for message in bulk_warnings:
+                        st.warning(message)
+
+                    if not bulk_preview.empty:
+                        display_preview = bulk_preview.drop(
+                            columns=["_Excel行号"], errors="ignore"
+                        ).copy()
+                        st.dataframe(
+                            display_preview,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    confirm_repeated_file = True
+                    if bulk_seen_before:
+                        confirm_repeated_file = st.checkbox(
+                            "确认这是新的到货批次，不是重复点击",
+                            value=False,
+                            key=f"confirm_repeated_bulk_{bulk_file_fingerprint}",
+                        )
+
+                    bulk_submit_disabled = bool(bulk_errors) or not confirm_repeated_file
+                    if st.button(
+                        "✅ 确认批量入库",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=bulk_submit_disabled,
+                        key="confirm_bulk_inventory_import",
+                    ):
+                        fresh_bulk = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
+                        latest_bulk_stock = fresh_bulk[STOCK_SHEET]
+                        latest_bulk_restock = fresh_bulk[RESTOCK_SHEET]
+                        final_normalized = _normalize_bulk_inventory_import(
+                            bulk_raw,
+                            bulk_default_date,
+                        )
+                        final_rows = final_normalized["rows"]
+                        final_preview = _build_bulk_inventory_preview(
+                            final_rows,
+                            latest_bulk_stock,
+                        )
+                        final_errors = list(final_normalized["errors"])
+                        if final_preview["状态"].eq("后台重复 SKU").any():
+                            final_errors.append("最新后台存在重复 SKU，已停止导入。")
+
+                        latest_notes = (
+                            latest_bulk_restock.get(
+                                "备注", pd.Series(dtype="object")
+                            )
+                            .fillna("")
+                            .astype(str)
+                        )
+                        latest_seen_before = latest_notes.str.contains(
+                            fingerprint_marker,
+                            regex=False,
+                        ).any()
+                        if latest_seen_before and not bulk_seen_before:
+                            final_errors.append(
+                                "这份文件在预览后已被另一笔操作导入。请刷新页面，"
+                                "确认它确实是新批次后再提交。"
+                            )
+                        elif latest_seen_before and not confirm_repeated_file:
+                            final_errors.append("检测到相同文件，请先确认它是新的到货批次。")
+
+                        if final_errors:
+                            for message in final_errors:
+                                st.error(message)
+                        else:
+                            upload_now = datetime.now()
+                            batch_seed = (
+                                f"{upload_now.isoformat()}|{bulk_file_fingerprint}|"
+                                f"{st.session_state.get('current_user', '店长')}"
+                            )
+                            batch_suffix = hashlib.sha1(
+                                batch_seed.encode("utf-8")
+                            ).hexdigest()[:4].upper()
+                            bulk_batch_id = (
+                                f"IN-{upload_now.strftime('%Y%m%d-%H%M%S')}-"
+                                f"{batch_suffix}"
+                            )
+                            applied_bulk = _apply_bulk_inventory_import(
+                                final_rows,
+                                latest_bulk_stock,
+                                latest_bulk_restock,
+                                batch_id=bulk_batch_id,
+                                upload_timestamp=upload_now.strftime("%Y-%m-%d %H:%M:%S"),
+                                batch_name=bulk_batch_name,
+                                file_fingerprint=bulk_file_fingerprint,
+                            )
+                            try:
+                                _save_bulk_inventory_frames(
+                                    applied_bulk["stock"],
+                                    applied_bulk["restock"],
+                                    STOCK_SHEET,
+                                    RESTOCK_SHEET,
+                                )
+                            except Exception as bulk_save_error:
+                                st.error(
+                                    "批量入库未能提交，后台没有返回成功。"
+                                    f"请检查网络后重试。错误：{bulk_save_error}"
+                                )
+                            else:
+                                readback_bulk = JIT_fetch(
+                                    [STOCK_SHEET, RESTOCK_SHEET]
+                                )
+                                bulk_verified, verify_message = (
+                                    _verify_bulk_inventory_commit(
+                                        applied_bulk["stock"],
+                                        readback_bulk[STOCK_SHEET],
+                                        readback_bulk[RESTOCK_SHEET],
+                                        final_rows,
+                                        bulk_batch_id,
+                                        applied_bulk["summary"]["流水数"],
+                                    )
+                                )
+                                if bulk_verified:
+                                    flash_message = (
+                                        f"批量入库完成：批次 {bulk_batch_id}，"
+                                        f"新增 {applied_bulk['summary']['新增SKU数']} 个 SKU，"
+                                        f"补货 {applied_bulk['summary']['补货SKU数']} 个 SKU，"
+                                        f"共入库 {applied_bulk['summary']['本批入库件数']} 件。"
+                                    )
+                                else:
+                                    flash_message = (
+                                        f"批次 {bulk_batch_id} 已提交，但自动回读核对未完成："
+                                        f"{verify_message} 请先查看底单流水，不要立即重复上传。"
+                                    )
+                                st.session_state["bulk_inventory_import_flash"] = {
+                                    "verified": bulk_verified,
+                                    "message": flash_message,
+                                }
+                                st.rerun()
 
         with t1_b:
             with st.form("form_transfer"):
@@ -5908,6 +6764,72 @@ if is_admin:
                     delta=f"含税净利率: {pct_net:.1f}%",
                     delta_color="normal",
                 )
+
+                with st.expander("人民币成本与汇率影响（参考）", expanded=False):
+                    try:
+                        rmb_fx_feed = _fetch_daily_cny_per_sgd()
+                    except Exception:
+                        rmb_fx_feed = {"rate": 0.0, "date": "", "source": "ECB"}
+
+                    saved_fx_rate = st.session_state.get(
+                        "admin_sales_fx_current_rate", 0.0
+                    )
+                    try:
+                        saved_fx_rate = float(saved_fx_rate)
+                    except (TypeError, ValueError):
+                        saved_fx_rate = 0.0
+                    rmb_reference_rate = (
+                        saved_fx_rate
+                        if math.isfinite(saved_fx_rate) and saved_fx_rate > 0
+                        else float(rmb_fx_feed.get("rate", 0.0))
+                    )
+
+                    if rmb_reference_rate <= 0:
+                        st.warning(
+                            "当日参考汇率暂时无法取得；现有净利润数据不受影响。"
+                        )
+                    else:
+                        rmb_cost_reference = _compute_period_rmb_cost_reference(
+                            period_sales_np,
+                            df_stock,
+                            rmb_reference_rate,
+                        )
+                        if rmb_cost_reference["可比销售件数"] == 0:
+                            st.info("当前期间暂无带人民币进价的销售商品。")
+                        else:
+                            rc1, rc2, rc3, rc4 = st.columns(4)
+                            rc1.metric(
+                                "厂商人民币成本",
+                                f"¥{rmb_cost_reference['人民币成本合计']:,.2f}",
+                            )
+                            rc2.metric(
+                                "今日折算成本",
+                                f"${rmb_cost_reference['折算新币成本']:,.2f}",
+                            )
+                            rc3.metric(
+                                "可比系统成本",
+                                f"${rmb_cost_reference['可比系统成本']:,.2f}",
+                            )
+                            rc4.metric(
+                                "成本差额",
+                                f"${rmb_cost_reference['成本差额']:+,.2f}",
+                                help="正数表示按人民币进价和参考汇率折算后的成本更高。",
+                            )
+
+                        rate_date = str(rmb_fx_feed.get("date", "")).strip()
+                        rate_note = f" · ECB数据日期 {rate_date}" if rate_date else ""
+                        st.caption(
+                            f"参考口径：1 SGD = {rmb_reference_rate:.4f} CNY{rate_note}。"
+                            "本区块仅供核对，不参与上方净利润计算。"
+                        )
+                        missing_rmb_quantity = rmb_cost_reference[
+                            "缺少人民币进价件数"
+                        ]
+                        if missing_rmb_quantity > 0:
+                            st.warning(
+                                f"有 {missing_rmb_quantity:g} 件销售缺少人民币进价，"
+                                "未计入本参考区。"
+                            )
 
                 st.divider()
                 st.markdown("### 📈 每日营收 vs 现金口径净利润趋势")
