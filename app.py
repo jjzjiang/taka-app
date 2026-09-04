@@ -42,6 +42,15 @@ BULK_INVENTORY_IMPORT_ALIASES = {
     "人民币进价": "人民币进价 CNY",
     "售卖价格": "售卖价格 SGD",
 }
+INVENTORY_COUNT_IMPORT_COLUMNS = [
+    "商品名称",
+    "颜色",
+    "展示数量",
+    "货柜数量",
+    "储物间数量",
+    "坏货数量",
+    "备注",
+]
 
 
 def _parse_ecb_cny_per_sgd(xml_payload):
@@ -606,6 +615,345 @@ def _verify_bulk_inventory_commit(
             if abs(float(expected_number) - float(actual_number)) > 0.0001:
                 return False, f"{name} ({color}) 的「{column}」回读不一致。"
     return True, ""
+
+
+def _normalize_inventory_count_import(raw_df, stock_df):
+    errors = []
+    warnings = []
+    if raw_df is None or raw_df.empty:
+        return {
+            "rows": pd.DataFrame(columns=INVENTORY_COUNT_IMPORT_COLUMNS),
+            "errors": ["文件没有可读取的盘点数据。"],
+            "warnings": warnings,
+        }
+
+    rows = raw_df.copy()
+    rows.columns = [str(column).strip() for column in rows.columns]
+    for column in INVENTORY_COUNT_IMPORT_COLUMNS:
+        if column not in rows.columns:
+            rows[column] = ""
+    rows = rows[INVENTORY_COUNT_IMPORT_COLUMNS].copy()
+    non_empty = rows.apply(
+        lambda row: any(
+            not pd.isna(value) and str(value).strip() != ""
+            for value in row
+        ),
+        axis=1,
+    )
+    rows = rows.loc[non_empty].copy()
+    rows["_Excel行号"] = rows.index.to_series().astype(int) + 2
+    rows = rows.reset_index(drop=True)
+    if rows.empty:
+        return {
+            "rows": rows,
+            "errors": ["文件没有可读取的盘点数据。"],
+            "warnings": warnings,
+        }
+
+    for column in ("商品名称", "颜色", "备注"):
+        rows[column] = rows[column].fillna("").astype(str).str.strip()
+    for _, row in rows.iterrows():
+        excel_row = int(row["_Excel行号"])
+        if not row["商品名称"]:
+            errors.append(f"第 {excel_row} 行缺少商品名称。")
+        if not row["颜色"]:
+            errors.append(f"第 {excel_row} 行缺少颜色。")
+
+    quantity_columns = ["展示数量", "货柜数量", "储物间数量", "坏货数量"]
+    for column in quantity_columns:
+        normalized_values = []
+        for _, row in rows.iterrows():
+            value = row[column]
+            if pd.isna(value) or str(value).strip() == "":
+                normalized_values.append(pd.NA)
+                continue
+            number = pd.to_numeric(value, errors="coerce")
+            excel_row = int(row["_Excel行号"])
+            if pd.isna(number) or not math.isfinite(float(number)):
+                errors.append(f"第 {excel_row} 行「{column}」不是有效数字。")
+                normalized_values.append(pd.NA)
+                continue
+            number = float(number)
+            if number < 0:
+                errors.append(f"第 {excel_row} 行「{column}」不能为负数。")
+            if not number.is_integer():
+                errors.append(f"第 {excel_row} 行「{column}」必须是整数。")
+            normalized_values.append(int(number) if number.is_integer() else number)
+        rows[column] = normalized_values
+
+    duplicate_mask = rows.duplicated(
+        subset=["商品名称", "颜色"], keep=False
+    ) & rows["商品名称"].ne("") & rows["颜色"].ne("")
+    for (name, color), duplicate_rows in rows.loc[duplicate_mask].groupby(
+        ["商品名称", "颜色"], sort=False
+    ):
+        row_numbers = ", ".join(
+            str(int(value)) for value in duplicate_rows["_Excel行号"]
+        )
+        errors.append(
+            f"商品「{name} ({color})」在文件第 {row_numbers} 行重复。"
+        )
+
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for column in ("商品名称", "颜色"):
+        if column not in stock.columns:
+            stock[column] = ""
+        stock[column] = stock[column].fillna("").astype(str).str.strip()
+    for _, row in rows.iterrows():
+        name = row["商品名称"]
+        color = row["颜色"]
+        if not name or not color:
+            continue
+        matches = stock[
+            stock["商品名称"].eq(name) & stock["颜色"].eq(color)
+        ]
+        excel_row = int(row["_Excel行号"])
+        if matches.empty:
+            errors.append(
+                f"第 {excel_row} 行商品「{name} ({color})」在当前系统中不存在。"
+            )
+        elif len(matches) > 1:
+            errors.append(f"后台存在重复 SKU：{name} ({color})。")
+        if all(pd.isna(row[column]) for column in quantity_columns):
+            warnings.append(
+                f"第 {excel_row} 行未填写任何盘点数量，该 SKU 不会修改。"
+            )
+
+    return {"rows": rows, "errors": errors, "warnings": warnings}
+
+
+def _build_inventory_count_preview(normalized_rows, stock_df):
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for column in STOCK_COLS:
+        if column not in stock.columns:
+            stock[column] = ""
+    for column in ("商品名称", "颜色"):
+        stock[column] = stock[column].fillna("").astype(str).str.strip()
+
+    location_labels = {
+        "展示数量": "展示",
+        "货柜数量": "货柜",
+        "储物间数量": "储物间",
+        "坏货数量": "坏货",
+    }
+    preview_rows = []
+    for _, row in normalized_rows.iterrows():
+        name = str(row["商品名称"]).strip()
+        color = str(row["颜色"]).strip()
+        matches = stock[
+            stock["商品名称"].eq(name) & stock["颜色"].eq(color)
+        ]
+        if len(matches) != 1:
+            continue
+        current = matches.iloc[0]
+        result = {"商品名称": name, "颜色": color}
+        current_values = {}
+        final_values = {}
+        for column, label in location_labels.items():
+            current_number = pd.to_numeric(current[column], errors="coerce")
+            current_value = 0 if pd.isna(current_number) else int(float(current_number))
+            incoming = row[column]
+            final_value = current_value if pd.isna(incoming) else int(incoming)
+            current_values[column] = current_value
+            final_values[column] = final_value
+            result[f"账面{label}"] = current_value
+            result[f"盘点后{label}"] = final_value
+            result[f"{label}差额"] = final_value - current_value
+        current_total = sum(current_values[column] for column in list(location_labels)[:3])
+        final_total = sum(final_values[column] for column in list(location_labels)[:3])
+        result["账面总库存"] = current_total
+        result["盘点后总库存"] = final_total
+        result["可售库存差额"] = final_total - current_total
+        result["坏货差额"] = final_values["坏货数量"] - current_values["坏货数量"]
+        result["状态"] = (
+            "将调整"
+            if any(final_values[column] != current_values[column] for column in location_labels)
+            else "无变化"
+        )
+        result["备注"] = str(row.get("备注", "") or "").strip()
+        result["_Excel行号"] = row.get("_Excel行号", "")
+        preview_rows.append(result)
+    return pd.DataFrame(preview_rows)
+
+
+def _apply_inventory_count_import(
+    normalized_rows,
+    stock_df,
+    restock_df,
+    count_date,
+    batch_id,
+    upload_timestamp,
+    batch_name,
+):
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    restock = restock_df.copy() if restock_df is not None else pd.DataFrame()
+    for column in STOCK_COLS:
+        if column not in stock.columns:
+            stock[column] = ""
+    stock = stock[STOCK_COLS].copy()
+    for column in RESTOCK_COLS:
+        if column not in restock.columns:
+            restock[column] = ""
+    restock = restock[RESTOCK_COLS].copy()
+    for column in ("商品名称", "颜色"):
+        stock[column] = stock[column].fillna("").astype(str).str.strip()
+
+    location_labels = {
+        "展示数量": "展示",
+        "货柜数量": "货柜",
+        "储物间数量": "储物间",
+        "坏货数量": "坏货",
+    }
+    new_logs = []
+    adjusted_skus = 0
+    surplus = 0
+    shortage = 0
+    batch_label = str(batch_name or "").strip() or "未命名盘点"
+    for _, row in normalized_rows.iterrows():
+        name = str(row["商品名称"]).strip()
+        color = str(row["颜色"]).strip()
+        matches = stock[
+            stock["商品名称"].eq(name) & stock["颜色"].eq(color)
+        ].index
+        if len(matches) != 1:
+            raise ValueError(f"SKU 无法唯一匹配：{name} ({color})")
+        idx = matches[0]
+        changes = []
+        saleable_delta = 0
+        bad_delta = 0
+        for column, label in location_labels.items():
+            incoming = row[column]
+            if pd.isna(incoming):
+                continue
+            current_number = pd.to_numeric(stock.at[idx, column], errors="coerce")
+            current_value = 0 if pd.isna(current_number) else int(float(current_number))
+            final_value = int(incoming)
+            difference = final_value - current_value
+            if difference == 0:
+                continue
+            stock.at[idx, column] = final_value
+            sign = "+" if difference > 0 else ""
+            changes.append(f"{label}:{current_value}→{final_value}({sign}{difference})")
+            if column == "坏货数量":
+                bad_delta += difference
+            else:
+                saleable_delta += difference
+
+        if not changes:
+            continue
+        adjusted_skus += 1
+        if saleable_delta > 0:
+            operation = "盘盈"
+            surplus += saleable_delta
+        elif saleable_delta < 0:
+            operation = "盘亏"
+            shortage += abs(saleable_delta)
+        elif bad_delta > 0:
+            operation = "盘盈"
+        elif bad_delta < 0:
+            operation = "盘亏"
+        else:
+            operation = "盘点调整"
+        stock.at[idx, "总库存"] = sum(
+            int(float(pd.to_numeric(stock.at[idx, column], errors="coerce")))
+            if not pd.isna(pd.to_numeric(stock.at[idx, column], errors="coerce"))
+            else 0
+            for column in ("展示数量", "货柜数量", "储物间数量")
+        )
+        user_note = str(row.get("备注", "") or "").strip()
+        note_parts = [
+            f"[批量盘点:{batch_id}]",
+            f"[上传时间:{upload_timestamp}]",
+            f"[批次:{batch_label}]",
+        ]
+        if user_note:
+            note_parts.append(user_note)
+        new_logs.append([
+            str(count_date),
+            operation,
+            name,
+            color,
+            saleable_delta,
+            "; ".join(changes),
+            0,
+            " ".join(note_parts),
+        ])
+
+    if new_logs:
+        new_logs_frame = pd.DataFrame(new_logs, columns=RESTOCK_COLS)
+        restock = (
+            new_logs_frame
+            if restock.empty
+            else pd.concat([new_logs_frame, restock], ignore_index=True)
+        )
+    return {
+        "stock": stock[STOCK_COLS],
+        "restock": restock[RESTOCK_COLS],
+        "summary": {
+            "调整SKU数": adjusted_skus,
+            "盘盈件数": surplus,
+            "盘亏件数": shortage,
+            "净调整": surplus - shortage,
+            "流水数": len(new_logs),
+        },
+    }
+
+
+def _build_inventory_count_template_bytes(stock_df):
+    workbook = Workbook()
+    template = workbook.active
+    template.title = "盘点覆盖模板"
+    template.append(INVENTORY_COUNT_IMPORT_COLUMNS)
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for column in ("商品名称", "颜色"):
+        if column not in stock.columns:
+            stock[column] = ""
+        stock[column] = stock[column].fillna("").astype(str).str.strip()
+    stock = stock[(stock["商品名称"] != "") | (stock["颜色"] != "")]
+    for _, row in stock.iterrows():
+        template.append([
+            row["商品名称"],
+            row["颜色"],
+            None,
+            None,
+            None,
+            None,
+            None,
+        ])
+    template.freeze_panes = "C2"
+    template.auto_filter.ref = f"A1:G{max(template.max_row, 1)}"
+    header_fill = PatternFill("solid", fgColor="DDEBF7")
+    for cell in template[1]:
+        cell.font = Font(bold=True, color="1F2937")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    widths = [24, 16, 14, 14, 16, 14, 30]
+    for index, width in enumerate(widths, start=1):
+        template.column_dimensions[_sheet_column_letter(index)].width = width
+    template.row_dimensions[1].height = 26
+
+    instructions = workbook.create_sheet("填写说明")
+    instructions["A1"] = "Taka 当前库存盘点覆盖模板"
+    instructions["A1"].font = Font(size=16, bold=True, color="1F4E78")
+    instructions["A3"] = "填写方法"
+    instructions["B3"] = "商品名称和颜色已由系统填好，只需填写线下实际数量。"
+    instructions["A4"] = "空白"
+    instructions["B4"] = "留空的库位不修改。"
+    instructions["A5"] = "归零"
+    instructions["B5"] = "明确填写 0 才会将该库位库存归零。"
+    instructions["A6"] = "数量"
+    instructions["B6"] = "只能填写大于等于 0 的整数。"
+    instructions["A7"] = "提醒"
+    instructions["B7"] = "不要修改商品名称和颜色；新 SKU 请使用批量入库功能建档。"
+    instructions.column_dimensions["A"].width = 18
+    instructions.column_dimensions["B"].width = 78
+    for row_number in range(3, 8):
+        instructions.cell(row=row_number, column=1).font = Font(bold=True)
+        instructions.cell(row=row_number, column=2).alignment = Alignment(wrap_text=True)
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
 
 
 def _build_bulk_inventory_template_bytes():
@@ -4686,7 +5034,7 @@ if is_admin:
 
         with inv_ops_tab:
             st.subheader("🧾 出入库/盘点操作")
-            t1_a, t1_d, t1_b, t1_c = st.tabs(["📥 补货入库 (Restock)", "📤 批量入库", "🔄 货位调拨 (Transfer)", "⚖️ 盘点平账 (Adjust)"])
+            t1_a, t1_d, t1_e, t1_b, t1_c = st.tabs(["📥 补货入库 (Restock)", "📤 批量入库", "📋 批量盘点", "🔄 货位调拨 (Transfer)", "⚖️ 盘点平账 (Adjust)"])
         
         with t1_a:
             with st.form("form_restock"):
@@ -4974,6 +5322,224 @@ if is_admin:
                                 st.session_state["bulk_inventory_import_flash"] = {
                                     "verified": bulk_verified,
                                     "message": flash_message,
+                                }
+                                st.rerun()
+
+        with t1_e:
+            st.markdown("### 📋 批量盘点覆盖")
+            st.info(
+                f"模板已自动填入当前 **{ACTIVE_SYSTEM_CONFIG['label']}** "
+                "的商品名称和颜色。你只需填写实际数量；"
+                "空白不修改，填写 0 才会归零。"
+            )
+            count_flash = st.session_state.pop("inventory_count_flash", None)
+            if count_flash:
+                if count_flash.get("verified"):
+                    st.success(count_flash.get("message", "批量盘点完成。"))
+                else:
+                    st.warning(count_flash.get("message", "批量盘点回读核对未完成。"))
+
+            count_top1, count_top2 = st.columns(2)
+            inventory_count_date = count_top1.date_input(
+                "盘点日期",
+                value=datetime.now().date(),
+                key="inventory_count_date",
+            )
+            inventory_count_name = count_top2.text_input(
+                "盘点批次名称（选填）",
+                placeholder="例如：新快闪前总盘点",
+                key="inventory_count_name",
+            )
+            if df_stock.empty:
+                st.warning("当前系统没有 SKU，暂时无法生成盘点模板。")
+            else:
+                st.download_button(
+                    "⬇️ 下载当前库存盘点模板",
+                    data=_build_inventory_count_template_bytes(df_stock),
+                    file_name=f"Taka_{ACTIVE_SYSTEM_CONFIG['label']}_盘点覆盖模板.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="download_inventory_count_template",
+                )
+
+            inventory_count_upload = st.file_uploader(
+                "上传盘点文件",
+                type=["xlsx", "csv"],
+                key="inventory_count_file",
+                help="请使用上方按钮生成的当前库存模板。",
+            )
+            if inventory_count_upload is not None:
+                count_file_bytes = inventory_count_upload.getvalue()
+                try:
+                    if inventory_count_upload.name.lower().endswith(".csv"):
+                        inventory_count_raw = pd.read_csv(
+                            BytesIO(count_file_bytes), dtype=object
+                        )
+                    else:
+                        inventory_count_raw = pd.read_excel(
+                            BytesIO(count_file_bytes), sheet_name=0, dtype=object
+                        )
+                except Exception as count_read_error:
+                    inventory_count_raw = None
+                    st.error(
+                        "盘点文件无法读取，请重新下载模板。"
+                        f"错误：{count_read_error}"
+                    )
+
+                if inventory_count_raw is not None:
+                    count_normalized = _normalize_inventory_count_import(
+                        inventory_count_raw, df_stock
+                    )
+                    count_rows = count_normalized["rows"]
+                    count_errors = list(count_normalized["errors"])
+                    count_warnings = list(count_normalized["warnings"])
+                    count_preview = _build_inventory_count_preview(
+                        count_rows, df_stock
+                    )
+                    changed_count_preview = count_preview[
+                        count_preview.get("状态", pd.Series(dtype="object")).eq("将调整")
+                    ].copy()
+                    count_surplus = int(
+                        changed_count_preview.get(
+                            "可售库存差额", pd.Series(dtype="float64")
+                        ).clip(lower=0).sum()
+                    )
+                    count_shortage = int(
+                        -changed_count_preview.get(
+                            "可售库存差额", pd.Series(dtype="float64")
+                        ).clip(upper=0).sum()
+                    )
+                    cm1, cm2, cm3, cm4 = st.columns(4)
+                    cm1.metric("模板 SKU", len(count_preview))
+                    cm2.metric("将调整", f"{len(changed_count_preview)} 个")
+                    cm3.metric("可售盘盈", f"{count_surplus} 件")
+                    cm4.metric("可售盘亏", f"{count_shortage} 件")
+
+                    for message in count_errors:
+                        st.error(message)
+                    if count_warnings:
+                        with st.expander(
+                            f"未填写数量的 SKU（{len(count_warnings)} 条，不会修改）",
+                            expanded=False,
+                        ):
+                            for message in count_warnings:
+                                st.caption(message)
+
+                    st.markdown("**账面数→盘点数→差额**")
+                    if not count_preview.empty:
+                        st.dataframe(
+                            count_preview.drop(
+                                columns=["_Excel行号"], errors="ignore"
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    confirm_inventory_count = st.checkbox(
+                        "我已核对预览差额，确认用盘点数覆盖对应库位",
+                        value=False,
+                        key="confirm_inventory_count_override",
+                    )
+                    count_submit_disabled = (
+                        bool(count_errors)
+                        or changed_count_preview.empty
+                        or not confirm_inventory_count
+                    )
+                    if st.button(
+                        "✅ 确认覆盖库存",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=count_submit_disabled,
+                        key="submit_inventory_count_override",
+                    ):
+                        fresh_count = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
+                        latest_count_stock = fresh_count[STOCK_SHEET]
+                        latest_count_restock = fresh_count[RESTOCK_SHEET]
+                        final_count_normalized = _normalize_inventory_count_import(
+                            inventory_count_raw, latest_count_stock
+                        )
+                        final_count_rows = final_count_normalized["rows"]
+                        final_count_errors = list(final_count_normalized["errors"])
+                        final_count_preview = _build_inventory_count_preview(
+                            final_count_rows, latest_count_stock
+                        )
+                        final_changed_count = final_count_preview[
+                            final_count_preview.get(
+                                "状态", pd.Series(dtype="object")
+                            ).eq("将调整")
+                        ]
+                        if final_changed_count.empty:
+                            final_count_errors.append(
+                                "最新后台库存已与盘点数一致，无需重复覆盖。"
+                            )
+
+                        if final_count_errors:
+                            for message in final_count_errors:
+                                st.error(message)
+                        else:
+                            count_now = datetime.now()
+                            count_seed = (
+                                f"{count_now.isoformat()}|{inventory_count_upload.name}|"
+                                f"{st.session_state.get('current_user', '店长')}"
+                            )
+                            count_suffix = hashlib.sha1(
+                                count_seed.encode("utf-8")
+                            ).hexdigest()[:4].upper()
+                            inventory_count_batch_id = (
+                                f"COUNT-{count_now.strftime('%Y%m%d-%H%M%S')}-"
+                                f"{count_suffix}"
+                            )
+                            applied_count = _apply_inventory_count_import(
+                                final_count_rows,
+                                latest_count_stock,
+                                latest_count_restock,
+                                count_date=inventory_count_date.strftime("%Y/%m/%d"),
+                                batch_id=inventory_count_batch_id,
+                                upload_timestamp=count_now.strftime("%Y-%m-%d %H:%M:%S"),
+                                batch_name=inventory_count_name,
+                            )
+                            try:
+                                _save_bulk_inventory_frames(
+                                    applied_count["stock"],
+                                    applied_count["restock"],
+                                    STOCK_SHEET,
+                                    RESTOCK_SHEET,
+                                )
+                            except Exception as count_save_error:
+                                st.error(
+                                    "批量盘点未能提交，后台没有返回成功。"
+                                    f"请检查网络后重试。错误：{count_save_error}"
+                                )
+                            else:
+                                count_readback = JIT_fetch(
+                                    [STOCK_SHEET, RESTOCK_SHEET]
+                                )
+                                count_verified, count_verify_message = (
+                                    _verify_bulk_inventory_commit(
+                                        applied_count["stock"],
+                                        count_readback[STOCK_SHEET],
+                                        count_readback[RESTOCK_SHEET],
+                                        final_count_rows,
+                                        inventory_count_batch_id,
+                                        applied_count["summary"]["流水数"],
+                                    )
+                                )
+                                summary = applied_count["summary"]
+                                if count_verified:
+                                    count_message = (
+                                        f"批量盘点完成：调整 {summary['调整SKU数']} 个 SKU，"
+                                        f"可售盘盈 {summary['盘盈件数']} 件，"
+                                        f"可售盘亏 {summary['盘亏件数']} 件。"
+                                    )
+                                else:
+                                    count_message = (
+                                        f"批次 {inventory_count_batch_id} 已提交，"
+                                        f"但自动回读核对未完成：{count_verify_message} "
+                                        "请先查看底单流水，不要立即重复上传。"
+                                    )
+                                st.session_state["inventory_count_flash"] = {
+                                    "verified": count_verified,
+                                    "message": count_message,
                                 }
                                 st.rerun()
 
