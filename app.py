@@ -109,6 +109,21 @@ def _convert_cny_to_sgd_cost(cny_cost, cny_per_sgd_rate):
     return round(cny_cost / cny_per_sgd_rate, 2)
 
 
+def _resolve_sku_edit_cost(sgd_cost, cny_cost, cny_per_sgd_rate, force_recalculate):
+    try:
+        sgd_cost = float(sgd_cost)
+        cny_cost = float(cny_cost)
+    except (TypeError, ValueError):
+        raise ValueError("进价必须是有效数字。")
+    if not math.isfinite(sgd_cost) or sgd_cost < 0:
+        raise ValueError("新币进价不能为负数。")
+    if not math.isfinite(cny_cost) or cny_cost < 0:
+        raise ValueError("人民币进价不能为负数。")
+    if cny_cost > 0 and (bool(force_recalculate) or sgd_cost <= 0):
+        return _convert_cny_to_sgd_cost(cny_cost, cny_per_sgd_rate)
+    return round(sgd_cost, 2)
+
+
 def _apply_sales_fx_model(sales_df, stock_df, benchmark_rate, current_rate):
     try:
         benchmark_rate = float(benchmark_rate)
@@ -4730,8 +4745,12 @@ def render_inventory_snapshot(role_prefix):
                     if int(row[stk_col]) <= 2: return ['background-color: #ffe6e6; color: #cc0000; font-weight: bold;'] * len(row)
                 except: pass
                 return [''] * len(row)
+
+            def format_rmb_cost(value):
+                number = pd.to_numeric(value, errors='coerce')
+                return '' if pd.isna(number) or float(number) <= 0 else f'¥{float(number):.2f}'
                 
-            styled_df = df_disp.style.format({c_col: '${:.2f}', p_col: '${:.2f}'}).apply(highlight_low_stock, axis=1)
+            styled_df = df_disp.style.format({c_col: '${:.2f}', p_col: '${:.2f}', rmb_col: format_rmb_cost}).apply(highlight_low_stock, axis=1)
             d_disable = [c for c in df_disp.columns if c not in ["选择", "Sel"]]
             
             edited_stock = st.data_editor(
@@ -4800,18 +4819,19 @@ def render_inventory_snapshot(role_prefix):
                         help="默认不勾选，避免只修改售价时意外改动原有新币成本。",
                     )
                     st.caption(
-                        "可以只补录人民币进价。只有勾选重新换算时，"
-                        "Cost ($) 才会按 CNY 进价 ÷ 汇率更新。"
+                        "Cost ($) 为 0 且填写了人民币进价时，保存会自动换算。"
+                        "已有新币成本时，只有勾选重新换算才会更新。"
                     )
                     
                     if st.form_submit_button("💾 Save Changes", type="primary"):
                         if recalculate_e_cost and e_rmb_cost <= 0:
                             st.error("重新换算前请先填写人民币进价。")
                         else:
-                            resolved_e_cost = (
-                                _convert_cny_to_sgd_cost(e_rmb_cost, e_fx_rate)
-                                if recalculate_e_cost
-                                else round(float(e_cost), 2)
+                            resolved_e_cost = _resolve_sku_edit_cost(
+                                e_cost,
+                                e_rmb_cost,
+                                e_fx_rate,
+                                recalculate_e_cost,
                             )
                             stored_e_rmb_cost = (
                                 round(float(e_rmb_cost), 2) if e_rmb_cost > 0 else ""
