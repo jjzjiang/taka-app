@@ -4715,12 +4715,13 @@ def render_inventory_snapshot(role_prefix):
                 st.dataframe(df_disp.style.format({p_col: '${:.2f}'}), use_container_width=True, hide_index=True)
             
         elif role_prefix == 'admin':
-            display_cols = ['选择', '商品名称', '颜色', '期间售出', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '单品毛利率']
+            display_cols = ['选择', '商品名称', '颜色', '期间售出', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '人民币进价', '单品毛利率']
             df_disp = v_df[display_cols].copy()
             if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
             
             p_col = 'Price' if st.session_state.lang == 'en' else '售卖价格'
             c_col = 'Cost' if st.session_state.lang == 'en' else '进价成本'
+            rmb_col = 'Purchase Cost CNY' if st.session_state.lang == 'en' else '人民币进价'
             stk_col = 'Total Stock' if st.session_state.lang == 'en' else '总库存'
             sel_col_name = "Sel" if st.session_state.lang == 'en' else "选择"
             
@@ -4753,47 +4754,96 @@ def render_inventory_snapshot(role_prefix):
                 real_orig_color = t_val(orig_disp_color, 'cn')
                 
                 raw_cost = str(selected_stock.iloc[0][c_col]).replace('$', '').replace(',', '')
+                raw_rmb_cost = str(selected_stock.iloc[0][rmb_col]).replace('¥', '').replace(',', '')
                 raw_price = str(selected_stock.iloc[0][p_col]).replace('$', '').replace(',', '')
-                orig_cost = float(raw_cost) if raw_cost else 0.0
-                orig_price = float(raw_price) if raw_price else 0.0
+                orig_cost = to_float(raw_cost)
+                orig_rmb_cost = to_float(raw_rmb_cost)
+                orig_price = to_float(raw_price)
+                if orig_rmb_cost > 0 and orig_cost > 0:
+                    edit_default_fx_rate = round(orig_rmb_cost / orig_cost, 4)
+                else:
+                    try:
+                        edit_default_fx_rate = round(
+                            float(_fetch_daily_cny_per_sgd()["rate"]), 4
+                        )
+                    except Exception:
+                        edit_default_fx_rate = 5.3000
 
                 with st.form("edit_base_info"):
                     ec1, ec2 = st.columns([1.5, 1.5])
                     e_name = ec1.text_input("Product Name (CN)", value=real_orig_name)
                     e_color = ec2.text_input("Variant/Color (CN)", value=real_orig_color)
-                    ec4, ec5 = st.columns([1.5, 1.5])
-                    e_cost = ec4.number_input("Cost ($)", value=orig_cost, format="%.2f")
-                    e_price = ec5.number_input("Price ($)", value=orig_price, format="%.2f")
+                    ec3, ec4, ec5 = st.columns(3)
+                    e_rmb_cost = ec3.number_input(
+                        "RMB Cost (CNY)",
+                        min_value=0.0,
+                        value=orig_rmb_cost,
+                        format="%.2f",
+                    )
+                    e_cost = ec4.number_input(
+                        "Cost ($)", min_value=0.0, value=orig_cost, format="%.2f"
+                    )
+                    e_price = ec5.number_input(
+                        "Price ($)", min_value=0.0, value=orig_price, format="%.2f"
+                    )
+                    ec6, ec7 = st.columns([1.5, 1.5])
+                    e_fx_rate = ec6.number_input(
+                        "换算汇率（1 SGD = CNY）",
+                        min_value=0.0001,
+                        value=float(edit_default_fx_rate),
+                        step=0.0001,
+                        format="%.4f",
+                    )
+                    recalculate_e_cost = ec7.checkbox(
+                        "按人民币进价重新换算新币成本",
+                        value=False,
+                        help="默认不勾选，避免只修改售价时意外改动原有新币成本。",
+                    )
+                    st.caption(
+                        "可以只补录人民币进价。只有勾选重新换算时，"
+                        "Cost ($) 才会按 CNY 进价 ÷ 汇率更新。"
+                    )
                     
                     if st.form_submit_button("💾 Save Changes", type="primary"):
-                        fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET, B2B_SHEET, RESTOCK_SHEET])
-                        latest_stock = fresh[STOCK_SHEET]
-                        latest_sales = fresh[SALES_SHEET]
-                        latest_b2b = fresh[B2B_SHEET]
-                        latest_restock = fresh[RESTOCK_SHEET]
-                        
-                        m_idx = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_orig_color).strip())].index
-                        if not m_idx.empty:
-                            idx = m_idx[0]
-                            latest_stock.loc[idx, ['商品名称', '颜色', '进价成本', '售卖价格']] = [e_name, e_color, e_cost, e_price]
-                            
-                            if e_name != real_orig_name or e_color != real_orig_color:
-                                if not latest_sales.empty:
-                                    latest_sales.loc[(latest_sales['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_sales['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
-                                    save_data(latest_sales, SALES_SHEET)
-                                if not latest_restock.empty:
-                                    latest_restock.loc[(latest_restock['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_restock['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
-                                    save_data(latest_restock, RESTOCK_SHEET)
-                                if not latest_b2b.empty:
-                                    latest_b2b.loc[(latest_b2b['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_b2b['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
-                                    save_data(latest_b2b, B2B_SHEET)
-                            
-                            save_data(latest_stock, STOCK_SHEET)
-                            st.session_state.stock_reset_key += 1
-                            st.success(f"✅ Product updated!")
-                            st.rerun()
+                        if recalculate_e_cost and e_rmb_cost <= 0:
+                            st.error("重新换算前请先填写人民币进价。")
                         else:
-                            st.error(f"⚠️ 在云端找不到商品档案，可能含有隐藏空格或已被删除。")
+                            resolved_e_cost = (
+                                _convert_cny_to_sgd_cost(e_rmb_cost, e_fx_rate)
+                                if recalculate_e_cost
+                                else round(float(e_cost), 2)
+                            )
+                            stored_e_rmb_cost = (
+                                round(float(e_rmb_cost), 2) if e_rmb_cost > 0 else ""
+                            )
+                            fresh = JIT_fetch([STOCK_SHEET, SALES_SHEET, B2B_SHEET, RESTOCK_SHEET])
+                            latest_stock = fresh[STOCK_SHEET]
+                            latest_sales = fresh[SALES_SHEET]
+                            latest_b2b = fresh[B2B_SHEET]
+                            latest_restock = fresh[RESTOCK_SHEET]
+                            
+                            m_idx = latest_stock[(latest_stock['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_stock['颜色'].astype(str).str.strip() == str(real_orig_color).strip())].index
+                            if not m_idx.empty:
+                                idx = m_idx[0]
+                                latest_stock.loc[idx, ['商品名称', '颜色', '进价成本', '人民币进价', '售卖价格']] = [e_name, e_color, resolved_e_cost, stored_e_rmb_cost, e_price]
+                                
+                                if e_name != real_orig_name or e_color != real_orig_color:
+                                    if not latest_sales.empty:
+                                        latest_sales.loc[(latest_sales['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_sales['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
+                                        save_data(latest_sales, SALES_SHEET)
+                                    if not latest_restock.empty:
+                                        latest_restock.loc[(latest_restock['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_restock['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
+                                        save_data(latest_restock, RESTOCK_SHEET)
+                                    if not latest_b2b.empty:
+                                        latest_b2b.loc[(latest_b2b['商品名称'].astype(str).str.strip() == str(real_orig_name).strip()) & (latest_b2b['颜色'].astype(str).str.strip() == str(real_orig_color).strip()), ['商品名称', '颜色']] = [e_name, e_color]
+                                        save_data(latest_b2b, B2B_SHEET)
+                                
+                                save_data(latest_stock, STOCK_SHEET)
+                                st.session_state.stock_reset_key += 1
+                                st.success(f"✅ Product updated!")
+                                st.rerun()
+                            else:
+                                st.error(f"⚠️ 在云端找不到商品档案，可能含有隐藏空格或已被删除。")
 
                 if not selected_stock.empty:
                     col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
