@@ -96,6 +96,19 @@ def _fetch_daily_cny_per_sgd():
         return _parse_ecb_cny_per_sgd(response.read())
 
 
+def _convert_cny_to_sgd_cost(cny_cost, cny_per_sgd_rate):
+    try:
+        cny_cost = float(cny_cost)
+        cny_per_sgd_rate = float(cny_per_sgd_rate)
+    except (TypeError, ValueError):
+        raise ValueError("人民币进价和汇率必须是有效数字。")
+    if not math.isfinite(cny_cost) or cny_cost < 0:
+        raise ValueError("人民币进价不能为负数。")
+    if not math.isfinite(cny_per_sgd_rate) or cny_per_sgd_rate <= 0:
+        raise ValueError("汇率必须大于 0。")
+    return round(cny_cost / cny_per_sgd_rate, 2)
+
+
 def _apply_sales_fx_model(sales_df, stock_df, benchmark_rate, current_rate):
     try:
         benchmark_rate = float(benchmark_rate)
@@ -3902,33 +3915,92 @@ with st.sidebar:
             st.divider()
             st.header("🛠️ 核心管理")
             with st.expander("➕ 新增产品建档 (Add SKU)"):
+                try:
+                    new_sku_fx_quote = _fetch_daily_cny_per_sgd()
+                    new_sku_default_fx_rate = round(
+                        float(new_sku_fx_quote["rate"]), 4
+                    )
+                    st.caption(
+                        f"当前参考汇率：1 SGD = {new_sku_default_fx_rate:.4f} CNY "
+                        f"（ECB {new_sku_fx_quote['date']}）。建档时可修改。"
+                    )
+                except Exception:
+                    new_sku_default_fx_rate = 5.3000
+                    st.warning(
+                        "暂时无法获取 ECB 当日汇率，已填入备用汇率 5.3000。"
+                        "请按实际结算汇率修改。"
+                    )
                 with st.form("new_sku"):
                     n_name = st.text_input("产品名称")
                     n_color = st.text_input("颜色")
-                    c1, c2, c3 = st.columns(3)
-                    n_cost = c1.number_input("进价", format="%.2f")
-                    n_price = c2.number_input("售价", format="%.2f")
-                    n_expect = c3.number_input("应收")
+                    c1, c2 = st.columns(2)
+                    n_rmb_cost = c1.number_input(
+                        "人民币进价 CNY",
+                        min_value=0.0,
+                        value=0.0,
+                        format="%.2f",
+                        help="填写后会优先按右侧汇率自动换算新币进价。",
+                    )
+                    n_fx_rate = c2.number_input(
+                        "换算汇率（1 SGD = CNY）",
+                        min_value=0.0001,
+                        value=float(new_sku_default_fx_rate),
+                        step=0.0001,
+                        format="%.4f",
+                        help="默认为 ECB 参考汇率，可改为银行或厂商实际结算汇率。",
+                    )
+                    c3, c4, c5 = st.columns(3)
+                    n_cost = c3.number_input(
+                        "新币进价 SGD（CNY 留空时使用）",
+                        min_value=0.0,
+                        value=0.0,
+                        format="%.2f",
+                    )
+                    n_price = c4.number_input("售价", min_value=0.0, format="%.2f")
+                    n_expect = c5.number_input("应收", min_value=0.0)
                     i1, i2, i3, i4 = st.columns(4)
-                    n_disp = i1.number_input("展示")
-                    n_shelf = i2.number_input("货柜")
-                    n_stor = i3.number_input("储物")
-                    n_dmg = i4.number_input("坏货")
+                    n_disp = i1.number_input("展示", min_value=0.0)
+                    n_shelf = i2.number_input("货柜", min_value=0.0)
+                    n_stor = i3.number_input("储物", min_value=0.0)
+                    n_dmg = i4.number_input("坏货", min_value=0.0)
+                    st.caption(
+                        "填写人民币进价时，系统会在确认建档时自动计算并锁定新币进价。"
+                    )
                     if st.form_submit_button("确认建档"):
                         if n_name and n_color:
-                            fresh = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
-                            latest_stock, latest_restock = fresh[STOCK_SHEET], fresh[RESTOCK_SHEET]
-                            total = n_disp + n_shelf + n_stor 
-                            new_r = pd.DataFrame([[n_name, n_color, n_cost, "", n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
-                            latest_stock = pd.concat([latest_stock, new_r], ignore_index=True)
-                            if total > 0 or n_dmg > 0:
-                                log_date = datetime.now().strftime("%Y/%m/%d")
-                                init_log = pd.DataFrame([[log_date, "初始建档", n_name, n_color, total+n_dmg, "多库位", n_cost, "系统建档"]], columns=RESTOCK_COLS)
-                                latest_restock = pd.concat([init_log, latest_restock], ignore_index=True)
-                                save_data(latest_restock, RESTOCK_SHEET)
-                            save_data(latest_stock, STOCK_SHEET) 
-                            st.success("✅ 云端建档成功！")
-                            st.rerun()
+                            try:
+                                resolved_n_cost = (
+                                    _convert_cny_to_sgd_cost(n_rmb_cost, n_fx_rate)
+                                    if n_rmb_cost > 0
+                                    else round(float(n_cost), 2)
+                                )
+                            except ValueError as new_sku_cost_error:
+                                st.error(str(new_sku_cost_error))
+                            else:
+                                fresh = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
+                                latest_stock, latest_restock = fresh[STOCK_SHEET], fresh[RESTOCK_SHEET]
+                                total = n_disp + n_shelf + n_stor
+                                stored_rmb_cost = round(float(n_rmb_cost), 2) if n_rmb_cost > 0 else ""
+                                new_r = pd.DataFrame([[n_name, n_color, resolved_n_cost, stored_rmb_cost, n_price, n_expect, n_disp, n_shelf, n_stor, n_dmg, 0, total]], columns=STOCK_COLS)
+                                latest_stock = pd.concat([latest_stock, new_r], ignore_index=True)
+                                if total > 0 or n_dmg > 0:
+                                    log_date = datetime.now().strftime("%Y/%m/%d")
+                                    init_note = "系统建档"
+                                    if n_rmb_cost > 0:
+                                        init_note += (
+                                            f"；人民币进价 ¥{n_rmb_cost:.2f}"
+                                            f"；建档汇率 1 SGD = {n_fx_rate:.4f} CNY"
+                                        )
+                                    init_log = pd.DataFrame([[log_date, "初始建档", n_name, n_color, total+n_dmg, "多库位", resolved_n_cost, init_note]], columns=RESTOCK_COLS)
+                                    latest_restock = pd.concat([init_log, latest_restock], ignore_index=True)
+                                    save_data(latest_restock, RESTOCK_SHEET)
+                                save_data(latest_stock, STOCK_SHEET)
+                                st.success(
+                                    f"✅ 云端建档成功！锁定新币进价 S${resolved_n_cost:.2f}"
+                                )
+                                st.rerun()
+                        else:
+                            st.warning("请填写产品名称和颜色。")
             st.divider()
             if st.button("📅 档期中心 / Popup 对比", use_container_width=True):
                 st.session_state.admin_page = "campaign_bi"
