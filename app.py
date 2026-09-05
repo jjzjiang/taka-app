@@ -645,7 +645,7 @@ def _verify_bulk_inventory_commit(
     return True, ""
 
 
-def _normalize_inventory_count_import(raw_df, stock_df):
+def _normalize_inventory_count_import(raw_df, stock_df, blank_as_zero=False):
     errors = []
     warnings = []
     if raw_df is None or raw_df.empty:
@@ -693,7 +693,7 @@ def _normalize_inventory_count_import(raw_df, stock_df):
         for _, row in rows.iterrows():
             value = row[column]
             if pd.isna(value) or str(value).strip() == "":
-                normalized_values.append(pd.NA)
+                normalized_values.append(0 if blank_as_zero else pd.NA)
                 continue
             number = pd.to_numeric(value, errors="coerce")
             excel_row = int(row["_Excel行号"])
@@ -742,7 +742,9 @@ def _normalize_inventory_count_import(raw_df, stock_df):
             )
         elif len(matches) > 1:
             errors.append(f"后台存在重复 SKU：{name} ({color})。")
-        if all(pd.isna(row[column]) for column in quantity_columns):
+        if not blank_as_zero and all(
+            pd.isna(row[column]) for column in quantity_columns
+        ):
             warnings.append(
                 f"第 {excel_row} 行未填写任何盘点数量，该 SKU 不会修改。"
             )
@@ -965,10 +967,10 @@ def _build_inventory_count_template_bytes(stock_df):
     instructions["A1"].font = Font(size=16, bold=True, color="1F4E78")
     instructions["A3"] = "填写方法"
     instructions["B3"] = "商品名称和颜色已由系统填好，只需填写线下实际数量。"
-    instructions["A4"] = "空白"
-    instructions["B4"] = "留空的库位不修改。"
-    instructions["A5"] = "归零"
-    instructions["B5"] = "明确填写 0 才会将该库位库存归零。"
+    instructions["A4"] = "完整盘点覆盖"
+    instructions["B4"] = "完整盘点覆盖（默认）：所有库存位置都会覆盖，空白按 0 处理。"
+    instructions["A5"] = "部分库位更新"
+    instructions["B5"] = "空白保留旧值，明确填写 0 才会将该库位库存归零。"
     instructions["A6"] = "数量"
     instructions["B6"] = "只能填写大于等于 0 的整数。"
     instructions["A7"] = "提醒"
@@ -5474,11 +5476,27 @@ if is_admin:
 
         with t1_e:
             st.markdown("### 📋 批量盘点覆盖")
-            st.info(
-                f"模板已自动填入当前 **{ACTIVE_SYSTEM_CONFIG['label']}** "
-                "的商品名称和颜色。你只需填写实际数量；"
-                "空白不修改，填写 0 才会归零。"
+            inventory_count_mode = st.radio(
+                "盘点方式",
+                ["完整盘点覆盖", "部分库位更新"],
+                index=0,
+                horizontal=True,
+                key="inventory_count_mode",
             )
+            inventory_count_full_override = (
+                inventory_count_mode == "完整盘点覆盖"
+            )
+            if inventory_count_full_override:
+                st.info(
+                    f"模板已自动填入当前 **{ACTIVE_SYSTEM_CONFIG['label']}** "
+                    "的商品名称和颜色。完整盘点会覆盖所有库存位置，空白按 0 处理。"
+                )
+            else:
+                st.info(
+                    f"模板已自动填入当前 **{ACTIVE_SYSTEM_CONFIG['label']}** "
+                    "的商品名称和颜色。部分更新只修改填写的库存位置；"
+                    "空白保留旧值，填写 0 才会归零。"
+                )
             count_flash = st.session_state.pop("inventory_count_flash", None)
             if count_flash:
                 if count_flash.get("verified"):
@@ -5535,7 +5553,9 @@ if is_admin:
 
                 if inventory_count_raw is not None:
                     count_normalized = _normalize_inventory_count_import(
-                        inventory_count_raw, df_stock
+                        inventory_count_raw,
+                        df_stock,
+                        blank_as_zero=inventory_count_full_override,
                     )
                     count_rows = count_normalized["rows"]
                     count_errors = list(count_normalized["errors"])
@@ -5603,7 +5623,9 @@ if is_admin:
                         latest_count_stock = fresh_count[STOCK_SHEET]
                         latest_count_restock = fresh_count[RESTOCK_SHEET]
                         final_count_normalized = _normalize_inventory_count_import(
-                            inventory_count_raw, latest_count_stock
+                            inventory_count_raw,
+                            latest_count_stock,
+                            blank_as_zero=inventory_count_full_override,
                         )
                         final_count_rows = final_count_normalized["rows"]
                         final_count_errors = list(final_count_normalized["errors"])
