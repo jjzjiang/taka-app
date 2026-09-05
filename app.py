@@ -4730,7 +4730,7 @@ def render_inventory_snapshot(role_prefix):
                 st.dataframe(df_disp.style.format({p_col: '${:.2f}'}), use_container_width=True, hide_index=True)
             
         elif role_prefix == 'admin':
-            display_cols = ['选择', '商品名称', '颜色', '期间售出', '已售出数量', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '售卖价格', '进价成本', '人民币进价', '单品毛利率']
+            display_cols = ['选择', '商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '售卖价格', '进价成本', '人民币进价', '单品毛利率']
             df_disp = v_df[display_cols].copy()
             if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
             
@@ -4738,11 +4738,16 @@ def render_inventory_snapshot(role_prefix):
             c_col = 'Cost' if st.session_state.lang == 'en' else '进价成本'
             rmb_col = 'Purchase Cost CNY' if st.session_state.lang == 'en' else '人民币进价'
             stk_col = 'Total Stock' if st.session_state.lang == 'en' else '总库存'
+            name_col = 'Product' if st.session_state.lang == 'en' else '商品名称'
+            color_col = 'Variant' if st.session_state.lang == 'en' else '颜色'
             sel_col_name = "Sel" if st.session_state.lang == 'en' else "选择"
+            low_stock_cols = {name_col, color_col, stk_col}
+            warning_style = 'background-color: #ffe6e6; color: #cc0000; font-weight: bold;'
             
             def highlight_low_stock(row):
                 try:
-                    if int(row[stk_col]) <= 2: return ['background-color: #ffe6e6; color: #cc0000; font-weight: bold;'] * len(row)
+                    if int(row[stk_col]) <= 2:
+                        return [warning_style if col in low_stock_cols else '' for col in row.index]
                 except: pass
                 return [''] * len(row)
 
