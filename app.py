@@ -3066,7 +3066,7 @@ CATEGORY_SYSTEMS = {
         "inventory_snapshot": "Silk_Inventory_Snapshots",
     },
 }
-CATEGORY_SCOPED_SESSION_KEYS = ["pos_cart", "last_order_id"]
+CATEGORY_SCOPED_SESSION_KEYS = ["pos_cart", "last_order_id", "lazada_cart"]
 
 def get_category_system_config(system_key):
     system_key = str(system_key or DEFAULT_CATEGORY_SYSTEM).strip()
@@ -3145,6 +3145,15 @@ TRAFFIC_COLS = ['日期', '有效客流']
 CAMP_COLS = ['档期名称', '开始日期', '结束日期']
 STAFF_PURCHASE_COLS = ['内购单号', '日期', '员工姓名', '商品名称', '颜色', '购买数量', '内购单价', '扣款金额', '成本合计', '记录人', '是否扣库存', '备注']
 INVENTORY_SNAPSHOT_COLS = ['档期键', '档期名称', '开始日期', '结束日期', '快照日期', '商品名称', '颜色', '开档库存', '记录人', '备注']
+LAZADA_SHEET = "Lazada_Sales"
+LAZADA_COLS = [
+    'Lazada订单号', '日期', '商品名称', '颜色', '销售数量',
+    '成交单价', '商品营业额', '录入方式', '备注',
+]
+LAZADA_IMPORT_COLUMNS = [
+    'Lazada订单号', '日期', '商品名称', '颜色', '销售数量',
+    '成交单价', '商品营业额', '备注',
+]
 DAILY_CLOSE_COLS = [
     '报告日期',
     '品类系统',
@@ -3157,7 +3166,406 @@ DAILY_CLOSE_COLS = [
     '最后提交时间',
 ]
 
-all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET]
+all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET]
+
+
+def _normalize_lazada_sales_import(
+    raw_df,
+    stock_df,
+    existing_sales_df,
+    entry_method="Excel导入",
+):
+    errors = []
+    warnings = []
+    empty_rows = pd.DataFrame(columns=LAZADA_COLS + ["_Excel行号"])
+    if raw_df is None or raw_df.empty:
+        return {"rows": empty_rows, "errors": ["文件没有可读取的 Lazada 销售数据。"], "warnings": warnings}
+
+    rows = raw_df.copy()
+    rows.columns = [str(column).strip() for column in rows.columns]
+    aliases = {"订单号": "Lazada订单号", "总营业额": "商品营业额"}
+    for alias, canonical in aliases.items():
+        if canonical not in rows.columns and alias in rows.columns:
+            rows = rows.rename(columns={alias: canonical})
+    for column in LAZADA_IMPORT_COLUMNS:
+        if column not in rows.columns:
+            rows[column] = ""
+    rows = rows[LAZADA_IMPORT_COLUMNS].copy()
+    non_empty = rows.apply(
+        lambda row: any(
+            not pd.isna(value) and str(value).strip() != ""
+            for value in row
+        ),
+        axis=1,
+    )
+    rows = rows.loc[non_empty].copy()
+    rows["_Excel行号"] = rows.index.to_series().astype(int) + 2
+    rows = rows.reset_index(drop=True)
+    if rows.empty:
+        return {"rows": empty_rows, "errors": ["文件没有可读取的 Lazada 销售数据。"], "warnings": warnings}
+
+    for column in ("Lazada订单号", "商品名称", "颜色", "备注"):
+        rows[column] = rows[column].fillna("").astype(str).str.strip()
+
+    normalized_dates = []
+    normalized_quantities = []
+    normalized_prices = []
+    normalized_revenues = []
+    for _, row in rows.iterrows():
+        excel_row = int(row["_Excel行号"])
+        if not row["Lazada订单号"]:
+            errors.append(f"第 {excel_row} 行缺少 Lazada 订单号。")
+        if not row["商品名称"]:
+            errors.append(f"第 {excel_row} 行缺少商品名称。")
+        if not row["颜色"]:
+            errors.append(f"第 {excel_row} 行缺少颜色。")
+
+        parsed_date = pd.to_datetime(row["日期"], errors="coerce")
+        if pd.isna(parsed_date):
+            errors.append(f"第 {excel_row} 行日期无法识别。")
+            normalized_dates.append("")
+        else:
+            normalized_dates.append(parsed_date.strftime("%Y/%m/%d"))
+
+        quantity = pd.to_numeric(row["销售数量"], errors="coerce")
+        if pd.isna(quantity) or not math.isfinite(float(quantity)):
+            errors.append(f"第 {excel_row} 行销售数量不是有效数字。")
+            normalized_quantities.append(0)
+            quantity_value = 0
+        else:
+            quantity_value = float(quantity)
+            if quantity_value <= 0 or not quantity_value.is_integer():
+                errors.append(f"第 {excel_row} 行销售数量必须是大于 0 的整数。")
+            normalized_quantities.append(
+                int(quantity_value) if quantity_value.is_integer() else quantity_value
+            )
+
+        price = pd.to_numeric(row["成交单价"], errors="coerce")
+        if pd.isna(price) or not math.isfinite(float(price)) or float(price) < 0:
+            errors.append(f"第 {excel_row} 行成交单价必须是大于或等于 0 的数字。")
+            normalized_prices.append(0.0)
+            price_value = 0.0
+        else:
+            price_value = round(float(price), 2)
+            normalized_prices.append(price_value)
+
+        expected_revenue = round(quantity_value * price_value, 2)
+        supplied_revenue = row["商品营业额"]
+        if pd.isna(supplied_revenue) or str(supplied_revenue).strip() == "":
+            normalized_revenues.append(expected_revenue)
+        else:
+            revenue = pd.to_numeric(supplied_revenue, errors="coerce")
+            if pd.isna(revenue) or not math.isfinite(float(revenue)) or float(revenue) < 0:
+                errors.append(f"第 {excel_row} 行商品营业额不是有效数字。")
+                normalized_revenues.append(expected_revenue)
+            else:
+                revenue_value = round(float(revenue), 2)
+                if abs(revenue_value - expected_revenue) > 0.01:
+                    errors.append(
+                        f"第 {excel_row} 行商品营业额与销售数量 × 成交单价不一致。"
+                    )
+                normalized_revenues.append(revenue_value)
+
+    rows["日期"] = normalized_dates
+    rows["销售数量"] = normalized_quantities
+    rows["成交单价"] = normalized_prices
+    rows["商品营业额"] = normalized_revenues
+    rows["录入方式"] = str(entry_method or "Excel导入").strip()
+
+    key_columns = ["Lazada订单号", "商品名称", "颜色"]
+    duplicate_mask = rows.duplicated(subset=key_columns, keep=False)
+    for _, duplicate_row in rows.loc[duplicate_mask].iterrows():
+        errors.append(
+            f"第 {int(duplicate_row['_Excel行号'])} 行订单/SKU 在文件中重复。"
+        )
+
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for column in ("商品名称", "颜色"):
+        if column not in stock.columns:
+            stock[column] = ""
+        stock[column] = stock[column].fillna("").astype(str).str.strip()
+    existing = (
+        existing_sales_df.copy()
+        if existing_sales_df is not None
+        else pd.DataFrame(columns=LAZADA_COLS)
+    )
+    for column in LAZADA_COLS:
+        if column not in existing.columns:
+            existing[column] = ""
+    existing_keys = set(
+        zip(
+            existing["Lazada订单号"].fillna("").astype(str).str.strip(),
+            existing["商品名称"].fillna("").astype(str).str.strip(),
+            existing["颜色"].fillna("").astype(str).str.strip(),
+        )
+    )
+
+    for _, row in rows.iterrows():
+        name = row["商品名称"]
+        color = row["颜色"]
+        excel_row = int(row["_Excel行号"])
+        matches = stock[
+            stock["商品名称"].eq(name) & stock["颜色"].eq(color)
+        ]
+        if matches.empty:
+            errors.append(f"第 {excel_row} 行商品「{name} ({color})」在钛杯库存中不存在。")
+        elif len(matches) > 1:
+            errors.append(f"钛杯库存中存在重复 SKU：{name} ({color})。")
+        key = (row["Lazada订单号"], name, color)
+        if key in existing_keys:
+            errors.append(
+                f"第 {excel_row} 行订单「{row['Lazada订单号']}」的 {name} ({color}) 已经存在。"
+            )
+
+    return {
+        "rows": rows[LAZADA_COLS + ["_Excel行号"]],
+        "errors": list(dict.fromkeys(errors)),
+        "warnings": warnings,
+    }
+
+
+def _apply_lazada_sales_import(normalized_rows, stock_df, lazada_sales_df):
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    lazada = (
+        lazada_sales_df.copy()
+        if lazada_sales_df is not None
+        else pd.DataFrame(columns=LAZADA_COLS)
+    )
+    for column in STOCK_COLS:
+        if column not in stock.columns:
+            stock[column] = ""
+    stock = stock[STOCK_COLS].copy()
+    for column in LAZADA_COLS:
+        if column not in lazada.columns:
+            lazada[column] = ""
+    lazada = lazada[LAZADA_COLS].copy()
+    rows = normalized_rows.copy() if normalized_rows is not None else pd.DataFrame()
+    if rows.empty:
+        raise ValueError("没有可提交的 Lazada 销售数据。")
+    for column in LAZADA_COLS:
+        if column not in rows.columns:
+            rows[column] = ""
+    rows = rows[LAZADA_COLS].copy()
+
+    existing_keys = set(
+        zip(
+            lazada["Lazada订单号"].fillna("").astype(str).str.strip(),
+            lazada["商品名称"].fillna("").astype(str).str.strip(),
+            lazada["颜色"].fillna("").astype(str).str.strip(),
+        )
+    )
+    incoming_keys = []
+    for _, row in rows.iterrows():
+        key = (
+            str(row["Lazada订单号"]).strip(),
+            str(row["商品名称"]).strip(),
+            str(row["颜色"]).strip(),
+        )
+        if key in existing_keys or key in incoming_keys:
+            raise ValueError(f"Lazada 订单/SKU 重复：{key[0]} / {key[1]} ({key[2]})。")
+        incoming_keys.append(key)
+
+    stock["商品名称"] = stock["商品名称"].fillna("").astype(str).str.strip()
+    stock["颜色"] = stock["颜色"].fillna("").astype(str).str.strip()
+    required = rows.copy()
+    required["销售数量"] = pd.to_numeric(required["销售数量"], errors="coerce").fillna(0)
+    required = required.groupby(["商品名称", "颜色"], as_index=False)["销售数量"].sum()
+
+    stock_targets = []
+    for _, requirement in required.iterrows():
+        name = str(requirement["商品名称"]).strip()
+        color = str(requirement["颜色"]).strip()
+        quantity = int(requirement["销售数量"])
+        matches = stock[
+            stock["商品名称"].eq(name) & stock["颜色"].eq(color)
+        ].index
+        if len(matches) != 1:
+            raise ValueError(f"SKU 无法唯一匹配：{name} ({color})。")
+        idx = matches[0]
+        current_total = recalc_total_stock(stock, idx)
+        if quantity <= 0:
+            raise ValueError(f"销售数量必须大于 0：{name} ({color})。")
+        if current_total < quantity:
+            raise ValueError(
+                f"{name} ({color}) 库存不足：现有 {current_total}，需要 {quantity}。"
+            )
+        stock_targets.append((idx, quantity))
+
+    for idx, quantity in stock_targets:
+        if not deduct_pos_stock_from_locations(stock, idx, quantity):
+            raise ValueError("库存库位与总库存不一致，Lazada 销售未提交。")
+        stock.at[idx, "已售出数量"] = to_int(stock.at[idx, "已售出数量"]) + quantity
+
+    lazada = pd.concat([rows, lazada], ignore_index=True)
+    return {
+        "stock": stock[STOCK_COLS],
+        "lazada": lazada[LAZADA_COLS],
+        "summary": {
+            "订单数": int(rows["Lazada订单号"].astype(str).nunique()),
+            "销售件数": int(pd.to_numeric(rows["销售数量"], errors="coerce").fillna(0).sum()),
+            "商品营业额": round(float(pd.to_numeric(rows["商品营业额"], errors="coerce").fillna(0).sum()), 2),
+        },
+    }
+
+
+def _revoke_lazada_sale(lazada_sales_df, stock_df, row_index):
+    lazada = lazada_sales_df.copy()
+    stock = stock_df.copy()
+    if row_index not in lazada.index:
+        raise ValueError("未找到要撤销的 Lazada 流水。")
+    row = lazada.loc[row_index]
+    name = str(row["商品名称"]).strip()
+    color = str(row["颜色"]).strip()
+    quantity = to_int(row["销售数量"])
+    matches = stock[
+        stock["商品名称"].fillna("").astype(str).str.strip().eq(name)
+        & stock["颜色"].fillna("").astype(str).str.strip().eq(color)
+    ].index
+    if len(matches) != 1:
+        raise ValueError(f"SKU 无法唯一匹配：{name} ({color})。")
+    idx = matches[0]
+    stock.at[idx, "货柜数量"] = to_int(stock.at[idx, "货柜数量"]) + quantity
+    stock.at[idx, "已售出数量"] = max(
+        0, to_int(stock.at[idx, "已售出数量"]) - quantity
+    )
+    stock.at[idx, "总库存"] = recalc_total_stock(stock, idx)
+    lazada = lazada.drop(index=row_index).reset_index(drop=True)
+    return {"stock": stock[STOCK_COLS], "lazada": lazada[LAZADA_COLS], "revoked": row}
+
+
+def _replace_lazada_sale(lazada_sales_df, stock_df, row_index, replacement_row):
+    reversed_result = _revoke_lazada_sale(lazada_sales_df, stock_df, row_index)
+    replacement = replacement_row.copy()
+    if isinstance(replacement, pd.Series):
+        replacement = replacement.to_frame().T
+    return _apply_lazada_sales_import(
+        replacement,
+        reversed_result["stock"],
+        reversed_result["lazada"],
+    )
+
+
+def _summarize_lazada_sales(lazada_sales_df):
+    sales = lazada_sales_df.copy() if lazada_sales_df is not None else pd.DataFrame()
+    for column in LAZADA_COLS:
+        if column not in sales.columns:
+            sales[column] = ""
+    sales["销售数量"] = pd.to_numeric(sales["销售数量"], errors="coerce").fillna(0)
+    sales["商品营业额"] = pd.to_numeric(sales["商品营业额"], errors="coerce").fillna(0.0)
+    product_summary = (
+        sales.groupby(["商品名称", "颜色"], as_index=False)
+        .agg({"销售数量": "sum", "商品营业额": "sum"})
+        .sort_values(["商品营业额", "销售数量"], ascending=[False, False])
+        if not sales.empty
+        else pd.DataFrame(columns=["商品名称", "颜色", "销售数量", "商品营业额"])
+    )
+    return {
+        "订单数": int(sales["Lazada订单号"].fillna("").astype(str).replace("", pd.NA).nunique()),
+        "销售件数": int(sales["销售数量"].sum()),
+        "商品营业额": round(float(sales["商品营业额"].sum()), 2),
+        "商品汇总": product_summary,
+    }
+
+
+def _build_lazada_sales_template_bytes(stock_df):
+    workbook = Workbook()
+    sales_sheet = workbook.active
+    sales_sheet.title = "Lazada销售导入"
+    sales_sheet.append(LAZADA_IMPORT_COLUMNS)
+    sales_sheet.freeze_panes = "A2"
+    sales_sheet.auto_filter.ref = "A1:H1"
+
+    reference = workbook.create_sheet("SKU参考")
+    reference.append(["商品名称", "颜色", "当前总库存", "系统售价"])
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for column in STOCK_COLS:
+        if column not in stock.columns:
+            stock[column] = ""
+    for _, row in stock.iterrows():
+        reference.append([
+            row["商品名称"], row["颜色"], row["总库存"], row["售卖价格"]
+        ])
+    reference.freeze_panes = "A2"
+
+    instructions = workbook.create_sheet("填写说明")
+    instruction_rows = [
+        ["Taka Lazada 销售导入模板", ""],
+        ["", ""],
+        ["订单号", "同一订单可填写多个不同 SKU；订单号 + 商品 + 颜色不能重复。"],
+        ["商品营业额", "可以留空，系统会按销售数量 × 成交单价自动计算。"],
+        ["库存", "提交成功后会扣减钛杯系统的当前库存。"],
+        ["范围", "Lazada 营业额独立保存，不进入高岛屋财务报表。"],
+    ]
+    for row in instruction_rows:
+        instructions.append(row)
+
+    header_fill = PatternFill("solid", fgColor="DDEBF7")
+    for worksheet in (sales_sheet, reference):
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="1F2937")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+    for worksheet in (sales_sheet, reference, instructions):
+        for column, width in zip("ABCDEFGH", [22, 14, 24, 16, 14, 14, 16, 30]):
+            worksheet.column_dimensions[column].width = width
+    instructions["A1"].font = Font(size=16, bold=True, color="1F4E78")
+    instructions.column_dimensions["A"].width = 20
+    instructions.column_dimensions["B"].width = 78
+    for row_number in range(3, 7):
+        instructions.cell(row=row_number, column=1).font = Font(bold=True)
+        instructions.cell(row=row_number, column=2).alignment = Alignment(wrap_text=True)
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def _verify_lazada_sales_commit(expected_rows, expected_stock, actual_lazada, actual_stock):
+    expected_rows = expected_rows.copy()
+    actual_lazada = actual_lazada.copy()
+    expected_stock = expected_stock.copy()
+    actual_stock = actual_stock.copy()
+    key_columns = ["Lazada订单号", "商品名称", "颜色"]
+    for frame in (expected_rows, actual_lazada):
+        for column in key_columns:
+            if column not in frame.columns:
+                return False, f"回读缺少字段：{column}。"
+            frame[column] = frame[column].fillna("").astype(str).str.strip()
+    for _, expected in expected_rows.iterrows():
+        matches = actual_lazada.copy()
+        for column in key_columns:
+            matches = matches[matches[column].eq(expected[column])]
+        if len(matches) != 1:
+            return False, (
+                f"Lazada 流水回读无法唯一匹配：{expected['Lazada订单号']} / "
+                f"{expected['商品名称']} ({expected['颜色']})。"
+            )
+        actual = matches.iloc[0]
+        for column in ("销售数量", "成交单价", "商品营业额"):
+            expected_number = pd.to_numeric(expected[column], errors="coerce")
+            actual_number = pd.to_numeric(actual[column], errors="coerce")
+            if pd.isna(expected_number) or pd.isna(actual_number) or abs(float(expected_number) - float(actual_number)) > 0.01:
+                return False, f"Lazada 流水「{column}」回读不一致。"
+
+    touched = expected_rows[["商品名称", "颜色"]].drop_duplicates()
+    stock_columns = ["展示数量", "货柜数量", "储物间数量", "已售出数量", "总库存"]
+    for _, key in touched.iterrows():
+        expected_match = expected_stock[
+            expected_stock["商品名称"].fillna("").astype(str).str.strip().eq(key["商品名称"])
+            & expected_stock["颜色"].fillna("").astype(str).str.strip().eq(key["颜色"])
+        ]
+        actual_match = actual_stock[
+            actual_stock["商品名称"].fillna("").astype(str).str.strip().eq(key["商品名称"])
+            & actual_stock["颜色"].fillna("").astype(str).str.strip().eq(key["颜色"])
+        ]
+        if len(expected_match) != 1 or len(actual_match) != 1:
+            return False, f"库存回读无法唯一匹配：{key['商品名称']} ({key['颜色']})。"
+        for column in stock_columns:
+            expected_number = to_int(expected_match.iloc[0][column])
+            actual_number = to_int(actual_match.iloc[0][column])
+            if expected_number != actual_number:
+                return False, f"{key['商品名称']} ({key['颜色']}) 的「{column}」回读不一致。"
+    return True, ""
 
 if "sheet_versions" not in st.session_state:
     st.session_state.sheet_versions = {s: 0 for s in all_sheets}
@@ -3519,6 +3927,71 @@ def _sheet_column_letter(column_number):
     return letters
 
 
+def _save_lazada_sales_frames(
+    stock_df,
+    lazada_df,
+    spreadsheet=None,
+    worksheet_getter=None,
+    version_state=None,
+    cache_invalidator=None,
+):
+    spreadsheet = sh if spreadsheet is None else spreadsheet
+    worksheet_getter = (
+        get_worksheet_cached if worksheet_getter is None else worksheet_getter
+    )
+    version_state = (
+        st.session_state.sheet_versions
+        if version_state is None
+        else version_state
+    )
+    cache_invalidator = (
+        invalidate_data_cache
+        if cache_invalidator is None
+        else cache_invalidator
+    )
+    frames = [("Stock", stock_df), (LAZADA_SHEET, lazada_df)]
+    batch_data = []
+    worksheet_rows = []
+    for sheet_name, frame in frames:
+        try:
+            worksheet = worksheet_getter(sheet_name)
+        except WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(
+                title=sheet_name,
+                rows="1000",
+                cols=str(max(20, len(frame.columns) + 5)),
+            )
+        safe_frame = frame.fillna("").astype(str)
+        values = [safe_frame.columns.tolist()] + safe_frame.values.tolist()
+        required_rows = max(1000, len(values) + 100)
+        required_cols = max(20, len(safe_frame.columns) + 5)
+        if worksheet.row_count < required_rows or worksheet.col_count < required_cols:
+            worksheet.resize(
+                rows=max(worksheet.row_count, required_rows),
+                cols=max(worksheet.col_count, required_cols),
+            )
+        escaped_title = str(worksheet.title).replace("'", "''")
+        last_column = _sheet_column_letter(len(safe_frame.columns))
+        batch_data.append({
+            "range": f"'{escaped_title}'!A1:{last_column}{len(values)}",
+            "majorDimension": "ROWS",
+            "values": values,
+        })
+        worksheet_rows.append((worksheet, len(values) + 1))
+
+    spreadsheet.values_batch_update(
+        {"valueInputOption": "USER_ENTERED", "data": batch_data}
+    )
+    for worksheet, first_unused_row in worksheet_rows:
+        if worksheet.row_count >= first_unused_row:
+            worksheet.batch_clear(
+                [f"A{first_unused_row}:ZZ{worksheet.row_count}"]
+            )
+    for sheet_name, _ in frames:
+        version_state[sheet_name] = version_state.get(sheet_name, 0) + 1
+        cache_invalidator(sheet_name)
+
+
 def _save_bulk_inventory_frames(
     stock_df,
     restock_df,
@@ -3768,6 +4241,10 @@ def JIT_fetch(sheets_to_fetch):
     if CAMP_SHEET in sheets_to_fetch: res[CAMP_SHEET] = clean_date_col(clean_date_col(load_data(CAMP_SHEET, CAMP_COLS), '开始日期'), '结束日期')
     if INVENTORY_SNAPSHOT_SHEET in sheets_to_fetch:
         res[INVENTORY_SNAPSHOT_SHEET] = clean_date_col(clean_date_col(clean_date_col(load_data(INVENTORY_SNAPSHOT_SHEET, INVENTORY_SNAPSHOT_COLS), '开始日期'), '结束日期'), '快照日期')
+    if LAZADA_SHEET in sheets_to_fetch:
+        res[LAZADA_SHEET] = clean_date_col(
+            load_data(LAZADA_SHEET, LAZADA_COLS), '日期'
+        )
     return res
 
 @st.cache_data(show_spinner=False)
@@ -3785,6 +4262,7 @@ df_feedback = pd.DataFrame(columns=FEEDBACK_COLS)
 df_restock = pd.DataFrame(columns=RESTOCK_COLS)
 df_traffic = pd.DataFrame(columns=TRAFFIC_COLS)
 df_campaign = pd.DataFrame(columns=CAMP_COLS)
+df_lazada_sales = pd.DataFrame(columns=LAZADA_COLS)
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -3794,6 +4272,7 @@ if "staff_purchase_reset_key" not in st.session_state: st.session_state.staff_pu
 if "b2b_reset_key" not in st.session_state: st.session_state.b2b_reset_key = 0 
 if "fb_reset_key" not in st.session_state: st.session_state.fb_reset_key = 0 
 if "camp_reset_key" not in st.session_state: st.session_state.camp_reset_key = 0
+if "lazada_reset_key" not in st.session_state: st.session_state.lazada_reset_key = 0
 if "admin_page" not in st.session_state: st.session_state.admin_page = "main"
 
 def clear_stock(): st.session_state.stock_reset_key += 1
@@ -4122,6 +4601,10 @@ if role_now == "admin":
     df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
     df_campaign = clean_date_col(clean_date_col(load_data(CAMP_SHEET, CAMP_COLS), '开始日期'), '结束日期')
     df_inventory_snapshot = clean_date_col(clean_date_col(clean_date_col(load_data(INVENTORY_SNAPSHOT_SHEET, INVENTORY_SNAPSHOT_COLS), '开始日期'), '结束日期'), '快照日期')
+    if ACTIVE_CATEGORY_SYSTEM == "titanium":
+        df_lazada_sales = clean_date_col(
+            load_data(LAZADA_SHEET, LAZADA_COLS), '日期'
+        )
 elif role_now == "supplier":
     df_stock = load_data(STOCK_SHEET, STOCK_COLS)
     df_sales = load_safe_sales()
@@ -4660,7 +5143,12 @@ if is_admin and st.session_state.get("admin_page") == "campaign_bi":
     st.stop()
 
 if is_admin:
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([t("📊 库存", "📊 Inventory"), t("💰 销售", "💰 Sales"), t("📈 毛利", "📈 Margin"), t("👥 考勤", "👥 Staff"), t("💎 净利润", "💎 Net Profit"), t("🤝 B2B订单", "🤝 B2B"), t("🗣️ 客户反馈", "🗣️ Feedback"), t("🧠 战略(BI)", "🧠 BI")])
+    admin_tab_labels = [t("📊 库存", "📊 Inventory"), t("💰 销售", "💰 Sales"), t("📈 毛利", "📈 Margin"), t("👥 考勤", "👥 Staff"), t("💎 净利润", "💎 Net Profit"), t("🤝 B2B订单", "🤝 B2B"), t("🗣️ 客户反馈", "🗣️ Feedback"), t("🧠 战略(BI)", "🧠 BI")]
+    if ACTIVE_CATEGORY_SYSTEM == "titanium":
+        admin_tab_labels.append(t("🛍 Lazada", "🛍 Lazada"))
+    admin_tabs = st.tabs(admin_tab_labels)
+    t1, t2, t3, t4, t5, t6, t7, t8 = admin_tabs[:8]
+    t9 = admin_tabs[8] if ACTIVE_CATEGORY_SYSTEM == "titanium" else None
 elif is_supplier:
     t1, t2, t3, t4 = st.tabs([t("📊 实时库存快照", "📊 Inventory Snapshot"), t("💰 销售报表对账", "💰 Sales Report"), t("📦 进货对账 (ERP流水)", "📦 Inbound Records"), t("🤝 B2B订单对账", "🤝 B2B Orders")])
 else:
@@ -5163,6 +5651,453 @@ def render_pos_engine(role_prefix):
                 save_data(latest_stock, STOCK_SHEET) 
                 st.success("✅ Exchange Success!")
                 st.rerun()
+
+
+def render_lazada_workspace():
+    st.subheader("🛍 Lazada 销售管理")
+    st.info(
+        "Lazada 与钛杯系统共用实时库存；每笔销售会扣减库存并增加累计已售。"
+        "Lazada 营业额不会计入高岛屋销售、毛利、净利润、档期或员工提成。"
+    )
+
+    flash = st.session_state.pop("lazada_flash", None)
+    if flash:
+        if flash.get("verified"):
+            st.success(flash.get("message", "Lazada 数据已保存。"))
+        else:
+            st.warning(flash.get("message", "数据已提交，但回读核对未完成。"))
+
+    def _sku_options(stock_frame):
+        options = stock_frame.copy()
+        for column in STOCK_COLS:
+            if column not in options.columns:
+                options[column] = ""
+        options["商品名称"] = options["商品名称"].fillna("").astype(str).str.strip()
+        options["颜色"] = options["颜色"].fillna("").astype(str).str.strip()
+        options = options[(options["商品名称"] != "") & (options["颜色"] != "")].copy()
+        options["_label"] = options.apply(
+            lambda row: (
+                f"{row['商品名称']} ({row['颜色']})｜库存 {recalc_total_stock(options, row.name)}"
+            ),
+            axis=1,
+        )
+        return options
+
+    def _read_upload(uploaded_file):
+        payload = uploaded_file.getvalue()
+        if uploaded_file.name.lower().endswith(".csv"):
+            return pd.read_csv(BytesIO(payload), dtype=object)
+        return pd.read_excel(BytesIO(payload), sheet_name=0, dtype=object)
+
+    def _save_submission(normalized_rows, success_message):
+        fresh = JIT_fetch(["Stock", LAZADA_SHEET])
+        latest_stock = fresh["Stock"]
+        latest_lazada = fresh[LAZADA_SHEET]
+        refreshed = _normalize_lazada_sales_import(
+            normalized_rows[LAZADA_IMPORT_COLUMNS],
+            latest_stock,
+            latest_lazada,
+            entry_method=str(normalized_rows.iloc[0]["录入方式"]),
+        )
+        if refreshed["errors"]:
+            raise ValueError("；".join(refreshed["errors"]))
+        result = _apply_lazada_sales_import(
+            refreshed["rows"], latest_stock, latest_lazada
+        )
+        _save_lazada_sales_frames(result["stock"], result["lazada"])
+        readback = JIT_fetch(["Stock", LAZADA_SHEET])
+        verified, message = _verify_lazada_sales_commit(
+            refreshed["rows"],
+            result["stock"],
+            readback[LAZADA_SHEET],
+            readback["Stock"],
+        )
+        st.session_state.lazada_flash = {
+            "verified": verified,
+            "message": success_message if verified else (
+                "数据已经提交，但自动回读核对未通过："
+                f"{message} 请先刷新核对，不要重复提交。"
+            ),
+        }
+
+    manual_tab, import_tab, report_tab = st.tabs(
+        ["✍️ 手动录入", "📤 Excel 导入", "📊 销售报表与修正"]
+    )
+
+    with manual_tab:
+        st.caption("先把商品加入待提交清单；确认后整单一次写入。")
+        options = _sku_options(df_stock)
+        if options.empty:
+            st.warning("钛杯系统暂无可销售 SKU。")
+        else:
+            c1, c2 = st.columns(2)
+            order_number = c1.text_input(
+                "Lazada 订单号",
+                key=f"lazada_order_{st.session_state.lazada_reset_key}",
+            ).strip()
+            sale_date = c2.date_input(
+                "销售日期",
+                value=datetime.now().date(),
+                key=f"lazada_date_{st.session_state.lazada_reset_key}",
+            )
+            selected_label = st.selectbox(
+                "选择商品",
+                options["_label"].tolist(),
+                key=f"lazada_sku_{st.session_state.lazada_reset_key}",
+            )
+            selected = options[options["_label"].eq(selected_label)].iloc[0]
+            c3, c4 = st.columns(2)
+            quantity = c3.number_input(
+                "销售数量",
+                min_value=1,
+                step=1,
+                value=1,
+                key=f"lazada_qty_{st.session_state.lazada_reset_key}",
+            )
+            unit_price = c4.number_input(
+                "成交单价 ($)",
+                min_value=0.0,
+                value=max(0.0, to_float(selected["售卖价格"])),
+                step=1.0,
+                format="%.2f",
+                key=f"lazada_price_{st.session_state.lazada_reset_key}",
+            )
+            note = st.text_input(
+                "备注（选填）",
+                key=f"lazada_note_{st.session_state.lazada_reset_key}",
+            )
+            if st.button("＋ 加入待提交清单", key="lazada_add_to_cart"):
+                if not order_number:
+                    st.warning("请先填写 Lazada 订单号。")
+                else:
+                    cart = list(st.session_state.get("lazada_cart", []))
+                    item_key = (
+                        order_number,
+                        str(selected["商品名称"]).strip(),
+                        str(selected["颜色"]).strip(),
+                    )
+                    if any(
+                        (
+                            str(item["Lazada订单号"]).strip(),
+                            str(item["商品名称"]).strip(),
+                            str(item["颜色"]).strip(),
+                        ) == item_key
+                        for item in cart
+                    ):
+                        st.warning("该订单中的这个 SKU 已在待提交清单里。")
+                    else:
+                        cart.append({
+                            "Lazada订单号": order_number,
+                            "日期": sale_date.strftime("%Y/%m/%d"),
+                            "商品名称": str(selected["商品名称"]).strip(),
+                            "颜色": str(selected["颜色"]).strip(),
+                            "销售数量": int(quantity),
+                            "成交单价": round(float(unit_price), 2),
+                            "商品营业额": round(int(quantity) * float(unit_price), 2),
+                            "录入方式": "手动录入",
+                            "备注": note.strip(),
+                        })
+                        st.session_state.lazada_cart = cart
+                        st.rerun()
+
+        cart = list(st.session_state.get("lazada_cart", []))
+        if cart:
+            cart_frame = pd.DataFrame(cart, columns=LAZADA_COLS)
+            st.dataframe(cart_frame, use_container_width=True, hide_index=True)
+            total_units = int(pd.to_numeric(cart_frame["销售数量"], errors="coerce").fillna(0).sum())
+            total_revenue = float(pd.to_numeric(cart_frame["商品营业额"], errors="coerce").fillna(0).sum())
+            m1, m2 = st.columns(2)
+            m1.metric("待提交件数", f"{total_units} 件")
+            m2.metric("待提交商品营业额", f"${total_revenue:,.2f}")
+            b1, b2 = st.columns(2)
+            if b1.button("清空待提交清单", use_container_width=True, key="lazada_clear_cart"):
+                st.session_state.lazada_cart = []
+                st.rerun()
+            if b2.button(
+                "确认提交 Lazada 销售",
+                type="primary",
+                use_container_width=True,
+                key="lazada_submit_cart",
+            ):
+                try:
+                    _save_submission(
+                        cart_frame,
+                        f"Lazada 销售已保存：{total_units} 件，商品营业额 ${total_revenue:,.2f}。",
+                    )
+                    st.session_state.lazada_cart = []
+                    st.session_state.lazada_reset_key += 1
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"提交失败，库存和流水未完成更新：{error}")
+
+    with import_tab:
+        st.caption("下载模板填写后上传；系统会先检查重复订单、SKU 和实时库存。")
+        st.download_button(
+            "⬇️ 下载 Lazada 销售模板",
+            data=_build_lazada_sales_template_bytes(df_stock),
+            file_name="Taka_Lazada销售导入模板.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="download_lazada_template",
+        )
+        upload = st.file_uploader(
+            "上传 Lazada 销售文件",
+            type=["xlsx", "csv"],
+            key=f"lazada_import_{st.session_state.lazada_reset_key}",
+        )
+        if upload is not None:
+            try:
+                raw = _read_upload(upload)
+                normalized = _normalize_lazada_sales_import(
+                    raw, df_stock, df_lazada_sales, entry_method="Excel导入"
+                )
+            except Exception as error:
+                normalized = None
+                st.error(f"文件无法读取：{error}")
+            if normalized is not None:
+                for error in normalized["errors"]:
+                    st.error(error)
+                for warning in normalized["warnings"]:
+                    st.warning(warning)
+                if not normalized["rows"].empty:
+                    st.dataframe(
+                        normalized["rows"].drop(columns=["_Excel行号"], errors="ignore"),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                confirmed = st.checkbox(
+                    "我已核对以上订单、数量和金额",
+                    key=f"lazada_import_confirm_{st.session_state.lazada_reset_key}",
+                    disabled=bool(normalized["errors"]),
+                )
+                if st.button(
+                    "确认导入并扣减库存",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=bool(normalized["errors"]) or not confirmed,
+                    key="lazada_import_submit",
+                ):
+                    try:
+                        rows = normalized["rows"]
+                        qty = int(pd.to_numeric(rows["销售数量"], errors="coerce").fillna(0).sum())
+                        revenue = float(pd.to_numeric(rows["商品营业额"], errors="coerce").fillna(0).sum())
+                        _save_submission(
+                            rows,
+                            f"Lazada 文件已导入：{qty} 件，商品营业额 ${revenue:,.2f}。",
+                        )
+                        st.session_state.lazada_reset_key += 1
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"导入失败，库存和流水未完成更新：{error}")
+
+    with report_tab:
+        report_start, report_end = date_range_picker(
+            "选择 Lazada 销售日期区间",
+            "Lazada Sales Date Range",
+            key="lazada_report_range",
+        )
+        report = filter_by_date_range(
+            df_lazada_sales, "日期", report_start, report_end
+        )
+        summary = _summarize_lazada_sales(report)
+        r1, r2, r3 = st.columns(3)
+        r1.metric("商品营业额", f"${summary['商品营业额']:,.2f}")
+        r2.metric("订单数", f"{summary['订单数']} 单")
+        r3.metric("销售件数", f"{summary['销售件数']} 件")
+        if report.empty:
+            st.info("该日期范围内暂无 Lazada 销售记录。")
+        else:
+            st.markdown("#### 商品汇总")
+            product_summary = summary["商品汇总"].copy()
+            st.dataframe(
+                product_summary.style.format({"商品营业额": "${:,.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.markdown("#### 销售流水")
+            detailed = report.reset_index().rename(columns={"index": "_原索引"})
+            st.dataframe(
+                detailed[LAZADA_COLS].style.format({
+                    "成交单价": "${:,.2f}",
+                    "商品营业额": "${:,.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            record_labels = detailed.apply(
+                lambda row: (
+                    f"{row['日期']}｜{row['Lazada订单号']}｜"
+                    f"{row['商品名称']} ({row['颜色']})｜{to_int(row['销售数量'])} 件"
+                ),
+                axis=1,
+            ).tolist()
+            selected_record_label = st.selectbox(
+                "选择需要修正的流水",
+                record_labels,
+                key=f"lazada_record_select_{st.session_state.lazada_reset_key}",
+            )
+            selected_position = record_labels.index(selected_record_label)
+            selected_record = detailed.iloc[selected_position]
+            edit_tab, revoke_tab = st.tabs(["修改记录", "撤销记录"])
+            with edit_tab:
+                sku_options = _sku_options(df_stock)
+                available_labels = sku_options["_label"].tolist()
+                current_index = next(
+                    (
+                        index
+                        for index, label in enumerate(available_labels)
+                        if label.startswith(
+                            f"{selected_record['商品名称']} ({selected_record['颜色']})｜"
+                        )
+                    ),
+                    0,
+                )
+                with st.form(f"lazada_edit_form_{st.session_state.lazada_reset_key}"):
+                    e1, e2 = st.columns(2)
+                    edit_order = e1.text_input(
+                        "Lazada 订单号", value=str(selected_record["Lazada订单号"])
+                    )
+                    edit_date = e2.date_input(
+                        "销售日期", value=pd.to_datetime(selected_record["日期"]).date()
+                    )
+                    edit_sku_label = st.selectbox(
+                        "商品", available_labels, index=current_index
+                    )
+                    e3, e4 = st.columns(2)
+                    edit_qty = e3.number_input(
+                        "销售数量", min_value=1, step=1, value=to_int(selected_record["销售数量"])
+                    )
+                    edit_price = e4.number_input(
+                        "成交单价 ($)", min_value=0.0, value=to_float(selected_record["成交单价"]), format="%.2f"
+                    )
+                    edit_note = st.text_input("备注", value=str(selected_record["备注"] or ""))
+                    edit_submitted = st.form_submit_button(
+                        "保存修改", type="primary", use_container_width=True
+                    )
+                if edit_submitted:
+                    try:
+                        fresh = JIT_fetch(["Stock", LAZADA_SHEET])
+                        latest_stock = fresh["Stock"]
+                        latest_lazada = fresh[LAZADA_SHEET]
+                        old_key = (
+                            str(selected_record["Lazada订单号"]).strip(),
+                            str(selected_record["商品名称"]).strip(),
+                            str(selected_record["颜色"]).strip(),
+                        )
+                        key_mask = (
+                            latest_lazada["Lazada订单号"].fillna("").astype(str).str.strip().eq(old_key[0])
+                            & latest_lazada["商品名称"].fillna("").astype(str).str.strip().eq(old_key[1])
+                            & latest_lazada["颜色"].fillna("").astype(str).str.strip().eq(old_key[2])
+                        )
+                        matches = latest_lazada.index[key_mask]
+                        if len(matches) != 1:
+                            raise ValueError("原流水已变化，请刷新后重新选择。")
+                        new_name, new_color = split_sku_label(edit_sku_label.split("｜", 1)[0])
+                        replacement_raw = pd.DataFrame([{
+                            "Lazada订单号": edit_order.strip(),
+                            "日期": edit_date.strftime("%Y/%m/%d"),
+                            "商品名称": new_name,
+                            "颜色": new_color,
+                            "销售数量": int(edit_qty),
+                            "成交单价": float(edit_price),
+                            "商品营业额": "",
+                            "备注": edit_note.strip(),
+                        }])
+                        existing_without_old = latest_lazada.drop(index=matches[0])
+                        normalized = _normalize_lazada_sales_import(
+                            replacement_raw,
+                            latest_stock,
+                            existing_without_old,
+                            entry_method="手动修正",
+                        )
+                        if normalized["errors"]:
+                            raise ValueError("；".join(normalized["errors"]))
+                        result = _replace_lazada_sale(
+                            latest_lazada,
+                            latest_stock,
+                            matches[0],
+                            normalized["rows"],
+                        )
+                        _save_lazada_sales_frames(result["stock"], result["lazada"])
+                        readback = JIT_fetch(["Stock", LAZADA_SHEET])
+                        verified, message = _verify_lazada_sales_commit(
+                            normalized["rows"], result["stock"], readback[LAZADA_SHEET], readback["Stock"]
+                        )
+                        st.session_state.lazada_flash = {
+                            "verified": verified,
+                            "message": "Lazada 流水和库存已同步修正。" if verified else (
+                                f"修改已提交，但回读核对未通过：{message} 请勿重复操作。"
+                            ),
+                        }
+                        st.session_state.lazada_reset_key += 1
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"修改失败：{error}")
+
+            with revoke_tab:
+                st.warning("撤销后，本笔数量会退回货柜库存，并从累计已售中扣回。")
+                revoke_confirmed = st.checkbox(
+                    "确认撤销这条 Lazada 流水",
+                    key=f"lazada_revoke_confirm_{st.session_state.lazada_reset_key}",
+                )
+                if st.button(
+                    "撤销并恢复库存",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not revoke_confirmed,
+                    key="lazada_revoke_submit",
+                ):
+                    try:
+                        fresh = JIT_fetch(["Stock", LAZADA_SHEET])
+                        latest_stock = fresh["Stock"]
+                        latest_lazada = fresh[LAZADA_SHEET]
+                        key_mask = (
+                            latest_lazada["Lazada订单号"].fillna("").astype(str).str.strip().eq(str(selected_record["Lazada订单号"]).strip())
+                            & latest_lazada["商品名称"].fillna("").astype(str).str.strip().eq(str(selected_record["商品名称"]).strip())
+                            & latest_lazada["颜色"].fillna("").astype(str).str.strip().eq(str(selected_record["颜色"]).strip())
+                        )
+                        matches = latest_lazada.index[key_mask]
+                        if len(matches) != 1:
+                            raise ValueError("原流水已变化，请刷新后重新选择。")
+                        result = _revoke_lazada_sale(latest_lazada, latest_stock, matches[0])
+                        _save_lazada_sales_frames(result["stock"], result["lazada"])
+                        readback = JIT_fetch(["Stock", LAZADA_SHEET])
+                        remaining_mask = (
+                            readback[LAZADA_SHEET]["Lazada订单号"].fillna("").astype(str).str.strip().eq(str(selected_record["Lazada订单号"]).strip())
+                            & readback[LAZADA_SHEET]["商品名称"].fillna("").astype(str).str.strip().eq(str(selected_record["商品名称"]).strip())
+                            & readback[LAZADA_SHEET]["颜色"].fillna("").astype(str).str.strip().eq(str(selected_record["颜色"]).strip())
+                        )
+                        expected_stock_row = result["stock"][
+                            result["stock"]["商品名称"].fillna("").astype(str).str.strip().eq(str(selected_record["商品名称"]).strip())
+                            & result["stock"]["颜色"].fillna("").astype(str).str.strip().eq(str(selected_record["颜色"]).strip())
+                        ]
+                        actual_stock_row = readback["Stock"][
+                            readback["Stock"]["商品名称"].fillna("").astype(str).str.strip().eq(str(selected_record["商品名称"]).strip())
+                            & readback["Stock"]["颜色"].fillna("").astype(str).str.strip().eq(str(selected_record["颜色"]).strip())
+                        ]
+                        stock_columns = ["展示数量", "货柜数量", "储物间数量", "已售出数量", "总库存"]
+                        revoke_verified = (
+                            not remaining_mask.any()
+                            and len(expected_stock_row) == 1
+                            and len(actual_stock_row) == 1
+                            and all(
+                                to_int(expected_stock_row.iloc[0][column])
+                                == to_int(actual_stock_row.iloc[0][column])
+                                for column in stock_columns
+                            )
+                        )
+                        st.session_state.lazada_flash = {
+                            "verified": revoke_verified,
+                            "message": (
+                                "Lazada 流水已撤销，数量已退回货柜库存。"
+                                if revoke_verified
+                                else "撤销已提交，但自动回读未能确认完整结果。请先刷新核对，不要重复撤销。"
+                            ),
+                        }
+                        st.session_state.lazada_reset_key += 1
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"撤销失败：{error}")
 
 # =========================================================================================
 # ================================== 🚀 Admin 专属代码 ======================================
@@ -8109,6 +9044,10 @@ if is_admin:
         if st.button("📅 打开档期中心 / Popup 对比", type="primary", use_container_width=True, key="open_campaign_bi_from_tab"):
             st.session_state.admin_page = "campaign_bi"
             st.rerun()
+
+    if t9 is not None:
+        with t9:
+            render_lazada_workspace()
 
 # ================= 🚀 Tab 3/4: 厂商专属层 (Supplier) =================
 elif is_supplier:
