@@ -3962,6 +3962,14 @@ def _save_lazada_sales_frames(
                 cols=str(max(20, len(frame.columns) + 5)),
             )
         safe_frame = frame.fillna("").astype(str)
+        if sheet_name == LAZADA_SHEET and "Lazada订单号" in safe_frame.columns:
+            safe_frame["Lazada订单号"] = safe_frame["Lazada订单号"].map(
+                lambda value: (
+                    value
+                    if not value or value.startswith("'")
+                    else f"'{value}"
+                )
+            )
         values = [safe_frame.columns.tolist()] + safe_frame.values.tolist()
         required_rows = max(1000, len(values) + 100)
         required_cols = max(20, len(safe_frame.columns) + 5)
