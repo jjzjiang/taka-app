@@ -3159,6 +3159,16 @@ PRODUCT_CATEGORIES = [
     "日常杯具类", "茶具类", "礼品礼盒类", "咖啡杯类", "餐具类",
     "钛艺类", "壶具类", "酒具类", "配件类", "其他/待分类",
 ]
+PRODUCT_BRANDS = ["太可", "小黑杯"]
+CONFIRMED_GIFT_PRODUCTS = {
+    "观锦 Pro", "迷梦鸢尾礼盒Pro", "观茗Pro", "悦见礼盒", "Leuch1917联名礼盒",
+}
+CONFIRMED_CATEGORY_OVERRIDES = {
+    "纯钛玲珑杯 50mL": "茶具类",
+    "纯钛壶": "茶具类",
+    "纯钛马克杯": "日常杯具类",
+    "筷子套装6pc": "餐具类",
+}
 PRODUCT_CATEGORY_COLS = [
     "品类系统", "商品名称", "确认品类", "系统建议品类", "分类状态",
     "最后确认人", "最后确认时间", "备注",
@@ -3181,17 +3191,20 @@ DAILY_CLOSE_COLS = [
 all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET, PRODUCT_CATEGORY_SHEET]
 
 
+def _suggest_product_brand(product_name):
+    name = " ".join(str(product_name or "").strip().split())
+    if name.upper().startswith(("BC", "BCT")) or "小黑杯" in name:
+        return "小黑杯"
+    return "太可"
+
+
 def _suggest_product_category(product_name):
     name = " ".join(str(product_name or "").strip().split())
-    lowered = name.casefold()
+    if name in CONFIRMED_CATEGORY_OVERRIDES:
+        return CONFIRMED_CATEGORY_OVERRIDES[name]
     if "钛艺" in name:
         return "钛艺类"
-    if any(
-        token in lowered
-        for token in (
-            "礼盒", "套装", "茶韵", "leuch1917", "观锦 pro", "观茗pro"
-        )
-    ):
+    if name in CONFIRMED_GIFT_PRODUCTS or "1917联名礼盒" in name:
         return "礼品礼盒类"
     if any(token in name for token in ("咖啡", "马克杯")):
         return "咖啡杯类"
@@ -3199,7 +3212,7 @@ def _suggest_product_category(product_name):
         token in name
         for token in (
             "泡茶", "快客", "盖碗", "茶水分离", "主人杯", "茶叶罐",
-            "焖茶", "直滤杯",
+            "焖茶", "直滤杯", "茶韵",
         )
     ):
         return "茶具类"
@@ -3253,6 +3266,7 @@ def _resolve_product_categories(products_df, mapping_df, system_key):
         products["商品名称"] = ""
     products["商品名称"] = products["商品名称"].fillna("").astype(str).str.strip()
     products = products[products["商品名称"].ne("")][["商品名称"]].drop_duplicates()
+    products["品牌"] = products["商品名称"].map(_suggest_product_brand)
     products["系统建议品类"] = products["商品名称"].map(_suggest_product_category)
 
     mapping = _normalize_product_category_map(mapping_df)
@@ -3269,7 +3283,7 @@ def _resolve_product_categories(products_df, mapping_df, system_key):
         lambda value: "已确认" if value in PRODUCT_CATEGORIES else "待确认"
     )
     return resolved[
-        ["商品名称", "系统建议品类", "确认品类", "品类", "分类状态"]
+        ["商品名称", "品牌", "系统建议品类", "确认品类", "品类", "分类状态"]
     ].reset_index(drop=True)
 
 
@@ -3341,15 +3355,19 @@ def _build_category_sales_analysis(sales_df, resolved_categories):
     categories = (
         resolved_categories.copy()
         if resolved_categories is not None
-        else pd.DataFrame(columns=["商品名称", "品类", "分类状态"])
+        else pd.DataFrame(columns=["商品名称", "品牌", "品类", "分类状态"])
     )
-    for column in ("商品名称", "品类", "分类状态"):
+    for column in ("商品名称", "品牌", "品类", "分类状态"):
         if column not in categories.columns:
             categories[column] = ""
-    categories = categories[["商品名称", "品类", "分类状态"]].drop_duplicates(
+    categories = categories[["商品名称", "品牌", "品类", "分类状态"]].drop_duplicates(
         subset=["商品名称"], keep="last"
     )
     detail = sales.merge(categories, on="商品名称", how="left")
+    inferred_brands = detail["商品名称"].map(_suggest_product_brand)
+    detail["品牌"] = detail["品牌"].fillna("").where(
+        detail["品牌"].fillna("").isin(PRODUCT_BRANDS), inferred_brands
+    )
     detail["品类"] = detail["品类"].fillna("").replace("", "其他/待分类")
     detail["分类状态"] = detail["分类状态"].fillna("").replace("", "待确认")
 
@@ -3379,34 +3397,42 @@ def _build_category_sales_analysis(sales_df, resolved_categories):
         ).fillna(0)
         return grouped.sort_values("商品营业额", ascending=False).reset_index(drop=True)
 
-    category_summary = aggregate(["品类"])
+    brand_summary = aggregate(["品牌"])
+    category_summary = aggregate(["品牌", "品类"])
     if not category_summary.empty:
-        category_summary["产品数"] = category_summary["品类"].map(
-            detail.groupby("品类")["商品名称"].nunique()
-        ).fillna(0).astype(int)
+        product_counts = detail.groupby(["品牌", "品类"])["商品名称"].nunique()
+        category_summary["产品数"] = category_summary.set_index(
+            ["品牌", "品类"]
+        ).index.map(product_counts).fillna(0).astype(int)
     else:
         category_summary["产品数"] = pd.Series(dtype="int64")
 
-    product_summary = aggregate(["品类", "商品名称"])
+    product_summary = aggregate(["品牌", "品类", "商品名称"])
     if not product_summary.empty:
-        product_summary["颜色数"] = product_summary.set_index(["品类", "商品名称"]).index.map(
-            detail.groupby(["品类", "商品名称"])["颜色"].nunique()
+        product_summary["颜色数"] = product_summary.set_index(
+            ["品牌", "品类", "商品名称"]
+        ).index.map(
+            detail.groupby(["品牌", "品类", "商品名称"])["颜色"].nunique()
         )
     else:
         product_summary["颜色数"] = pd.Series(dtype="int64")
 
     return {
         "summary": summary,
+        "brand_summary": brand_summary,
+        "brand_daily": detail.groupby(["日期", "品牌"], as_index=False).agg(
+            销售件数=("销售数量", "sum"), 商品营业额=("商品营业额", "sum")
+        ) if not detail.empty else pd.DataFrame(columns=["日期", "品牌", "销售件数", "商品营业额"]),
         "category_summary": category_summary,
-        "category_daily": detail.groupby(["日期", "品类"], as_index=False).agg(
+        "category_daily": detail.groupby(["日期", "品牌", "品类"], as_index=False).agg(
             销售件数=("销售数量", "sum"), 商品营业额=("商品营业额", "sum")
-        ) if not detail.empty else pd.DataFrame(columns=["日期", "品类", "销售件数", "商品营业额"]),
+        ) if not detail.empty else pd.DataFrame(columns=["日期", "品牌", "品类", "销售件数", "商品营业额"]),
         "product_summary": product_summary,
-        "product_daily": detail.groupby(["日期", "品类", "商品名称"], as_index=False).agg(
+        "product_daily": detail.groupby(["日期", "品牌", "品类", "商品名称"], as_index=False).agg(
             销售件数=("销售数量", "sum"), 商品营业额=("商品营业额", "sum")
-        ) if not detail.empty else pd.DataFrame(columns=["日期", "品类", "商品名称", "销售件数", "商品营业额"]),
-        "color_summary": aggregate(["品类", "商品名称", "颜色"]),
-        "channel_summary": aggregate(["品类", "商品名称", "渠道"]),
+        ) if not detail.empty else pd.DataFrame(columns=["日期", "品牌", "品类", "商品名称", "销售件数", "商品营业额"]),
+        "color_summary": aggregate(["品牌", "品类", "商品名称", "颜色"]),
+        "channel_summary": aggregate(["品牌", "品类", "商品名称", "渠道"]),
         "detail": detail.reset_index(drop=True),
     }
 
@@ -5468,7 +5494,7 @@ def render_campaign_bi_center():
 
 def render_product_category_sales_center():
     st.title("📦 品类销售分析")
-    st.caption("按功能品类查看销量与商品营业额占比，并下钻到商品和颜色。只统计正常正数销售。")
+    st.caption("全部品牌 → 品牌 → 品类 → 商品 → 颜色。只统计正常正数销售。")
 
     today = datetime.now().date()
     control1, control2 = st.columns([2, 1])
@@ -5510,8 +5536,72 @@ def render_product_category_sales_center():
             sale_dates.between(start_date, end_date)
         ].copy()
 
-    full_analysis = _build_category_sales_analysis(normalized_sales, resolved)
-    available_categories = full_analysis["category_summary"].get(
+    overall_analysis = _build_category_sales_analysis(normalized_sales, resolved)
+    brand_summary = overall_analysis["brand_summary"]
+
+    st.markdown("### 品牌销售结构")
+    if brand_summary.empty:
+        st.info("当前日期和渠道下暂无销售数据。")
+        available_brands = PRODUCT_BRANDS
+    else:
+        brand_chart1, brand_chart2 = st.columns(2)
+        with brand_chart1:
+            brand_revenue_fig = px.pie(
+                brand_summary,
+                names="品牌",
+                values="商品营业额",
+                hole=0.45,
+                title="品牌商品营业额占比",
+            )
+            brand_revenue_fig.update_traces(
+                textposition="inside", textinfo="percent+label"
+            )
+            brand_revenue_fig.update_layout(
+                height=390, margin=dict(l=10, r=10, t=50, b=10)
+            )
+            st.plotly_chart(brand_revenue_fig, use_container_width=True)
+        with brand_chart2:
+            brand_qty_fig = px.pie(
+                brand_summary,
+                names="品牌",
+                values="销售件数",
+                hole=0.45,
+                title="品牌销售件数占比",
+            )
+            brand_qty_fig.update_traces(
+                textposition="inside", textinfo="percent+label"
+            )
+            brand_qty_fig.update_layout(
+                height=390, margin=dict(l=10, r=10, t=50, b=10)
+            )
+            st.plotly_chart(brand_qty_fig, use_container_width=True)
+        st.dataframe(
+            brand_summary.style.format({
+                "销售件数": "{:.0f}",
+                "商品营业额": "${:,.2f}",
+                "销量占比%": "{:.1f}%",
+                "营收占比%": "{:.1f}%",
+                "平均成交价": "${:,.2f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        available_brands = brand_summary["品牌"].tolist()
+
+    chosen_brand = st.selectbox(
+        "选择品牌",
+        available_brands,
+        key="category_sales_drill_brand",
+    )
+    brand_lookup = resolved.set_index("商品名称")["品牌"].to_dict()
+    brand_sales = normalized_sales[
+        normalized_sales["商品名称"].map(brand_lookup).fillna(
+            normalized_sales["商品名称"].map(_suggest_product_brand)
+        ).eq(chosen_brand)
+    ].copy()
+    brand_analysis = _build_category_sales_analysis(brand_sales, resolved)
+
+    available_categories = brand_analysis["category_summary"].get(
         "品类", pd.Series(dtype=str)
     ).tolist()
     selected_categories = st.multiselect(
@@ -5522,11 +5612,11 @@ def render_product_category_sales_center():
     )
     if selected_categories:
         category_lookup = resolved.set_index("商品名称")["品类"].to_dict()
-        selected_sales = normalized_sales[
-            normalized_sales["商品名称"].map(category_lookup).fillna("其他/待分类").isin(selected_categories)
+        selected_sales = brand_sales[
+            brand_sales["商品名称"].map(category_lookup).fillna("其他/待分类").isin(selected_categories)
         ]
     else:
-        selected_sales = normalized_sales.iloc[0:0].copy()
+        selected_sales = brand_sales.iloc[0:0].copy()
     analysis = _build_category_sales_analysis(selected_sales, resolved)
     summary = analysis["summary"]
 
