@@ -3154,6 +3154,18 @@ LAZADA_IMPORT_COLUMNS = [
     'Lazada订单号', '日期', '商品名称', '颜色', '销售数量',
     '成交单价', '商品营业额', '备注',
 ]
+PRODUCT_CATEGORY_SHEET = "Product_Category_Map"
+PRODUCT_CATEGORIES = [
+    "日常杯具类", "茶具类", "礼品礼盒类", "咖啡杯类", "餐具类",
+    "钛艺类", "壶具类", "酒具类", "配件类", "其他/待分类",
+]
+PRODUCT_CATEGORY_COLS = [
+    "品类系统", "商品名称", "确认品类", "系统建议品类", "分类状态",
+    "最后确认人", "最后确认时间", "备注",
+]
+CATEGORY_SALES_COLS = [
+    "日期", "渠道", "订单号", "商品名称", "颜色", "销售数量", "商品营业额",
+]
 DAILY_CLOSE_COLS = [
     '报告日期',
     '品类系统',
@@ -3166,7 +3178,305 @@ DAILY_CLOSE_COLS = [
     '最后提交时间',
 ]
 
-all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET]
+all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET, PRODUCT_CATEGORY_SHEET]
+
+
+def _suggest_product_category(product_name):
+    name = " ".join(str(product_name or "").strip().split())
+    lowered = name.casefold()
+    if "钛艺" in name:
+        return "钛艺类"
+    if any(
+        token in lowered
+        for token in (
+            "礼盒", "套装", "茶韵", "leuch1917", "观锦 pro", "观茗pro"
+        )
+    ):
+        return "礼品礼盒类"
+    if any(token in name for token in ("咖啡", "马克杯")):
+        return "咖啡杯类"
+    if any(
+        token in name
+        for token in (
+            "泡茶", "快客", "盖碗", "茶水分离", "主人杯", "茶叶罐",
+            "焖茶", "直滤杯",
+        )
+    ):
+        return "茶具类"
+    if any(token in name for token in ("啤酒杯", "酒壶")):
+        return "酒具类"
+    if any(token in name for token in ("筷子", "钛碗", "盘子", "托盘", "叶碟")):
+        return "餐具类"
+    if any(token in name for token in ("纯钛壶", "保温壶", "冲锋壶")):
+        return "壶具类"
+    if any(token in name for token in ("杯盖", "吸管")):
+        return "配件类"
+    if name.upper().startswith(("BC", "BCT")) or "杯" in name or name == "滑盖儿童":
+        return "日常杯具类"
+    return "其他/待分类"
+
+
+def _normalize_product_category_map(mapping_df):
+    mapping = (
+        mapping_df.copy()
+        if mapping_df is not None
+        else pd.DataFrame(columns=PRODUCT_CATEGORY_COLS)
+    )
+    for column in PRODUCT_CATEGORY_COLS:
+        if column not in mapping.columns:
+            mapping[column] = ""
+    mapping = mapping[PRODUCT_CATEGORY_COLS].fillna("").astype(str)
+    for column in PRODUCT_CATEGORY_COLS:
+        mapping[column] = mapping[column].str.strip()
+    mapping = mapping[
+        mapping["品类系统"].ne("") & mapping["商品名称"].ne("")
+    ].copy()
+    invalid_confirmed = (
+        mapping["确认品类"].ne("")
+        & ~mapping["确认品类"].isin(PRODUCT_CATEGORIES)
+    )
+    mapping.loc[invalid_confirmed, "确认品类"] = ""
+    mapping.loc[mapping["确认品类"].eq(""), "分类状态"] = "待确认"
+    mapping.loc[mapping["确认品类"].ne(""), "分类状态"] = "已确认"
+    return mapping.drop_duplicates(
+        subset=["品类系统", "商品名称"], keep="last"
+    ).reset_index(drop=True)
+
+
+def _resolve_product_categories(products_df, mapping_df, system_key):
+    products = (
+        products_df.copy()
+        if products_df is not None
+        else pd.DataFrame(columns=["商品名称"])
+    )
+    if "商品名称" not in products.columns:
+        products["商品名称"] = ""
+    products["商品名称"] = products["商品名称"].fillna("").astype(str).str.strip()
+    products = products[products["商品名称"].ne("")][["商品名称"]].drop_duplicates()
+    products["系统建议品类"] = products["商品名称"].map(_suggest_product_category)
+
+    mapping = _normalize_product_category_map(mapping_df)
+    system_mapping = mapping[mapping["品类系统"].eq(str(system_key))][
+        ["商品名称", "确认品类"]
+    ].copy()
+    resolved = products.merge(system_mapping, on="商品名称", how="left")
+    resolved["确认品类"] = resolved["确认品类"].fillna("").astype(str).str.strip()
+    resolved["品类"] = resolved["确认品类"].where(
+        resolved["确认品类"].isin(PRODUCT_CATEGORIES),
+        resolved["系统建议品类"],
+    )
+    resolved["分类状态"] = resolved["确认品类"].apply(
+        lambda value: "已确认" if value in PRODUCT_CATEGORIES else "待确认"
+    )
+    return resolved[
+        ["商品名称", "系统建议品类", "确认品类", "品类", "分类状态"]
+    ].reset_index(drop=True)
+
+
+def _normalize_category_sales_channels(pos_sales_df, lazada_sales_df, channel, system_key):
+    frames = []
+    if channel in ("高岛屋 POS", "全渠道"):
+        pos = (
+            pos_sales_df.copy()
+            if pos_sales_df is not None
+            else pd.DataFrame(columns=SALES_COLS)
+        )
+        for column in SALES_COLS:
+            if column not in pos.columns:
+                pos[column] = ""
+        pos["订单号"] = pos["订单号"].fillna("").astype(str).str.strip()
+        pos["销售数量"] = pd.to_numeric(pos["销售数量"], errors="coerce").fillna(0)
+        pos["商品营业额"] = pd.to_numeric(pos["总营业额"], errors="coerce").fillna(0)
+        pos = pos[
+            pos["销售数量"].gt(0)
+            & pos["商品营业额"].gt(0)
+            & ~pos["订单号"].str.upper().str.startswith("EXC-")
+        ].copy()
+        pos["渠道"] = "高岛屋 POS"
+        frames.append(pos[CATEGORY_SALES_COLS])
+
+    if channel in ("Lazada", "全渠道") and str(system_key) == "titanium":
+        lazada = (
+            lazada_sales_df.copy()
+            if lazada_sales_df is not None
+            else pd.DataFrame(columns=LAZADA_COLS)
+        )
+        for column in LAZADA_COLS:
+            if column not in lazada.columns:
+                lazada[column] = ""
+        lazada = lazada.rename(columns={"Lazada订单号": "订单号"})
+        lazada["销售数量"] = pd.to_numeric(lazada["销售数量"], errors="coerce").fillna(0)
+        lazada["商品营业额"] = pd.to_numeric(lazada["商品营业额"], errors="coerce").fillna(0)
+        lazada = lazada[
+            lazada["销售数量"].gt(0)
+            & lazada["商品营业额"].gt(0)
+        ].copy()
+        lazada["渠道"] = "Lazada"
+        frames.append(lazada[CATEGORY_SALES_COLS])
+
+    if not frames:
+        return pd.DataFrame(columns=CATEGORY_SALES_COLS)
+    sales = pd.concat(frames, ignore_index=True)
+    sales["日期"] = pd.to_datetime(sales["日期"], errors="coerce")
+    sales = sales[sales["日期"].notna()].copy()
+    sales["日期"] = sales["日期"].dt.strftime("%Y/%m/%d")
+    for column in ("渠道", "订单号", "商品名称", "颜色"):
+        sales[column] = sales[column].fillna("").astype(str).str.strip()
+    sales = sales[sales["商品名称"].ne("")]
+    return sales[CATEGORY_SALES_COLS].reset_index(drop=True)
+
+
+def _build_category_sales_analysis(sales_df, resolved_categories):
+    sales = (
+        sales_df.copy()
+        if sales_df is not None
+        else pd.DataFrame(columns=CATEGORY_SALES_COLS)
+    )
+    for column in CATEGORY_SALES_COLS:
+        if column not in sales.columns:
+            sales[column] = ""
+    sales["销售数量"] = pd.to_numeric(sales["销售数量"], errors="coerce").fillna(0)
+    sales["商品营业额"] = pd.to_numeric(sales["商品营业额"], errors="coerce").fillna(0)
+
+    categories = (
+        resolved_categories.copy()
+        if resolved_categories is not None
+        else pd.DataFrame(columns=["商品名称", "品类", "分类状态"])
+    )
+    for column in ("商品名称", "品类", "分类状态"):
+        if column not in categories.columns:
+            categories[column] = ""
+    categories = categories[["商品名称", "品类", "分类状态"]].drop_duplicates(
+        subset=["商品名称"], keep="last"
+    )
+    detail = sales.merge(categories, on="商品名称", how="left")
+    detail["品类"] = detail["品类"].fillna("").replace("", "其他/待分类")
+    detail["分类状态"] = detail["分类状态"].fillna("").replace("", "待确认")
+
+    total_qty = float(detail["销售数量"].sum())
+    total_revenue = float(detail["商品营业额"].sum())
+    summary = {
+        "销售件数": total_qty,
+        "商品营业额": total_revenue,
+        "订单数": int(detail["订单号"].replace("", pd.NA).nunique()),
+        "有销售品类数": int(detail["品类"].nunique()),
+        "有销售商品数": int(detail["商品名称"].nunique()),
+        "平均成交价": total_revenue / total_qty if total_qty else 0.0,
+    }
+
+    def aggregate(group_columns):
+        columns = list(group_columns) + ["销售件数", "商品营业额", "销量占比%", "营收占比%", "平均成交价"]
+        if detail.empty:
+            return pd.DataFrame(columns=columns)
+        grouped = detail.groupby(list(group_columns), dropna=False).agg(
+            销售件数=("销售数量", "sum"),
+            商品营业额=("商品营业额", "sum"),
+        ).reset_index()
+        grouped["销量占比%"] = grouped["销售件数"] / total_qty * 100 if total_qty else 0.0
+        grouped["营收占比%"] = grouped["商品营业额"] / total_revenue * 100 if total_revenue else 0.0
+        grouped["平均成交价"] = grouped["商品营业额"].div(
+            grouped["销售件数"].replace(0, pd.NA)
+        ).fillna(0)
+        return grouped.sort_values("商品营业额", ascending=False).reset_index(drop=True)
+
+    category_summary = aggregate(["品类"])
+    if not category_summary.empty:
+        category_summary["产品数"] = category_summary["品类"].map(
+            detail.groupby("品类")["商品名称"].nunique()
+        ).fillna(0).astype(int)
+    else:
+        category_summary["产品数"] = pd.Series(dtype="int64")
+
+    product_summary = aggregate(["品类", "商品名称"])
+    if not product_summary.empty:
+        product_summary["颜色数"] = product_summary.set_index(["品类", "商品名称"]).index.map(
+            detail.groupby(["品类", "商品名称"])["颜色"].nunique()
+        )
+    else:
+        product_summary["颜色数"] = pd.Series(dtype="int64")
+
+    return {
+        "summary": summary,
+        "category_summary": category_summary,
+        "category_daily": detail.groupby(["日期", "品类"], as_index=False).agg(
+            销售件数=("销售数量", "sum"), 商品营业额=("商品营业额", "sum")
+        ) if not detail.empty else pd.DataFrame(columns=["日期", "品类", "销售件数", "商品营业额"]),
+        "product_summary": product_summary,
+        "product_daily": detail.groupby(["日期", "品类", "商品名称"], as_index=False).agg(
+            销售件数=("销售数量", "sum"), 商品营业额=("商品营业额", "sum")
+        ) if not detail.empty else pd.DataFrame(columns=["日期", "品类", "商品名称", "销售件数", "商品营业额"]),
+        "color_summary": aggregate(["品类", "商品名称", "颜色"]),
+        "channel_summary": aggregate(["品类", "商品名称", "渠道"]),
+        "detail": detail.reset_index(drop=True),
+    }
+
+
+def _upsert_product_category_mappings(
+    existing_df, edits_df, system_key, actor, confirmed_at
+):
+    existing = (
+        existing_df.copy()
+        if existing_df is not None
+        else pd.DataFrame(columns=PRODUCT_CATEGORY_COLS)
+    )
+    for column in PRODUCT_CATEGORY_COLS:
+        if column not in existing.columns:
+            existing[column] = ""
+    existing = existing[PRODUCT_CATEGORY_COLS].fillna("").astype(str)
+    for column in PRODUCT_CATEGORY_COLS:
+        existing[column] = existing[column].str.strip()
+
+    edits = edits_df.copy() if edits_df is not None else pd.DataFrame()
+    required = ["商品名称", "确认品类"]
+    if any(column not in edits.columns for column in required):
+        return existing.reset_index(drop=True)
+    for column in ("商品名称", "确认品类", "系统建议品类", "备注"):
+        if column not in edits.columns:
+            edits[column] = ""
+        edits[column] = edits[column].fillna("").astype(str).str.strip()
+    edits = edits[
+        edits["商品名称"].ne("")
+        & edits["确认品类"].isin(PRODUCT_CATEGORIES)
+    ].drop_duplicates(subset=["商品名称"], keep="last")
+    if edits.empty:
+        return existing.reset_index(drop=True)
+
+    edited_names = set(edits["商品名称"])
+    keep_mask = ~(
+        existing["品类系统"].eq(str(system_key))
+        & existing["商品名称"].isin(edited_names)
+    )
+    rows = edits.assign(
+        品类系统=str(system_key),
+        分类状态="已确认",
+        最后确认人=str(actor or "").strip(),
+        最后确认时间=str(confirmed_at or "").strip(),
+    )[PRODUCT_CATEGORY_COLS]
+    return pd.concat([existing[keep_mask], rows], ignore_index=True)[
+        PRODUCT_CATEGORY_COLS
+    ]
+
+
+def _verify_product_category_commit(saved_df, edits_df, system_key):
+    saved = saved_df.copy() if saved_df is not None else pd.DataFrame()
+    edits = edits_df.copy() if edits_df is not None else pd.DataFrame()
+    required_saved = {"品类系统", "商品名称", "确认品类"}
+    required_edits = {"商品名称", "确认品类"}
+    if not required_saved.issubset(saved.columns) or not required_edits.issubset(edits.columns):
+        return False
+    expected = edits[["商品名称", "确认品类"]].fillna("").astype(str)
+    expected = expected[
+        expected["商品名称"].str.strip().ne("")
+        & expected["确认品类"].str.strip().isin(PRODUCT_CATEGORIES)
+    ].drop_duplicates("商品名称", keep="last")
+    if expected.empty:
+        return False
+    actual = saved[saved["品类系统"].astype(str).str.strip().eq(str(system_key))][
+        ["商品名称", "确认品类"]
+    ].fillna("").astype(str).drop_duplicates("商品名称", keep="last")
+    expected_map = dict(zip(expected["商品名称"].str.strip(), expected["确认品类"].str.strip()))
+    actual_map = dict(zip(actual["商品名称"].str.strip(), actual["确认品类"].str.strip()))
+    return all(actual_map.get(name) == category for name, category in expected_map.items())
 
 
 def _normalize_lazada_sales_import(
@@ -4253,6 +4563,10 @@ def JIT_fetch(sheets_to_fetch):
         res[LAZADA_SHEET] = clean_date_col(
             load_data(LAZADA_SHEET, LAZADA_COLS), '日期'
         )
+    if PRODUCT_CATEGORY_SHEET in sheets_to_fetch:
+        res[PRODUCT_CATEGORY_SHEET] = load_data(
+            PRODUCT_CATEGORY_SHEET, PRODUCT_CATEGORY_COLS
+        )
     return res
 
 @st.cache_data(show_spinner=False)
@@ -4509,7 +4823,13 @@ with st.sidebar:
             if st.button("📅 档期中心 / Popup 对比", use_container_width=True):
                 st.session_state.admin_page = "campaign_bi"
                 st.rerun()
-            if st.session_state.get("admin_page") == "campaign_bi":
+            if ACTIVE_CATEGORY_SYSTEM == "titanium":
+                if st.button("📦 品类销售分析", use_container_width=True):
+                    st.session_state.admin_page = "product_category_sales"
+                    st.rerun()
+            if st.session_state.get("admin_page") in {
+                "campaign_bi", "product_category_sales"
+            }:
                 if st.button("↩️ 返回日常管理台", use_container_width=True):
                     st.session_state.admin_page = "main"
                     st.rerun()
@@ -5146,8 +5466,279 @@ def render_campaign_bi_center():
         else:
             st.info("请先至少保存 2 个档期，再使用档期财务对比。")
 
+def render_product_category_sales_center():
+    st.title("📦 品类销售分析")
+    st.caption("按功能品类查看销量与商品营业额占比，并下钻到商品和颜色。只统计正常正数销售。")
+
+    today = datetime.now().date()
+    control1, control2 = st.columns([2, 1])
+    with control1:
+        start_date, end_date = date_range_picker(
+            "📅 分析日期区间",
+            "📅 Analysis Date Range",
+            key="category_sales_date_range",
+            default_start=today - timedelta(days=29),
+            default_end=today,
+        )
+    with control2:
+        channel = st.radio(
+            "销售渠道",
+            ["高岛屋 POS", "Lazada", "全渠道"],
+            horizontal=True,
+            key="category_sales_channel",
+        )
+
+    mapping_df = load_data(PRODUCT_CATEGORY_SHEET, PRODUCT_CATEGORY_COLS)
+    product_frames = []
+    for frame in (df_stock, df_sales, df_lazada_sales):
+        if frame is not None and "商品名称" in frame.columns:
+            product_frames.append(frame[["商品名称"]])
+    products = (
+        pd.concat(product_frames, ignore_index=True)
+        if product_frames
+        else pd.DataFrame(columns=["商品名称"])
+    )
+    resolved = _resolve_product_categories(
+        products, mapping_df, ACTIVE_CATEGORY_SYSTEM
+    )
+    normalized_sales = _normalize_category_sales_channels(
+        df_sales, df_lazada_sales, channel, ACTIVE_CATEGORY_SYSTEM
+    )
+    if not normalized_sales.empty:
+        sale_dates = pd.to_datetime(normalized_sales["日期"], errors="coerce").dt.date
+        normalized_sales = normalized_sales[
+            sale_dates.between(start_date, end_date)
+        ].copy()
+
+    full_analysis = _build_category_sales_analysis(normalized_sales, resolved)
+    available_categories = full_analysis["category_summary"].get(
+        "品类", pd.Series(dtype=str)
+    ).tolist()
+    selected_categories = st.multiselect(
+        "品类筛选",
+        PRODUCT_CATEGORIES,
+        default=available_categories,
+        key="category_sales_categories",
+    )
+    if selected_categories:
+        category_lookup = resolved.set_index("商品名称")["品类"].to_dict()
+        selected_sales = normalized_sales[
+            normalized_sales["商品名称"].map(category_lookup).fillna("其他/待分类").isin(selected_categories)
+        ]
+    else:
+        selected_sales = normalized_sales.iloc[0:0].copy()
+    analysis = _build_category_sales_analysis(selected_sales, resolved)
+    summary = analysis["summary"]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("商品营业额", f"${summary['商品营业额']:,.2f}")
+    m2.metric("销售件数", f"{summary['销售件数']:,.0f} 件")
+    m3.metric("有销售品类", f"{summary['有销售品类数']} 类")
+    m4.metric("平均成交价", f"${summary['平均成交价']:,.2f}")
+
+    category_summary = analysis["category_summary"]
+    if category_summary.empty:
+        st.info("当前日期、渠道和品类筛选下暂无销售数据。")
+    else:
+        st.markdown("### 品类销售结构")
+        chart1, chart2 = st.columns(2)
+        with chart1:
+            revenue_fig = px.pie(
+                category_summary,
+                names="品类",
+                values="商品营业额",
+                hole=0.45,
+                title="商品营业额占比",
+            )
+            revenue_fig.update_traces(textposition="inside", textinfo="percent+label")
+            revenue_fig.update_layout(height=390, margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(revenue_fig, use_container_width=True)
+        with chart2:
+            qty_fig = px.pie(
+                category_summary,
+                names="品类",
+                values="销售件数",
+                hole=0.45,
+                title="销售件数占比",
+            )
+            qty_fig.update_traces(textposition="inside", textinfo="percent+label")
+            qty_fig.update_layout(height=390, margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(qty_fig, use_container_width=True)
+        st.dataframe(
+            category_summary.style.format({
+                "销售件数": "{:.0f}",
+                "商品营业额": "${:,.2f}",
+                "销量占比%": "{:.1f}%",
+                "营收占比%": "{:.1f}%",
+                "平均成交价": "${:,.2f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### 品类下钻")
+        chosen_category = st.selectbox(
+            "选择品类",
+            category_summary["品类"].tolist(),
+            key="category_sales_drill_category",
+        )
+        product_summary = analysis["product_summary"]
+        category_products = product_summary[
+            product_summary["品类"].eq(chosen_category)
+        ].copy()
+        trend = analysis["category_daily"]
+        trend = trend[trend["品类"].eq(chosen_category)].copy()
+        detail1, detail2 = st.columns([1.3, 1])
+        with detail1:
+            if not trend.empty:
+                category_trend_fig = px.line(
+                    trend, x="日期", y="商品营业额", markers=True,
+                    title=f"{chosen_category}：每日商品营业额",
+                )
+                category_trend_fig.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
+                st.plotly_chart(category_trend_fig, use_container_width=True)
+        with detail2:
+            product_fig = px.bar(
+                category_products.head(12).sort_values("商品营业额"),
+                x="商品营业额", y="商品名称", orientation="h",
+                title="商品营业额 Top 商品",
+            )
+            product_fig.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10), yaxis_title="")
+            st.plotly_chart(product_fig, use_container_width=True)
+
+        category_channel_rows = analysis["channel_summary"]
+        category_channel_rows = category_channel_rows[
+            category_channel_rows["品类"].eq(chosen_category)
+        ].groupby("渠道", as_index=False).agg(
+            销售件数=("销售件数", "sum"),
+            商品营业额=("商品营业额", "sum"),
+        )
+        if not category_channel_rows.empty:
+            st.markdown("品类渠道贡献")
+            st.dataframe(
+                category_channel_rows.style.format({
+                    "销售件数": "{:.0f}", "商品营业额": "${:,.2f}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+        chosen_product = st.selectbox(
+            "选择商品",
+            category_products["商品名称"].tolist(),
+            key="category_sales_drill_product",
+        )
+        color_rows = analysis["color_summary"]
+        color_rows = color_rows[
+            color_rows["品类"].eq(chosen_category)
+            & color_rows["商品名称"].eq(chosen_product)
+        ]
+        channel_rows = analysis["channel_summary"]
+        channel_rows = channel_rows[
+            channel_rows["品类"].eq(chosen_category)
+            & channel_rows["商品名称"].eq(chosen_product)
+        ]
+        product_trend = analysis["product_daily"]
+        product_trend = product_trend[
+            product_trend["品类"].eq(chosen_category)
+            & product_trend["商品名称"].eq(chosen_product)
+        ]
+        if not product_trend.empty:
+            product_trend_fig = px.line(
+                product_trend,
+                x="日期",
+                y=["商品营业额", "销售件数"],
+                markers=True,
+                title=f"{chosen_product}：每日销售走势",
+            )
+            product_trend_fig.update_layout(
+                height=330, margin=dict(l=10, r=10, t=50, b=10), legend_title_text="指标"
+            )
+            st.plotly_chart(product_trend_fig, use_container_width=True)
+        drill1, drill2 = st.columns(2)
+        with drill1:
+            st.markdown("颜色表现")
+            st.dataframe(
+                color_rows[["颜色", "销售件数", "商品营业额", "销量占比%", "营收占比%"]].style.format({
+                    "销售件数": "{:.0f}", "商品营业额": "${:,.2f}",
+                    "销量占比%": "{:.1f}%", "营收占比%": "{:.1f}%",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        with drill2:
+            st.markdown("渠道贡献")
+            st.dataframe(
+                channel_rows[["渠道", "销售件数", "商品营业额"]].style.format({
+                    "销售件数": "{:.0f}", "商品营业额": "${:,.2f}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        product_detail = analysis["detail"]
+        product_detail = product_detail[
+            product_detail["商品名称"].eq(chosen_product)
+        ]
+        with st.expander("查看销售明细", expanded=False):
+            st.dataframe(product_detail, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ 导出当前商品明细 CSV",
+                data=convert_df_to_csv(product_detail),
+                file_name=f"Category_Sales_{chosen_product}_{start_date}_{end_date}.csv",
+                mime="text/csv",
+                key="download_category_product_detail",
+            )
+
+    with st.expander("⚙️ 智能分类管理", expanded=False):
+        st.caption("系统会按商品名称建议功能品类。人工确认后，以后优先使用你保存的分类。")
+        editor = resolved.copy()
+        editor["备注"] = ""
+        if not mapping_df.empty:
+            mapping_notes = _normalize_product_category_map(mapping_df)
+            mapping_notes = mapping_notes[
+                mapping_notes["品类系统"].eq(ACTIVE_CATEGORY_SYSTEM)
+            ].set_index("商品名称")["备注"].to_dict()
+            editor["备注"] = editor["商品名称"].map(mapping_notes).fillna("")
+        editor["确认品类"] = editor["确认品类"].where(
+            editor["确认品类"].ne(""), editor["系统建议品类"]
+        )
+        editor.insert(0, "保存", False)
+        edited = st.data_editor(
+            editor[["保存", "商品名称", "系统建议品类", "确认品类", "分类状态", "备注"]],
+            column_config={
+                "保存": st.column_config.CheckboxColumn("保存", default=False),
+                "确认品类": st.column_config.SelectboxColumn("确认品类", options=PRODUCT_CATEGORIES, required=True),
+            },
+            disabled=["商品名称", "系统建议品类", "分类状态"],
+            use_container_width=True,
+            hide_index=True,
+            key="product_category_mapping_editor",
+        )
+        if st.button("💾 保存选中商品的分类", type="primary"):
+            chosen = edited[edited["保存"].eq(True)].copy()
+            if chosen.empty:
+                st.warning("请先勾选需要保存的商品。")
+            else:
+                latest = JIT_fetch([PRODUCT_CATEGORY_SHEET])[PRODUCT_CATEGORY_SHEET]
+                merged = _upsert_product_category_mappings(
+                    latest,
+                    chosen[["商品名称", "确认品类", "系统建议品类", "备注"]],
+                    ACTIVE_CATEGORY_SYSTEM,
+                    st.session_state.current_user,
+                    datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+                )
+                save_data(merged, PRODUCT_CATEGORY_SHEET)
+                saved = JIT_fetch([PRODUCT_CATEGORY_SHEET])[PRODUCT_CATEGORY_SHEET]
+                if _verify_product_category_commit(saved, chosen, ACTIVE_CATEGORY_SYSTEM):
+                    st.success("分类已保存并核验成功。")
+                    st.rerun()
+                else:
+                    st.error("分类写入后核验未通过，请不要重复修改，先刷新页面确认。")
+
+
 if is_admin and st.session_state.get("admin_page") == "campaign_bi":
     render_campaign_bi_center()
+    st.stop()
+
+if is_admin and st.session_state.get("admin_page") == "product_category_sales":
+    render_product_category_sales_center()
     st.stop()
 
 if is_admin:
