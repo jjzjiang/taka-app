@@ -5013,6 +5013,25 @@ def _campaign_options():
             out[f"{name} ({start} 至 {end})"] = (name, start, end)
     return out
 
+def _campaign_range_for_selection(campaigns, selection):
+    if not campaigns or selection not in campaigns:
+        return None
+    period = campaigns.get(selection)
+    if not isinstance(period, (list, tuple)) or len(period) < 3:
+        return None
+    start = pd.to_datetime(period[1], errors="coerce")
+    end = pd.to_datetime(period[2], errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        return None
+    start, end = start.date(), end.date()
+    return (end, start) if start > end else (start, end)
+
+def _sync_category_sales_campaign_range(campaigns):
+    selection = st.session_state.get("category_sales_campaign_shortcut")
+    selected_range = _campaign_range_for_selection(campaigns, selection)
+    if selected_range is not None:
+        st.session_state["category_sales_date_range"] = selected_range
+
 def _period_inventory_key(period_name, start_date, end_date):
     return f"{period_name}|{pd.to_datetime(start_date).date()}|{pd.to_datetime(end_date).date()}"
 
@@ -5497,16 +5516,32 @@ def render_product_category_sales_center():
     st.caption("全部品牌 → 品牌 → 品类 → 商品 → 颜色。只统计正常正数销售。")
 
     today = datetime.now().date()
-    control1, control2 = st.columns([2, 1])
+    campaigns = _campaign_options()
+    campaign_labels = ["手动日期"] + list(campaigns.keys())
+    control1, control2, control3 = st.columns([2, 1.35, 1])
+    with control2:
+        selected_campaign = st.selectbox(
+            "快捷选择档期",
+            campaign_labels,
+            key="category_sales_campaign_shortcut",
+            on_change=_sync_category_sales_campaign_range,
+            args=(campaigns,),
+        )
+    campaign_range = _campaign_range_for_selection(campaigns, selected_campaign)
+    default_start, default_end = (
+        campaign_range
+        if campaign_range is not None
+        else (today - timedelta(days=29), today)
+    )
     with control1:
         start_date, end_date = date_range_picker(
             "📅 分析日期区间",
             "📅 Analysis Date Range",
             key="category_sales_date_range",
-            default_start=today - timedelta(days=29),
-            default_end=today,
+            default_start=default_start,
+            default_end=default_end,
         )
-    with control2:
+    with control3:
         channel = st.radio(
             "销售渠道",
             ["高岛屋 POS", "Lazada", "全渠道"],
