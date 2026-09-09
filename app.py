@@ -3155,6 +3155,11 @@ LAZADA_IMPORT_COLUMNS = [
     '成交单价', '商品营业额', '备注',
 ]
 PRODUCT_CATEGORY_SHEET = "Product_Category_Map"
+MARKET_INSIGHT_SHEET = "Market_Insight_Snapshots"
+MARKET_INSIGHT_COLS = [
+    "来源档期指纹", "公开档期名称", "品类", "偏好占比%",
+    "偏好等级", "排名", "发布状态", "发布时间", "发布人",
+]
 PRODUCT_CATEGORIES = [
     "日常杯具类", "茶具类", "礼品礼盒类", "咖啡杯类", "餐具类",
     "钛艺类", "壶具类", "酒具类", "配件类", "其他/待分类",
@@ -3188,7 +3193,129 @@ DAILY_CLOSE_COLS = [
     '最后提交时间',
 ]
 
-all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET, PRODUCT_CATEGORY_SHEET]
+all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET, PRODUCT_CATEGORY_SHEET, MARKET_INSIGHT_SHEET]
+
+
+def _resolve_person_role(position):
+    position = str(position or "").strip()
+    if position == "合作厂商":
+        return "supplier"
+    if position == "市场洞察访客":
+        return "showcase"
+    return "employee"
+
+
+def _market_insight_period_fingerprint(period_name, start_date, end_date):
+    start = pd.to_datetime(start_date, errors="coerce")
+    end = pd.to_datetime(end_date, errors="coerce")
+    if pd.isna(start) or pd.isna(end):
+        raise ValueError("档期日期无效。")
+    start, end = start.date(), end.date()
+    if start > end:
+        start, end = end, start
+    raw = f"{str(period_name or '').strip()}|{start.isoformat()}|{end.isoformat()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _sanitize_market_insight_preferences(category_summary, small_share_threshold=5.0):
+    safe_columns = ["品类", "偏好占比%", "偏好等级", "排名"]
+    source = (
+        category_summary.copy()
+        if category_summary is not None
+        else pd.DataFrame(columns=["品类", "销售件数"])
+    )
+    for column in ("品类", "销售件数"):
+        if column not in source.columns:
+            source[column] = "" if column == "品类" else 0
+    source["品类"] = source["品类"].fillna("").astype(str).str.strip()
+    source["销售件数"] = pd.to_numeric(
+        source["销售件数"], errors="coerce"
+    ).fillna(0.0)
+    source = source[source["品类"].ne("") & source["销售件数"].gt(0)]
+    if source.empty:
+        return pd.DataFrame(columns=safe_columns)
+
+    grouped = source.groupby("品类", as_index=False)["销售件数"].sum()
+    total_quantity = float(grouped["销售件数"].sum())
+    grouped["_raw_share"] = grouped["销售件数"] / total_quantity * 100
+    merge_to_other = (
+        grouped["_raw_share"].lt(float(small_share_threshold))
+        | grouped["品类"].eq("其他/待分类")
+    )
+    grouped.loc[merge_to_other, "品类"] = "其他"
+    grouped = grouped.groupby("品类", as_index=False)["销售件数"].sum()
+    grouped["_raw_share"] = grouped["销售件数"] / total_quantity * 100
+    grouped["偏好占比%"] = grouped["_raw_share"].astype(int)
+
+    remainder = 100 - int(grouped["偏好占比%"].sum())
+    grouped["_fraction"] = grouped["_raw_share"] - grouped["偏好占比%"]
+    remainder_order = grouped.sort_values(
+        ["_fraction", "销售件数", "品类"],
+        ascending=[False, False, True],
+    ).index.tolist()
+    for index in remainder_order[:max(0, remainder)]:
+        grouped.at[index, "偏好占比%"] += 1
+
+    grouped = grouped.sort_values(
+        ["偏好占比%", "品类"], ascending=[False, True]
+    ).reset_index(drop=True)
+    grouped["排名"] = grouped.index + 1
+    grouped["偏好等级"] = grouped["偏好占比%"].apply(
+        lambda value: "高偏好" if value >= 30 else ("中偏好" if value >= 15 else "观察")
+    )
+    return grouped[safe_columns]
+
+
+def _normalize_market_insight_snapshots(snapshot_df):
+    snapshots = (
+        snapshot_df.copy()
+        if snapshot_df is not None
+        else pd.DataFrame(columns=MARKET_INSIGHT_COLS)
+    )
+    for column in MARKET_INSIGHT_COLS:
+        if column not in snapshots.columns:
+            snapshots[column] = ""
+    snapshots = snapshots[MARKET_INSIGHT_COLS].copy()
+    text_columns = [
+        "来源档期指纹", "公开档期名称", "品类", "偏好等级",
+        "发布状态", "发布时间", "发布人",
+    ]
+    for column in text_columns:
+        snapshots[column] = snapshots[column].fillna("").astype(str).str.strip()
+    snapshots["偏好占比%"] = pd.to_numeric(
+        snapshots["偏好占比%"], errors="coerce"
+    ).fillna(0).clip(0, 100).round(0).astype(int)
+    snapshots["排名"] = pd.to_numeric(
+        snapshots["排名"], errors="coerce"
+    ).fillna(0).round(0).astype(int)
+    return snapshots[
+        snapshots["来源档期指纹"].ne("")
+        & snapshots["公开档期名称"].ne("")
+        & snapshots["品类"].ne("")
+    ].reset_index(drop=True)
+
+
+def _upsert_market_insight_snapshot(
+    existing_df, safe_preferences, period_fingerprint, public_name, actor, published_at
+):
+    existing = _normalize_market_insight_snapshots(existing_df)
+    fingerprint = str(period_fingerprint or "").strip()
+    public_name = str(public_name or "").strip()
+    if not fingerprint or not public_name:
+        raise ValueError("公开档期名称不能为空。")
+    safe = safe_preferences.copy()
+    required = ["品类", "偏好占比%", "偏好等级", "排名"]
+    if safe.empty or any(column not in safe.columns for column in required):
+        raise ValueError("当前档期没有可发布的脱敏品类洞察。")
+    existing = existing[existing["来源档期指纹"].ne(fingerprint)].copy()
+    published = safe[required].copy()
+    published.insert(0, "公开档期名称", public_name)
+    published.insert(0, "来源档期指纹", fingerprint)
+    published["发布状态"] = "已发布"
+    published["发布时间"] = str(published_at or "").strip()
+    published["发布人"] = str(actor or "").strip()
+    published = _normalize_market_insight_snapshots(published)
+    return pd.concat([existing, published], ignore_index=True)[MARKET_INSIGHT_COLS]
 
 
 def _suggest_product_brand(product_name):
@@ -3435,6 +3562,35 @@ def _build_category_sales_analysis(sales_df, resolved_categories):
         "channel_summary": aggregate(["品牌", "品类", "商品名称", "渠道"]),
         "detail": detail.reset_index(drop=True),
     }
+
+
+def _build_taic_market_insight_preferences(
+    pos_sales_df, resolved_categories, start_date, end_date
+):
+    normalized = _normalize_category_sales_channels(
+        pos_sales_df,
+        pd.DataFrame(columns=LAZADA_COLS),
+        "高岛屋 POS",
+        "titanium",
+    )
+    if not normalized.empty:
+        sale_dates = pd.to_datetime(normalized["日期"], errors="coerce").dt.date
+        normalized = normalized[
+            sale_dates.between(start_date, end_date)
+        ].copy()
+    resolved = resolved_categories.copy()
+    if "品牌" not in resolved.columns:
+        resolved["品牌"] = resolved["商品名称"].map(_suggest_product_brand)
+    brand_lookup = resolved.drop_duplicates("商品名称", keep="last").set_index(
+        "商品名称"
+    )["品牌"].to_dict()
+    taic_sales = normalized[
+        normalized["商品名称"].map(brand_lookup).fillna(
+            normalized["商品名称"].map(_suggest_product_brand)
+        ).eq("太可")
+    ].copy()
+    analysis = _build_category_sales_analysis(taic_sales, resolved)
+    return _sanitize_market_insight_preferences(analysis["category_summary"])
 
 
 def _upsert_product_category_mappings(
@@ -4593,6 +4749,10 @@ def JIT_fetch(sheets_to_fetch):
         res[PRODUCT_CATEGORY_SHEET] = load_data(
             PRODUCT_CATEGORY_SHEET, PRODUCT_CATEGORY_COLS
         )
+    if MARKET_INSIGHT_SHEET in sheets_to_fetch:
+        res[MARKET_INSIGHT_SHEET] = load_data(
+            MARKET_INSIGHT_SHEET, MARKET_INSIGHT_COLS
+        )
     return res
 
 @st.cache_data(show_spinner=False)
@@ -4611,6 +4771,7 @@ df_restock = pd.DataFrame(columns=RESTOCK_COLS)
 df_traffic = pd.DataFrame(columns=TRAFFIC_COLS)
 df_campaign = pd.DataFrame(columns=CAMP_COLS)
 df_lazada_sales = pd.DataFrame(columns=LAZADA_COLS)
+df_market_insights = pd.DataFrame(columns=MARKET_INSIGHT_COLS)
 
 if "stock_reset_key" not in st.session_state: st.session_state.stock_reset_key = 0
 if "sales_reset_key" not in st.session_state: st.session_state.sales_reset_key = 0
@@ -4659,14 +4820,14 @@ def make_auth_token(role, user):
     if role == "admin":
         return _auth_digest("admin", "店长", manager_password)
 
-    if role in ["employee", "supplier"] and not df_employee.empty:
+    if role in ["employee", "supplier", "showcase"] and not df_employee.empty:
         emp_matches = df_employee[df_employee['员工姓名'].fillna('').astype(str).str.strip() == user]
         if emp_matches.empty:
             return None
         emp_row_for_token = emp_matches.iloc[0]
         if str(emp_row_for_token.get('状态', '')).strip() == '离职':
             return None
-        expected_role = "supplier" if str(emp_row_for_token.get('职位', '')).strip() == '合作厂商' else "employee"
+        expected_role = _resolve_person_role(emp_row_for_token.get('职位', ''))
         if expected_role != role:
             return None
         pin_secret = str(emp_row_for_token.get('登录密码', '')).strip()
@@ -4684,17 +4845,17 @@ def restore_login_from_url():
 
     if role == "admin":
         user = "店长"
-    elif role not in ["employee", "supplier"] or not user:
+    elif role not in ["employee", "supplier", "showcase"] or not user:
         return False
 
     expected_token = make_auth_token(role, user)
     if expected_token and hmac.compare_digest(str(token), str(expected_token)):
         st.session_state.role = role
         st.session_state.current_user = user
-        if role in ["employee", "supplier"] and not df_employee.empty:
+        if role in ["employee", "supplier", "showcase"] and not df_employee.empty:
             emp_matches = df_employee[df_employee['员工姓名'].fillna('').astype(str).str.strip() == user]
             if not emp_matches.empty:
-                if apply_employee_system_access(emp_matches.iloc[0]):
+                if role != "showcase" and apply_employee_system_access(emp_matches.iloc[0]):
                     st.session_state._category_restore_needs_rerun = True
         return True
     return False
@@ -4729,6 +4890,7 @@ with st.sidebar:
     if st.session_state.role is not None:
         if st.session_state.role == "admin": user_emoji = "👑"
         elif st.session_state.role == "supplier": user_emoji = "🏭"
+        elif st.session_state.role == "showcase": user_emoji = "📊"
         else: user_emoji = "🧑‍💼"
         
         st.success(t(f"{user_emoji} 欢迎回来：{st.session_state.current_user}", f"{user_emoji} Welcome back: {st.session_state.current_user}"))
@@ -4853,8 +5015,12 @@ with st.sidebar:
                 if st.button("📦 品类销售分析", use_container_width=True):
                     st.session_state.admin_page = "product_category_sales"
                     st.rerun()
+                if st.button("🔒 脱敏数据 / 市场洞察", use_container_width=True):
+                    st.session_state.admin_page = "market_insight"
+                    st.rerun()
             if st.session_state.get("admin_page") in {
-                "campaign_bi", "product_category_sales"
+                "campaign_bi", "product_category_sales", "market_insight",
+                "market_insight_preview",
             }:
                 if st.button("↩️ 返回日常管理台", use_container_width=True):
                     st.session_state.admin_page = "main"
@@ -4872,7 +5038,7 @@ with st.sidebar:
                     st.rerun()
     
     else:
-        login_type = st.radio(t("请选择您的身份", "Select Role"), [t("🧑‍💼 门店店员 / 🏭 合作厂商", "🧑‍💼 Staff / 🏭 Supplier"), t("👑 店长/管理员", "👑 Admin")], horizontal=True)
+        login_type = st.radio(t("请选择您的身份", "Select Role"), [t("🧑‍💼 人员 / 🏭 合作方 / 📊 市场洞察", "🧑‍💼 Staff / 🏭 Partner / 📊 Market Insight"), t("👑 店长/管理员", "👑 Admin")], horizontal=True)
         
         if login_type == t("👑 店长/管理员", "👑 Admin"):
             pwd_input = st.text_input(t("输入授权密码", "Enter Admin Password"), type="password")
@@ -4895,7 +5061,7 @@ with st.sidebar:
                     emp_sel = st.selectbox(t("选择您的名字", "Select your name"), active_emps)
                     emp_row = df_employee[df_employee['员工姓名'] == emp_sel].iloc[0]
                     emp_pwd = str(emp_row['登录密码']).strip()
-                    assigned_role = "supplier" if str(emp_row.get('职位', '')).strip() == '合作厂商' else "employee"
+                    assigned_role = _resolve_person_role(emp_row.get('职位', ''))
                     
                     if emp_pwd == "":
                         st.info(t("🌟 系统检测到您是首次登录，请设置专属 PIN 码。", "🌟 First time login. Please set your PIN."))
@@ -4911,7 +5077,8 @@ with st.sidebar:
                                     save_data(fresh_emp, EMP_SHEET)
                                     st.session_state.role = assigned_role
                                     st.session_state.current_user = emp_sel
-                                    apply_employee_system_access(emp_row)
+                                    if assigned_role != "showcase":
+                                        apply_employee_system_access(emp_row)
                                     persist_login_to_url(assigned_role, emp_sel)
                                     st.success("✅ 密码设置成功！")
                                     st.rerun()
@@ -4955,6 +5122,7 @@ if role_now == "admin":
     df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
     df_campaign = clean_date_col(clean_date_col(load_data(CAMP_SHEET, CAMP_COLS), '开始日期'), '结束日期')
     df_inventory_snapshot = clean_date_col(clean_date_col(clean_date_col(load_data(INVENTORY_SNAPSHOT_SHEET, INVENTORY_SNAPSHOT_COLS), '开始日期'), '结束日期'), '快照日期')
+    df_market_insights = load_data(MARKET_INSIGHT_SHEET, MARKET_INSIGHT_COLS)
     if ACTIVE_CATEGORY_SYSTEM == "titanium":
         df_lazada_sales = clean_date_col(
             load_data(LAZADA_SHEET, LAZADA_COLS), '日期'
@@ -4969,19 +5137,27 @@ elif role_now == "employee":
     df_sales = load_safe_sales()
     df_attendance = clean_date_col(load_data(ATT_SHEET, ATT_COLS), '日期')
     df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
+elif role_now == "showcase":
+    df_market_insights = load_data(MARKET_INSIGHT_SHEET, MARKET_INSIGHT_COLS)
 
 # ================= 🚀 主界面布局 =================
-col_title, col_lang = st.columns([8, 2])
-with col_title:
-    st.title(t("🏙️ Takashimaya 零售管理系统 (云端同步版)", "🏙️ Takashimaya Retail System (Cloud Sync)"))
-    st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
-with col_lang:
-    lang_choice = st.radio("🌐 Language", ["中文", "English"], index=0 if st.session_state.lang == 'cn' else 1, horizontal=True)
-    if (lang_choice == "中文" and st.session_state.lang != "cn") or (lang_choice == "English" and st.session_state.lang != "en"):
-        st.session_state.lang = 'cn' if lang_choice == "中文" else 'en'
-        st.rerun()
-
-q = st.text_input(t("🔍 全局筛查 (输入单号/客户/商品，过滤所有看板)...", "🔍 Quick Search..."), placeholder=t("搜商品/单号/客户...", "Search items/orders/customers..."))
+is_market_insight_surface = role_now == "showcase" or (
+    role_now == "admin"
+    and st.session_state.get("admin_page") == "market_insight_preview"
+)
+if not is_market_insight_surface:
+    col_title, col_lang = st.columns([8, 2])
+    with col_title:
+        st.title(t("🏙️ Takashimaya 零售管理系统 (云端同步版)", "🏙️ Takashimaya Retail System (Cloud Sync)"))
+        st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
+    with col_lang:
+        lang_choice = st.radio("🌐 Language", ["中文", "English"], index=0 if st.session_state.lang == 'cn' else 1, horizontal=True)
+        if (lang_choice == "中文" and st.session_state.lang != "cn") or (lang_choice == "English" and st.session_state.lang != "en"):
+            st.session_state.lang = 'cn' if lang_choice == "中文" else 'en'
+            st.rerun()
+    q = st.text_input(t("🔍 全局筛查 (输入单号/客户/商品，过滤所有看板)...", "🔍 Quick Search..."), placeholder=t("搜商品/单号/客户...", "Search items/orders/customers..."))
+else:
+    q = ""
 
 def get_f(df, q):
     if q and not df.empty:
@@ -4995,6 +5171,7 @@ def get_f(df, q):
 is_admin = st.session_state.role == "admin"
 is_supplier = st.session_state.role == "supplier"
 is_employee = st.session_state.role == "employee"
+is_showcase = st.session_state.role == "showcase"
 
 def _campaign_options():
     if df_campaign.empty:
@@ -5856,6 +6033,287 @@ def render_product_category_sales_center():
                     st.rerun()
                 else:
                     st.error("分类写入后核验未通过，请不要重复修改，先刷新页面确认。")
+
+
+def _render_market_insight_snapshot_view(
+    snapshot_df, key_prefix, preferred_fingerprint=None
+):
+    snapshots = _normalize_market_insight_snapshots(snapshot_df)
+    snapshots = snapshots[snapshots["发布状态"].eq("已发布")].copy()
+    if snapshots.empty:
+        st.info("目前没有已发布的市场洞察。")
+        return
+
+    period_rows = snapshots.sort_values(
+        ["发布时间", "公开档期名称"]
+    ).drop_duplicates("来源档期指纹", keep="last")
+    period_ids = period_rows["来源档期指纹"].tolist()
+    period_names = period_rows.set_index("来源档期指纹")["公开档期名称"].to_dict()
+    default_index = (
+        period_ids.index(preferred_fingerprint)
+        if preferred_fingerprint in period_ids
+        else len(period_ids) - 1
+    )
+    selected_id = st.selectbox(
+        "选择市场观察档期",
+        period_ids,
+        index=max(0, default_index),
+        format_func=lambda value: period_names.get(value, "市场观察"),
+        key=f"{key_prefix}_period",
+    )
+    current = snapshots[snapshots["来源档期指纹"].eq(selected_id)].copy()
+    current = current.sort_values("排名")
+
+    st.subheader(period_names.get(selected_id, "市场观察"))
+    chart_col, rank_col = st.columns([1.35, 1])
+    with chart_col:
+        figure = px.pie(
+            current,
+            names="品类",
+            values="偏好占比%",
+            hole=0.42,
+            title="功能品类偏好结构",
+        )
+        figure.update_traces(
+            textposition="inside",
+            textinfo="percent+label",
+            hovertemplate="%{label}<br>偏好占比 %{value}%<extra></extra>",
+        )
+        figure.update_layout(height=430, margin=dict(l=10, r=10, t=55, b=10))
+        st.plotly_chart(figure, use_container_width=True)
+    with rank_col:
+        st.markdown("#### 品类偏好排名")
+        st.dataframe(
+            current[["排名", "品类", "偏好等级", "偏好占比%"]].style.format({
+                "偏好占比%": "{}%",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if snapshots["来源档期指纹"].nunique() >= 2:
+        st.markdown("### 已发布档期偏好变化")
+        trend = snapshots[[
+            "来源档期指纹", "公开档期名称", "品类", "偏好占比%", "排名", "发布时间"
+        ]].copy()
+        trend = trend.sort_values(["发布时间", "公开档期名称", "排名"])
+        trend_figure = px.line(
+            trend,
+            x="公开档期名称",
+            y="偏好占比%",
+            color="品类",
+            markers=True,
+            labels={"公开档期名称": "市场观察档期", "偏好占比%": "偏好占比 (%)"},
+        )
+        trend_figure.update_layout(
+            height=390,
+            margin=dict(l=10, r=10, t=30, b=10),
+            legend_title_text="功能品类",
+        )
+        st.plotly_chart(trend_figure, use_container_width=True)
+
+
+def render_market_insight_showcase(
+    snapshot_df, admin_preview=False, preferred_fingerprint=None
+):
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {display: none;}
+        [data-testid="stSidebarCollapsedControl"] {display: none;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    action_col, spacer = st.columns([1, 5])
+    with action_col:
+        if admin_preview:
+            if st.button("返回脱敏数据管理", use_container_width=True):
+                st.session_state.admin_page = "market_insight"
+                st.rerun()
+        elif st.button("退出展示", use_container_width=True):
+            st.session_state.role = None
+            st.session_state.current_user = None
+            st.query_params.clear()
+            st.rerun()
+    st.title("新加坡市场品类洞察")
+    st.caption("基于本地运营观察形成的功能品类偏好结论")
+    st.info("市场洞察，仅供合作沟通")
+    _render_market_insight_snapshot_view(
+        snapshot_df,
+        "admin_market_insight_preview" if admin_preview else "market_insight_showcase",
+        preferred_fingerprint=preferred_fingerprint,
+    )
+
+
+def render_market_insight_admin():
+    st.title("🔒 脱敏数据管理")
+    st.caption("从太可已保存档期生成市场品类洞察；发布内容不包含实际件数、金额或商品明细。")
+    flash = st.session_state.pop("market_insight_flash", "")
+    if flash:
+        st.success(flash)
+
+    campaigns = _campaign_options()
+    published = _normalize_market_insight_snapshots(df_market_insights)
+    if not campaigns:
+        st.info("请先在档期中心保存档期。")
+    else:
+        selected_label = st.selectbox(
+            "选择内部档期",
+            list(campaigns.keys()),
+            key="market_insight_source_campaign",
+        )
+        period_name, start_date, end_date = campaigns[selected_label]
+        fingerprint = _market_insight_period_fingerprint(
+            period_name, start_date, end_date
+        )
+        existing_period = published[
+            published["来源档期指纹"].eq(fingerprint)
+        ]
+        default_public_name = (
+            existing_period["公开档期名称"].iloc[0]
+            if not existing_period.empty
+            else f"市场观察档期 {published['来源档期指纹'].nunique() + 1}"
+        )
+        public_name = st.text_input(
+            "对外显示名称",
+            value=default_public_name,
+            key=f"market_insight_public_name_{fingerprint}",
+        ).strip()
+
+        product_frames = []
+        for frame in (df_stock, df_sales):
+            if frame is not None and "商品名称" in frame.columns:
+                product_frames.append(frame[["商品名称"]])
+        products = (
+            pd.concat(product_frames, ignore_index=True)
+            if product_frames
+            else pd.DataFrame(columns=["商品名称"])
+        )
+        category_map = load_data(PRODUCT_CATEGORY_SHEET, PRODUCT_CATEGORY_COLS)
+        resolved = _resolve_product_categories(products, category_map, "titanium")
+        safe_preferences = _build_taic_market_insight_preferences(
+            df_sales, resolved, start_date, end_date
+        )
+
+        st.markdown("### 发布前预览")
+        if safe_preferences.empty:
+            st.warning("这个档期没有可生成洞察的太可正向 POS 销售。")
+        else:
+            preview_col, preview_table_col = st.columns([1.25, 1])
+            with preview_col:
+                preview_figure = px.pie(
+                    safe_preferences,
+                    names="品类",
+                    values="偏好占比%",
+                    hole=0.42,
+                    title="对外功能品类偏好",
+                )
+                preview_figure.update_traces(
+                    textposition="inside", textinfo="percent+label"
+                )
+                preview_figure.update_layout(
+                    height=390, margin=dict(l=10, r=10, t=55, b=10)
+                )
+                st.plotly_chart(preview_figure, use_container_width=True)
+            with preview_table_col:
+                st.dataframe(
+                    safe_preferences.style.format({"偏好占比%": "{}%"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            if st.button("发布脱敏快照", type="primary", use_container_width=True):
+                if not public_name:
+                    st.warning("请填写对外显示名称。")
+                elif published[
+                    published["公开档期名称"].eq(public_name)
+                    & published["来源档期指纹"].ne(fingerprint)
+                ].shape[0] > 0:
+                    st.warning("这个对外名称已用于其他档期，请更换名称。")
+                else:
+                    latest = JIT_fetch([MARKET_INSIGHT_SHEET])[MARKET_INSIGHT_SHEET]
+                    updated = _upsert_market_insight_snapshot(
+                        latest,
+                        safe_preferences,
+                        fingerprint,
+                        public_name,
+                        st.session_state.current_user,
+                        datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+                    )
+                    save_data(updated, MARKET_INSIGHT_SHEET)
+                    saved = _normalize_market_insight_snapshots(
+                        JIT_fetch([MARKET_INSIGHT_SHEET])[MARKET_INSIGHT_SHEET]
+                    )
+                    saved_period = saved[saved["来源档期指纹"].eq(fingerprint)]
+                    if (
+                        len(saved_period) == len(safe_preferences)
+                        and int(saved_period["偏好占比%"].sum()) == 100
+                        and saved_period["公开档期名称"].eq(public_name).all()
+                    ):
+                        st.session_state.market_insight_flash = "脱敏市场洞察已发布并核验。"
+                        st.rerun()
+                    else:
+                        st.error("发布后的回读核验未通过，请先刷新确认，不要重复发布。")
+
+    published = _normalize_market_insight_snapshots(df_market_insights)
+    published = published[published["发布状态"].eq("已发布")].copy()
+    if not published.empty:
+        st.divider()
+        st.markdown("### 已发布内容")
+        published_periods = published.drop_duplicates(
+            "来源档期指纹", keep="last"
+        )
+        published_ids = published_periods["来源档期指纹"].tolist()
+        published_names = published_periods.set_index("来源档期指纹")[
+            "公开档期名称"
+        ].to_dict()
+        selected_published = st.selectbox(
+            "管理已发布档期",
+            published_ids,
+            format_func=lambda value: published_names.get(value, "市场观察"),
+            key="market_insight_published_period",
+        )
+        manage_col1, manage_col2 = st.columns(2)
+        with manage_col1:
+            if st.button("全屏预览", use_container_width=True):
+                st.session_state.market_insight_preview_id = selected_published
+                st.session_state.admin_page = "market_insight_preview"
+                st.rerun()
+        with manage_col2:
+            if st.button("取消发布", use_container_width=True):
+                latest = _normalize_market_insight_snapshots(
+                    JIT_fetch([MARKET_INSIGHT_SHEET])[MARKET_INSIGHT_SHEET]
+                )
+                updated = latest[
+                    latest["来源档期指纹"].ne(selected_published)
+                ].copy()
+                save_data(updated, MARKET_INSIGHT_SHEET)
+                saved = _normalize_market_insight_snapshots(
+                    JIT_fetch([MARKET_INSIGHT_SHEET])[MARKET_INSIGHT_SHEET]
+                )
+                if saved["来源档期指纹"].ne(selected_published).all():
+                    st.session_state.market_insight_flash = "已取消发布。"
+                    st.rerun()
+                else:
+                    st.error("取消发布后的回读核验未通过，请刷新确认。")
+
+
+if is_showcase:
+    render_market_insight_showcase(df_market_insights)
+    st.stop()
+
+if is_admin and st.session_state.get("admin_page") == "market_insight_preview":
+    render_market_insight_showcase(
+        df_market_insights,
+        admin_preview=True,
+        preferred_fingerprint=st.session_state.get("market_insight_preview_id"),
+    )
+    st.stop()
+
+if is_admin and st.session_state.get("admin_page") == "market_insight":
+    render_market_insight_admin()
+    st.stop()
 
 
 if is_admin and st.session_state.get("admin_page") == "campaign_bi":
@@ -8019,7 +8477,7 @@ if is_admin:
             with st.form("add_employee"):
                 c1, c2 = st.columns(2)
                 e_name = c1.text_input("人员姓名")
-                e_role = c2.selectbox("身份职位", ["店长", "全职店员", "兼职店员", "实习生", "合作厂商", "其他"])
+                e_role = c2.selectbox("身份职位", ["店长", "全职店员", "兼职店员", "实习生", "合作厂商", "市场洞察访客", "其他"])
                 c3, c4, c5 = st.columns(3)
                 e_wage = c3.number_input("时薪 ($/小时, 厂商填0)", min_value=0.0, step=0.5, value=12.0, format="%.2f")
                 e_phone = c4.text_input("联系方式 (选填)")
