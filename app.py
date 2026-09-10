@@ -2496,39 +2496,64 @@ def _period_daily_financials(period_sales, attendance_df, start_date, end_date):
     return daily[output_columns].sort_values("日期").reset_index(drop=True)
 
 
-def compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, start_date, end_date):
+def compute_period_operations_dashboard(sales_df, traffic_df, start_date, end_date):
     start_date = pd.to_datetime(start_date).date()
     end_date = pd.to_datetime(end_date).date()
     if start_date > end_date:
         start_date, end_date = end_date, start_date
-    period_sales = _dashboard_sales_with_cost(stock_df, sales_df, start_date, end_date)
-    financials = compute_period_financials(stock_df, sales_df, attendance_df, start_date, end_date)
+
+    sales = _bi_norm_sales(sales_df)
+    period_sales = sales[
+        (sales["日期_dt"] >= start_date)
+        & (sales["日期_dt"] <= end_date)
+    ].copy()
     traffic = _dashboard_traffic(traffic_df)
-    period_traffic = traffic[(traffic["日期_dt"] >= start_date) & (traffic["日期_dt"] <= end_date)]
-    total_traffic = float(period_traffic["有效客流"].sum()) if not period_traffic.empty else 0.0
-    total_revenue = float(period_sales["总营业额"].sum()) if not period_sales.empty else 0.0
-    total_items = float(period_sales["销售数量"].sum()) if not period_sales.empty else 0.0
-    gross_margin = float(period_sales["具体毛利"].sum()) if not period_sales.empty else 0.0
-    if not period_sales.empty:
-        valid_orders = period_sales[
-            (~period_sales["订单号"].astype(str).str.contains("历史单", na=False)) &
-            (~period_sales["订单号"].astype(str).str.contains("EXC-", na=False))
-        ]
-        legacy_orders = period_sales[period_sales["订单号"].astype(str).str.contains("历史单", na=False)]
-        order_count = int(valid_orders["订单号"].nunique() + len(legacy_orders))
-    else:
+    period_traffic = traffic[
+        (traffic["日期_dt"] >= start_date)
+        & (traffic["日期_dt"] <= end_date)
+    ]
+
+    total_traffic = (
+        float(period_traffic["有效客流"].sum())
+        if not period_traffic.empty
+        else 0.0
+    )
+    total_revenue = (
+        float(period_sales["总营业额"].sum())
+        if not period_sales.empty
+        else 0.0
+    )
+    total_items = (
+        float(period_sales["销售数量"].sum())
+        if not period_sales.empty
+        else 0.0
+    )
+    if period_sales.empty:
         order_count = 0
+        daily = pd.DataFrame(columns=["日期", "总营业额", "销售数量"])
+    else:
+        valid_orders = period_sales[
+            (~period_sales["订单号"].astype(str).str.contains("历史单", na=False))
+            & (~period_sales["订单号"].astype(str).str.contains("EXC-", na=False))
+        ]
+        legacy_orders = period_sales[
+            period_sales["订单号"].astype(str).str.contains("历史单", na=False)
+        ]
+        order_count = int(valid_orders["订单号"].nunique() + len(legacy_orders))
+        daily = (
+            period_sales.groupby("日期_dt", as_index=False)[
+                ["总营业额", "销售数量"]
+            ]
+            .sum()
+            .sort_values("日期_dt")
+        )
+        daily["日期"] = pd.to_datetime(daily["日期_dt"]).dt.strftime("%Y/%m/%d")
+        daily = daily[["日期", "总营业额", "销售数量"]].reset_index(drop=True)
+
     conversion = (order_count / total_traffic * 100) if total_traffic > 0 else 0.0
     acv = total_revenue / order_count if order_count > 0 else 0.0
     upt = total_items / order_count if order_count > 0 else 0.0
-    avg_margin_rate = (gross_margin / total_revenue * 100) if total_revenue > 0 else 0.0
     days = max((end_date - start_date).days + 1, 1)
-    financial_daily = _period_daily_financials(
-        period_sales,
-        attendance_df,
-        start_date,
-        end_date,
-    )
     summary = {
         "有效客流": int(total_traffic),
         "交易单数": int(order_count),
@@ -2536,11 +2561,39 @@ def compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, star
         "总营业额": round(total_revenue, 2),
         "平均客单价": round(acv, 2),
         "连带率": round(upt, 2),
-        "具体毛利": round(gross_margin, 2),
         "总售出件数": int(total_items),
-        "平均毛利率%": round(avg_margin_rate, 2),
         "日均营收": round(total_revenue / days, 2),
     }
+    return {"summary": summary, "daily": daily}
+
+
+def compute_period_dashboard(stock_df, sales_df, attendance_df, traffic_df, start_date, end_date):
+    start_date = pd.to_datetime(start_date).date()
+    end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+    operations = compute_period_operations_dashboard(
+        sales_df,
+        traffic_df,
+        start_date,
+        end_date,
+    )
+    period_sales = _dashboard_sales_with_cost(stock_df, sales_df, start_date, end_date)
+    financials = compute_period_financials(stock_df, sales_df, attendance_df, start_date, end_date)
+    total_revenue = float(period_sales["总营业额"].sum()) if not period_sales.empty else 0.0
+    gross_margin = float(period_sales["具体毛利"].sum()) if not period_sales.empty else 0.0
+    avg_margin_rate = (gross_margin / total_revenue * 100) if total_revenue > 0 else 0.0
+    financial_daily = _period_daily_financials(
+        period_sales,
+        attendance_df,
+        start_date,
+        end_date,
+    )
+    summary = dict(operations["summary"])
+    summary.update({
+        "具体毛利": round(gross_margin, 2),
+        "平均毛利率%": round(avg_margin_rate, 2),
+    })
     summary.update(financials)
     return {"summary": summary, "daily": financial_daily}
 
@@ -3202,6 +3255,8 @@ def _resolve_person_role(position):
         return "supplier"
     if position == "市场洞察访客":
         return "showcase"
+    if position == "Jewel运营访客":
+        return "jewel"
     return "employee"
 
 
@@ -4820,7 +4875,7 @@ def make_auth_token(role, user):
     if role == "admin":
         return _auth_digest("admin", "店长", manager_password)
 
-    if role in ["employee", "supplier", "showcase"] and not df_employee.empty:
+    if role in ["employee", "supplier", "showcase", "jewel"] and not df_employee.empty:
         emp_matches = df_employee[df_employee['员工姓名'].fillna('').astype(str).str.strip() == user]
         if emp_matches.empty:
             return None
@@ -4845,17 +4900,17 @@ def restore_login_from_url():
 
     if role == "admin":
         user = "店长"
-    elif role not in ["employee", "supplier", "showcase"] or not user:
+    elif role not in ["employee", "supplier", "showcase", "jewel"] or not user:
         return False
 
     expected_token = make_auth_token(role, user)
     if expected_token and hmac.compare_digest(str(token), str(expected_token)):
         st.session_state.role = role
         st.session_state.current_user = user
-        if role in ["employee", "supplier", "showcase"] and not df_employee.empty:
+        if role in ["employee", "supplier", "showcase", "jewel"] and not df_employee.empty:
             emp_matches = df_employee[df_employee['员工姓名'].fillna('').astype(str).str.strip() == user]
             if not emp_matches.empty:
-                if role != "showcase" and apply_employee_system_access(emp_matches.iloc[0]):
+                if role not in ["showcase", "jewel"] and apply_employee_system_access(emp_matches.iloc[0]):
                     st.session_state._category_restore_needs_rerun = True
         return True
     return False
@@ -4891,6 +4946,7 @@ with st.sidebar:
         if st.session_state.role == "admin": user_emoji = "👑"
         elif st.session_state.role == "supplier": user_emoji = "🏭"
         elif st.session_state.role == "showcase": user_emoji = "📊"
+        elif st.session_state.role == "jewel": user_emoji = "🏢"
         else: user_emoji = "🧑‍💼"
         
         st.success(t(f"{user_emoji} 欢迎回来：{st.session_state.current_user}", f"{user_emoji} Welcome back: {st.session_state.current_user}"))
@@ -5077,7 +5133,7 @@ with st.sidebar:
                                     save_data(fresh_emp, EMP_SHEET)
                                     st.session_state.role = assigned_role
                                     st.session_state.current_user = emp_sel
-                                    if assigned_role != "showcase":
+                                    if assigned_role not in ["showcase", "jewel"]:
                                         apply_employee_system_access(emp_row)
                                     persist_login_to_url(assigned_role, emp_sel)
                                     st.success("✅ 密码设置成功！")
@@ -5090,7 +5146,8 @@ with st.sidebar:
                             if emp_pwd_input == emp_pwd:
                                 st.session_state.role = assigned_role
                                 st.session_state.current_user = emp_sel
-                                apply_employee_system_access(emp_row)
+                                if assigned_role not in ["showcase", "jewel"]:
+                                    apply_employee_system_access(emp_row)
                                 persist_login_to_url(assigned_role, emp_sel)
                                 st.rerun()
                             else:
@@ -5139,9 +5196,16 @@ elif role_now == "employee":
     df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
 elif role_now == "showcase":
     df_market_insights = load_data(MARKET_INSIGHT_SHEET, MARKET_INSIGHT_COLS)
+elif role_now == "jewel":
+    df_sales = load_safe_sales()
+    df_traffic = clean_date_col(load_data(TRAFFIC_SHEET, TRAFFIC_COLS), '日期')
+    df_campaign = clean_date_col(
+        clean_date_col(load_data(CAMP_SHEET, CAMP_COLS), '开始日期'),
+        '结束日期',
+    )
 
 # ================= 🚀 主界面布局 =================
-is_market_insight_surface = role_now == "showcase" or (
+is_market_insight_surface = role_now in {"showcase", "jewel"} or (
     role_now == "admin"
     and st.session_state.get("admin_page") == "market_insight_preview"
 )
@@ -5172,6 +5236,7 @@ is_admin = st.session_state.role == "admin"
 is_supplier = st.session_state.role == "supplier"
 is_employee = st.session_state.role == "employee"
 is_showcase = st.session_state.role == "showcase"
+is_jewel = st.session_state.role == "jewel"
 
 def _campaign_options():
     if df_campaign.empty:
@@ -6297,6 +6362,72 @@ def render_market_insight_admin():
                     st.rerun()
                 else:
                     st.error("取消发布后的回读核验未通过，请刷新确认。")
+
+
+def render_jewel_operations_dashboard():
+    st.title("Jewel 档期运营看板")
+    st.caption("只读运营数据。请选择一个已保存档期查看客流、交易与营业表现。")
+
+    campaigns = _campaign_options()
+    if not campaigns:
+        st.info("管理员尚未创建可查看的档期。")
+        return
+
+    selected_label = st.selectbox(
+        "选择档期",
+        list(campaigns.keys()),
+        index=0,
+        key="jewel_campaign_period",
+    )
+    period = campaigns[selected_label]
+    result = compute_period_operations_dashboard(
+        df_sales,
+        df_traffic,
+        period[1],
+        period[2],
+    )
+    summary = result["summary"]
+    daily = result["daily"]
+
+    st.markdown(f"### {period[0]}：{period[1]} 至 {period[2]}")
+    r1c1, r1c2, r1c3 = st.columns(3)
+    r1c1.metric("有效客流", f"{summary['有效客流']} 人")
+    r1c2.metric("交易单数", f"{summary['交易单数']} 单")
+    r1c3.metric("购买转化率", f"{summary['购买转化率%']:.1f}%")
+
+    st.divider()
+    r2c1, r2c2, r2c3 = st.columns(3)
+    r2c1.metric("总营业额", f"${summary['总营业额']:,.2f}")
+    r2c2.metric("平均客单价 ACV", f"${summary['平均客单价']:,.2f}")
+    r2c3.metric("连带率 UPT", f"{summary['连带率']:.2f} 件/单")
+
+    st.divider()
+    r3c1, r3c2 = st.columns(2)
+    r3c1.metric("总售出件数", f"{summary['总售出件数']} 件")
+    r3c2.metric("日均营收", f"${summary['日均营收']:,.2f}")
+
+    st.divider()
+    if daily.empty:
+        st.info("这个档期暂无营业流水，无法生成每日走势。")
+        return
+
+    st.markdown("### 每日营业额与售出件数趋势")
+    chart_data = daily.set_index("日期")[["总营业额", "销售数量"]]
+    st.line_chart(chart_data, use_container_width=True)
+    st.markdown("### 每日汇总")
+    st.dataframe(
+        daily.style.format({
+            "总营业额": "${:.2f}",
+            "销售数量": "{:.0f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+if is_jewel:
+    render_jewel_operations_dashboard()
+    st.stop()
 
 
 if is_showcase:
@@ -8477,7 +8608,7 @@ if is_admin:
             with st.form("add_employee"):
                 c1, c2 = st.columns(2)
                 e_name = c1.text_input("人员姓名")
-                e_role = c2.selectbox("身份职位", ["店长", "全职店员", "兼职店员", "实习生", "合作厂商", "市场洞察访客", "其他"])
+                e_role = c2.selectbox("身份职位", ["店长", "全职店员", "兼职店员", "实习生", "合作厂商", "市场洞察访客", "Jewel运营访客", "其他"])
                 c3, c4, c5 = st.columns(3)
                 e_wage = c3.number_input("时薪 ($/小时, 厂商填0)", min_value=0.0, step=0.5, value=12.0, format="%.2f")
                 e_phone = c4.text_input("联系方式 (选填)")
