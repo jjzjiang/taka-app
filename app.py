@@ -1072,6 +1072,21 @@ def _bi_empty_frame():
         "动销分", "利润分", "系统分类", "辅助标签", "库存预警"
     ])
 
+CHART_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _format_chart_date_label(value):
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(parsed):
+        return raw
+    return f"{parsed.strftime('%m/%d')} {CHART_WEEKDAY_ABBR[parsed.weekday()]}"
+
+
 def _bi_num(value, default=0.0):
     converted = pd.to_numeric(value, errors="coerce")
     if isinstance(converted, pd.Series):
@@ -5507,6 +5522,7 @@ def render_campaign_bi_center():
                         "真实净利润": "${:.2f}",
                         "销售数量": "{:.0f}",
                     }
+                chart_df.index = chart_df.index.map(_format_chart_date_label)
                 st.bar_chart(chart_df, use_container_width=True)
                 st.markdown("### 每日明细")
                 st.dataframe(
@@ -5958,8 +5974,14 @@ def render_product_category_sales_center():
         detail1, detail2 = st.columns([1.3, 1])
         with detail1:
             if not trend.empty:
+                trend_chart = trend.sort_values("日期").copy()
+                trend_chart["图表日期"] = trend_chart["日期"].map(_format_chart_date_label)
                 category_trend_fig = px.line(
-                    trend, x="日期", y="商品营业额", markers=True,
+                    trend_chart,
+                    x="图表日期",
+                    y="商品营业额",
+                    markers=True,
+                    hover_data={"日期": True, "图表日期": False},
                     title=f"{chosen_category}：每日商品营业额",
                 )
                 category_trend_fig.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
@@ -6010,11 +6032,14 @@ def render_product_category_sales_center():
             & product_trend["商品名称"].eq(chosen_product)
         ]
         if not product_trend.empty:
+            product_trend_chart = product_trend.sort_values("日期").copy()
+            product_trend_chart["图表日期"] = product_trend_chart["日期"].map(_format_chart_date_label)
             product_trend_fig = px.line(
-                product_trend,
-                x="日期",
+                product_trend_chart,
+                x="图表日期",
                 y=["商品营业额", "销售件数"],
                 markers=True,
+                hover_data={"日期": True, "图表日期": False},
                 title=f"{chosen_product}：每日销售走势",
             )
             product_trend_fig.update_layout(
@@ -6413,6 +6438,7 @@ def render_jewel_operations_dashboard():
 
     st.markdown("### 每日营业额与售出件数趋势")
     chart_data = daily.set_index("日期")[["总营业额", "销售数量"]]
+    chart_data.index = chart_data.index.map(_format_chart_date_label)
     st.line_chart(chart_data, use_container_width=True)
     st.markdown("### 每日汇总")
     st.dataframe(
@@ -8583,6 +8609,8 @@ if is_admin:
                     st.divider()
                     st.markdown("### 📈 营收与毛利走势")
                     chart_data_t3 = summ.groupby('周期')[['总营业额', '具体毛利']].sum().sort_index(ascending=True)
+                    if period == "Daily":
+                        chart_data_t3.index = chart_data_t3.index.map(_format_chart_date_label)
                     st.bar_chart(chart_data_t3, use_container_width=True)
 
                     dl_c1, dl_c2 = st.columns([1, 4])
@@ -9821,6 +9849,7 @@ if is_admin:
                     .rename(columns={'真实净利润': '现金口径净利润'})
                     .sort_index(ascending=True)
                 )
+                chart_data_t5.index = chart_data_t5.index.map(_format_chart_date_label)
                 net_profit_chart_mode = st.radio(
                     "图表显示方式",
                     ["柱状图", "折线图", "柱状图 + 折线图"],
