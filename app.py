@@ -3330,6 +3330,33 @@ def _expense_sgd_amount(amount, currency, rate):
     return round(float(value) / float(numeric_rate), 2)
 
 
+def _selected_expense_delete_ids(source_rows, selection_values):
+    if len(source_rows) != len(selection_values):
+        raise ValueError("勾选行与支出明细不一致，请刷新后重试。")
+    selected_ids = [
+        str(record_id)
+        for record_id, checked in zip(source_rows["记录ID"], selection_values)
+        if str(checked).strip().lower() == "true"
+    ]
+    if len(selected_ids) > 1:
+        raise ValueError("为防误删，每次只能删除一条记录。")
+    return selected_ids
+
+
+def _latest_expense_deletion_batch(frame):
+    rows = _normalize_expense_rows(frame)
+    stamps = rows["更新时间"].fillna("").astype(str).str.strip()
+    deleted = rows.loc[
+        rows["状态"].eq("已作废")
+        & rows["记录ID"].fillna("").astype(str).str.strip().ne("")
+        & stamps.ne("")
+    ].copy()
+    if deleted.empty:
+        return deleted
+    latest_stamp = deleted["更新时间"].astype(str).max()
+    return deleted.loc[deleted["更新时间"].astype(str).eq(latest_stamp)].reset_index(drop=True)
+
+
 def _expense_editor_updates(original, edited, updated_at):
     editable = ["日期", "归属系统", "类别", "项目", "原币金额", "币种", "换算汇率", "备注", "状态"]
     if len(original) != len(edited) or not original["记录ID"].is_unique or not edited["记录ID"].is_unique:
@@ -3354,12 +3381,12 @@ def _expense_editor_updates(original, edited, updated_at):
         if all(comparable(column, row[column]) == comparable(column, previous[column]) for column in editable):
             continue
         changed = {column: comparable(column, row[column]) for column in editable}
-        if changed["状态"] == "已作废" and all(
+        if changed["状态"] in {"有效", "已作废"} and all(
             changed[column] == comparable(column, previous[column])
             for column in editable if column != "状态"
         ):
             updated = previous.to_dict()
-            updated["状态"] = "已作废"
+            updated["状态"] = changed["状态"]
             updated["更新时间"] = updated_at
             updates.append(updated)
             continue
@@ -3382,6 +3409,38 @@ def _expense_editor_updates(original, edited, updated_at):
         updated["更新时间"] = updated_at
         updates.append(updated)
     return updates
+
+
+def _write_expense_updates(worksheet, updates, source_rows):
+    if not updates:
+        return
+    sheet_rows = worksheet.get_all_values()
+    if not sheet_rows or sheet_rows[0][:len(EXPENSE_COLS)] != EXPENSE_COLS:
+        raise ValueError("后台支出表的列结构不符合预期。")
+    positions = {}
+    for row_number, values in enumerate(sheet_rows[1:], start=2):
+        if values:
+            positions.setdefault(values[0], []).append(row_number)
+    if not source_rows["记录ID"].is_unique:
+        raise ValueError("支出记录 ID 重复，请刷新后重试。")
+    original_by_id = source_rows.set_index("记录ID")
+    if len({row["记录ID"] for row in updates}) != len(updates):
+        raise ValueError("待保存的记录 ID 重复。")
+    batch = []
+    for update in updates:
+        record_id = update["记录ID"]
+        matches = positions.get(record_id, [])
+        if record_id not in original_by_id.index or len(matches) != 1:
+            raise ValueError(f"{record_id} 在后台无法唯一定位，请刷新重试。")
+        current_row = sheet_rows[matches[0] - 1]
+        current_timestamp = current_row[12] if len(current_row) > 12 else ""
+        if current_timestamp != str(original_by_id.loc[record_id, "更新时间"]):
+            raise ValueError(f"{record_id} 已被其他操作更新，请刷新后重试。")
+        batch.append({
+            "range": f"A{matches[0]}:M{matches[0]}",
+            "values": [[str(update[column]) for column in EXPENSE_COLS]],
+        })
+    worksheet.batch_update(batch, value_input_option="RAW")
 
 
 def _resolve_person_role(position):
@@ -6575,6 +6634,29 @@ def render_admin_expenses():
         st.info("还没有支出记录。")
         return
 
+    latest_deleted = _latest_expense_deletion_batch(records)
+    if not latest_deleted.empty:
+        with st.expander(f"撤销最近一次删除（{len(latest_deleted)} 笔）"):
+            st.dataframe(
+                latest_deleted[["日期", "类别", "项目", "原币金额", "币种", "新币金额"]],
+                hide_index=True, use_container_width=True,
+            )
+            if st.button("恢复上方记录", key="expense_restore_latest"):
+                restored = latest_deleted.copy()
+                restored["状态"] = "有效"
+                try:
+                    updates = _expense_editor_updates(
+                        latest_deleted, restored, datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f"),
+                    )
+                    _write_expense_updates(get_worksheet_cached(EXPENSE_SHEET), updates, latest_deleted)
+                except Exception as error:
+                    st.error(f"恢复失败：{error}")
+                else:
+                    st.session_state.sheet_versions[EXPENSE_SHEET] = st.session_state.sheet_versions.get(EXPENSE_SHEET, 0) + 1
+                    invalidate_data_cache(EXPENSE_SHEET)
+                    st.success(f"已恢复 {len(updates)} 笔记录。")
+                    st.rerun()
+
     today = datetime.now().date()
     dated = records["日期"].dropna()
     earliest = dated.min().date() if not dated.empty else today
@@ -6640,10 +6722,15 @@ def render_admin_expenses():
             editor_table["日期"] = editor_table["日期"].dt.date
             editor_table["换算汇率"] = editor_table["换算汇率"].where(editor_table["币种"].eq("CNY"))
             editor_table.insert(0, "删除", False)
-            editor_key = "expense_inline_" + hashlib.sha256(category_name.encode("utf-8")).hexdigest()[:12]
+            editor_state = "|".join(
+                source_rows["记录ID"].astype(str) + ":" + source_rows["更新时间"].astype(str)
+            )
+            editor_key = ("expense_inline_" + hashlib.sha256(category_name.encode("utf-8")).hexdigest()[:12]
+                          + "_" + hashlib.sha256(editor_state.encode("utf-8")).hexdigest()[:12]
+                          + f"_{st.session_state.sheet_versions.get(EXPENSE_SHEET, 0)}")
             edited_table = st.data_editor(
                 editor_table, key=editor_key, hide_index=True, use_container_width=True,
-                num_rows="fixed", disabled=["新币金额"],
+                num_rows="fixed", disabled=["新币金额", "状态"],
                 column_config={
                     "删除": st.column_config.CheckboxColumn("删除", help="勾选后点击下方删除按钮；记录会保留为已作废，可恢复。"),
                     "日期": st.column_config.DateColumn("日期", format="YYYY/MM/DD", required=True),
@@ -6666,13 +6753,19 @@ def render_admin_expenses():
             if save_clicked or delete_clicked:
                 edited_rows = source_rows.copy()
                 if delete_clicked:
-                    to_delete = edited_table["删除"].fillna(False).astype(bool).tolist()
-                    if not any(to_delete):
+                    try:
+                        delete_ids = _selected_expense_delete_ids(source_rows, edited_table["删除"].tolist())
+                    except ValueError as error:
+                        st.error(str(error))
+                        continue
+                    if not delete_ids:
                         st.warning("请先勾选要删除的记录。")
                         continue
-                    edited_rows.loc[to_delete, "状态"] = "已作废"
+                    edited_rows.loc[edited_rows["记录ID"].isin(delete_ids), "状态"] = "已作废"
                 else:
                     for column in editor_columns:
+                        if column == "状态":
+                            continue
                         if column == "换算汇率":
                             edited_rows[column] = [
                                 1 if currency == "SGD" else rate
@@ -6690,31 +6783,11 @@ def render_admin_expenses():
                 if not updates:
                     st.info("没有待保存的修改。")
                     continue
+                if delete_clicked and (len(updates) != 1 or updates[0]["记录ID"] != delete_ids[0]):
+                    st.error("删除范围与勾选记录不一致，操作已取消。")
+                    continue
                 try:
-                    worksheet = get_worksheet_cached(EXPENSE_SHEET)
-                    sheet_rows = worksheet.get_all_values()
-                    if not sheet_rows or sheet_rows[0][:len(EXPENSE_COLS)] != EXPENSE_COLS:
-                        raise ValueError("后台支出表的列结构不符合预期。")
-                    positions = {}
-                    for row_number, values in enumerate(sheet_rows[1:], start=2):
-                        if values:
-                            positions.setdefault(values[0], []).append(row_number)
-                    original_by_id = source_rows.set_index("记录ID")
-                    batch = []
-                    for update in updates:
-                        record_id = update["记录ID"]
-                        matches = positions.get(record_id, [])
-                        if len(matches) != 1:
-                            raise ValueError(f"{record_id} 在后台无法唯一定位，请刷新重试。")
-                        current_row = sheet_rows[matches[0] - 1]
-                        current_timestamp = current_row[12] if len(current_row) > 12 else ""
-                        if current_timestamp != str(original_by_id.loc[record_id, "更新时间"]):
-                            raise ValueError(f"{record_id} 已被其他操作更新，请刷新后重试。")
-                        batch.append({
-                            "range": f"A{matches[0]}:M{matches[0]}",
-                            "values": [[str(update[column]) for column in EXPENSE_COLS]],
-                        })
-                    worksheet.batch_update(batch, value_input_option="RAW")
+                    _write_expense_updates(get_worksheet_cached(EXPENSE_SHEET), updates, source_rows)
                 except Exception as error:
                     st.error(f"修改未保存：{error}")
                     continue
