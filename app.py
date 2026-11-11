@@ -3305,6 +3305,63 @@ def _upsert_expense_row(frame, row):
     return result
 
 
+def _expense_category_summary(frame):
+    valid = _normalize_expense_rows(frame)
+    valid = valid.loc[valid["状态"].eq("有效")]
+    return (
+        valid.groupby(["类别", "归属系统"], as_index=False)["新币金额"]
+        .sum()
+        .sort_values("新币金额", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def _expense_editor_updates(original, edited, updated_at):
+    editable = ["日期", "归属系统", "类别", "项目", "原币金额", "币种", "换算汇率", "备注", "状态"]
+    if len(original) != len(edited) or not original["记录ID"].is_unique or not edited["记录ID"].is_unique:
+        raise ValueError("支出记录行数或 ID 已变化，请刷新重试。")
+    old_rows = original.set_index("记录ID", drop=False)
+    new_rows = edited.set_index("记录ID", drop=False)
+    if set(old_rows.index) != set(new_rows.index):
+        raise ValueError("支出记录 ID 已变化，请刷新重试。")
+
+    def comparable(column, value):
+        if column == "日期":
+            parsed = pd.to_datetime(value, errors="coerce")
+            return parsed.strftime("%Y/%m/%d") if pd.notna(parsed) else ""
+        if column in {"原币金额", "换算汇率"}:
+            parsed = pd.to_numeric(value, errors="coerce")
+            return float(parsed) if pd.notna(parsed) else None
+        return "" if pd.isna(value) else str(value).strip()
+
+    updates = []
+    for record_id, row in new_rows.iterrows():
+        previous = old_rows.loc[record_id]
+        if all(comparable(column, row[column]) == comparable(column, previous[column]) for column in editable):
+            continue
+        changed = {column: comparable(column, row[column]) for column in editable}
+        if not changed["日期"] or changed["归属系统"] not in EXPENSE_SCOPES:
+            raise ValueError(f"{record_id} 的日期或归属系统无效。")
+        if not changed["类别"] or not changed["项目"]:
+            raise ValueError(f"{record_id} 的类别和项目不能为空。")
+        if changed["原币金额"] is None or changed["原币金额"] <= 0:
+            raise ValueError(f"{record_id} 的金额必须大于 0。")
+        if changed["币种"] not in {"SGD", "CNY"} or changed["状态"] not in {"有效", "已作废"}:
+            raise ValueError(f"{record_id} 的币种或状态无效。")
+        if changed["币种"] == "CNY" and (changed["换算汇率"] is None or changed["换算汇率"] <= 0):
+            raise ValueError(f"{record_id} 的人民币换算汇率必须大于 0。")
+        rate = 1 if changed["币种"] == "SGD" else round(changed["换算汇率"], 4)
+        amount = round(changed["原币金额"], 2)
+        updated = previous.to_dict()
+        updated.update(changed)
+        updated["原币金额"] = amount
+        updated["换算汇率"] = rate
+        updated["新币金额"] = round(amount / rate, 2)
+        updated["更新时间"] = updated_at
+        updates.append(updated)
+    return updates
+
+
 def _resolve_person_role(position):
     position = str(position or "").strip()
     if position == "合作厂商":
@@ -6478,93 +6535,131 @@ def render_admin_expenses():
         st.info("还没有支出记录。")
         return
 
-    filter_cols = st.columns([2, 1, 1])
     today = datetime.now().date()
+    dated = records["日期"].dropna()
+    earliest = dated.min().date() if not dated.empty else today
+    latest = max(today, dated.max().date()) if not dated.empty else today
+    filter_cols = st.columns([2, 1, 1])
     selected_dates = filter_cols[0].date_input(
-        "日期范围", value=(today - timedelta(days=30), today), key="expense_filter_dates",
+        "日期范围", value=(earliest, latest), key="expense_filter_dates_v2",
     )
     selected_scope = filter_cols[1].selectbox("系统", ["全部"] + EXPENSE_SCOPES, key="expense_filter_scope")
-    selected_category = filter_cols[2].selectbox("类别", ["全部"] + categories, key="expense_filter_category")
-    visible = records.loc[records["状态"].eq("有效")].copy()
-    if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
-        start_date, end_date = selected_dates
-        visible = visible.loc[visible["日期"].dt.date.between(start_date, end_date)]
+    show_voided = filter_cols[2].checkbox("显示已作废", value=False, key="expense_show_voided")
+    scoped = records.copy()
+    if not isinstance(selected_dates, (tuple, list)) or len(selected_dates) != 2:
+        st.info("请选择完整日期范围。")
+        return
+    start_date, end_date = selected_dates
+    scoped = scoped.loc[scoped["日期"].dt.date.between(start_date, end_date)]
     if selected_scope != "全部":
-        visible = visible.loc[visible["归属系统"].eq(selected_scope)]
-    if selected_category != "全部":
-        visible = visible.loc[visible["类别"].eq(selected_category)]
+        scoped = scoped.loc[scoped["归属系统"].eq(selected_scope)]
+    active = scoped.loc[scoped["状态"].eq("有效")].copy()
+    details = scoped if show_voided else active
 
-    st.metric("筛选范围内支出（SGD）", f"${visible['新币金额'].sum():,.2f}")
-    totals = visible.groupby("归属系统")["新币金额"].sum()
-    metric_cols = st.columns(3)
-    for column, scope in zip(metric_cols, EXPENSE_SCOPES):
-        column.metric(scope, f"${totals.get(scope, 0):,.2f}")
+    summary = _expense_category_summary(active)
+    total = float(active["新币金额"].sum())
+    st.metric("总支出（SGD）", f"${total:,.2f}")
+    totals_by_scope = active.groupby("归属系统")["新币金额"].sum()
+    for column, scope in zip(st.columns(3), EXPENSE_SCOPES):
+        column.metric(scope, f"${totals_by_scope.get(scope, 0):,.2f}")
 
-    st.subheader("支出明细")
-    table = visible.sort_values("日期", ascending=False).copy()
-    table["日期"] = table["日期"].dt.strftime("%Y/%m/%d")
-    st.dataframe(
-        table[["日期", "归属系统", "类别", "项目", "原币金额", "币种", "换算汇率", "新币金额", "备注"]],
-        use_container_width=True, hide_index=True,
+    if not summary.empty:
+        st.subheader("各类支出")
+        category_order = (
+            summary.groupby("类别")["新币金额"].sum().sort_values().index.tolist()
+        )
+        fig = px.bar(
+            summary, x="新币金额", y="类别", color="归属系统", orientation="h",
+            category_orders={"类别": category_order, "归属系统": EXPENSE_SCOPES},
+            color_discrete_map={"钛杯系统": "#1864ab", "丝绸系统": "#b95d47", "共同支出": "#4e906e"},
+            labels={"新币金额": "SGD", "类别": "", "归属系统": "归属"},
+        )
+        fig.update_layout(
+            barmode="stack", height=max(300, min(850, 100 + len(category_order) * 58)),
+            margin=dict(l=8, r=20, t=14, b=35), legend=dict(orientation="h", y=1.12, x=0),
+        )
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    else:
+        st.info("这个范围内还没有有效支出。")
+
+    st.subheader("分类明细")
+    category_totals = active.groupby("类别")["新币金额"].sum()
+    category_names = sorted(
+        details["类别"].dropna().astype(str).unique(),
+        key=lambda name: (-float(category_totals.get(name, 0)), name),
     )
-
-    with st.expander("修改或作废记录"):
-        record_options = records.loc[records["记录ID"].fillna("").astype(str).ne("")].copy()
-        record_options = record_options.sort_values("日期", ascending=False)
-        labels = {
-            str(row["记录ID"]): f"{row['日期']:%Y/%m/%d} · {row['项目']} · ${row['新币金额']:,.2f} · {row['状态']}"
-            for _, row in record_options.iterrows() if pd.notna(row["日期"])
-        }
-        if not labels:
-            st.info("暂无可修改的记录。")
-        else:
-            selected_id = st.selectbox("选择记录", list(labels), format_func=lambda value: labels[value])
-            selected = records.loc[records["记录ID"].astype(str).eq(selected_id)].iloc[0]
-            with st.form(f"expense_edit_form_{selected_id}"):
-                edit_date = st.date_input("日期", value=selected["日期"].date() if pd.notna(selected["日期"]) else today)
-                edit_scope = st.selectbox("归属系统", EXPENSE_SCOPES, index=EXPENSE_SCOPES.index(selected["归属系统"]) if selected["归属系统"] in EXPENSE_SCOPES else 0)
-                edit_category = st.text_input("类别", value=str(selected["类别"]))
-                edit_item = st.text_input("项目", value=str(selected["项目"]))
-                edit_amount = st.number_input("原币金额", min_value=0.0, value=float(selected["原币金额"]), step=1.0, format="%.2f")
-                edit_currency = st.selectbox("币种", ["SGD", "CNY"], index=1 if selected["币种"] == "CNY" else 0)
-                edit_rate = st.number_input("换算汇率（1 SGD = CNY）", min_value=0.0001, value=float(selected["换算汇率"]) if selected["换算汇率"] > 0 else 5.3, step=0.01, format="%.4f")
-                edit_note = st.text_input("备注", value=str(selected["备注"]))
-                edit_status = st.selectbox("状态", ["有效", "已作废"], index=1 if selected["状态"] == "已作废" else 0)
-                save_expense = st.form_submit_button("保存修改", type="primary")
-            if save_expense:
-                if not edit_category.strip() or not edit_item.strip() or edit_amount <= 0:
-                    st.error("请填写类别、项目和大于 0 的金额。")
-                else:
+    for category_name in category_names:
+        group = details.loc[details["类别"].eq(category_name)].sort_values("日期", ascending=False)
+        if group.empty:
+            continue
+        group_total = float(category_totals.get(category_name, 0))
+        with st.expander(f"{category_name}　${group_total:,.2f}　·　{len(group)} 笔"):
+            source_rows = group[EXPENSE_COLS].reset_index(drop=True)
+            editor_columns = ["日期", "归属系统", "类别", "项目", "原币金额", "币种", "换算汇率", "新币金额", "备注", "状态"]
+            editor_table = source_rows[editor_columns].copy()
+            editor_table["日期"] = editor_table["日期"].dt.date
+            editor_key = "expense_inline_" + hashlib.sha256(category_name.encode("utf-8")).hexdigest()[:12]
+            edited_table = st.data_editor(
+                editor_table, key=editor_key, hide_index=True, use_container_width=True,
+                num_rows="fixed", disabled=["新币金额"],
+                column_config={
+                    "日期": st.column_config.DateColumn("日期", format="YYYY/MM/DD", required=True),
+                    "归属系统": st.column_config.SelectboxColumn("归属系统", options=EXPENSE_SCOPES, required=True),
+                    "类别": st.column_config.TextColumn("类别", required=True),
+                    "项目": st.column_config.TextColumn("项目", required=True),
+                    "原币金额": st.column_config.NumberColumn("原币金额", min_value=0.01, step=0.01, format="%.2f", required=True),
+                    "币种": st.column_config.SelectboxColumn("币种", options=["SGD", "CNY"], required=True),
+                    "换算汇率": st.column_config.NumberColumn("1 SGD = CNY", min_value=0.0001, step=0.01, format="%.4f", required=True),
+                    "新币金额": st.column_config.NumberColumn("新币金额", format="%.2f"),
+                    "状态": st.column_config.SelectboxColumn("状态", options=["有效", "已作废"], required=True),
+                },
+            )
+            if st.button("保存本类修改", key=f"expense_save_{editor_key}"):
+                edited_rows = source_rows.copy()
+                for column in editor_columns:
+                    edited_rows[column] = edited_table[column].tolist()
+                try:
+                    updates = _expense_editor_updates(
+                        source_rows, edited_rows, datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f"),
+                    )
+                except ValueError as error:
+                    st.error(str(error))
+                    continue
+                if not updates:
+                    st.info("没有待保存的修改。")
+                    continue
+                try:
                     worksheet = get_worksheet_cached(EXPENSE_SHEET)
                     sheet_rows = worksheet.get_all_values()
                     if not sheet_rows or sheet_rows[0][:len(EXPENSE_COLS)] != EXPENSE_COLS:
-                        st.error("后台支出表的列结构不符合预期，未保存修改。")
-                        return
-                    matching_rows = [index for index, values in enumerate(sheet_rows[1:], start=2) if values and values[0] == selected_id]
-                    if len(matching_rows) != 1:
-                        st.error("后台记录已变化，未保存修改；请刷新后重试。")
-                        return
-                    sgd_amount = edit_amount if edit_currency == "SGD" else edit_amount / edit_rate
-                    edited = {
-                        "记录ID": selected_id, "日期": edit_date.strftime("%Y/%m/%d"),
-                        "归属系统": edit_scope, "类别": edit_category.strip(), "项目": edit_item.strip(),
-                        "原币金额": round(edit_amount, 2), "币种": edit_currency,
-                        "换算汇率": 1 if edit_currency == "SGD" else round(edit_rate, 4),
-                        "新币金额": round(sgd_amount, 2), "备注": edit_note.strip(),
-                        "状态": edit_status, "记录人": selected["记录人"],
-                        "更新时间": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
-                    }
-                    updated = _upsert_expense_row(pd.DataFrame([dict(zip(EXPENSE_COLS, sheet_rows[matching_rows[0] - 1]))]), edited)
-                    values = [str(updated.iloc[0][column]) for column in EXPENSE_COLS]
-                    try:
-                        worksheet.update(values=[values], range_name=f"A{matching_rows[0]}:M{matching_rows[0]}")
-                    except Exception as error:
-                        st.error(f"保存失败，请检查连接后重试：{error}")
-                        return
-                    st.session_state.sheet_versions[EXPENSE_SHEET] = st.session_state.sheet_versions.get(EXPENSE_SHEET, 0) + 1
-                    invalidate_data_cache(EXPENSE_SHEET)
-                    st.success("记录已更新。")
-                    st.rerun()
+                        raise ValueError("后台支出表的列结构不符合预期。")
+                    positions = {}
+                    for row_number, values in enumerate(sheet_rows[1:], start=2):
+                        if values:
+                            positions.setdefault(values[0], []).append(row_number)
+                    original_by_id = source_rows.set_index("记录ID")
+                    batch = []
+                    for update in updates:
+                        record_id = update["记录ID"]
+                        matches = positions.get(record_id, [])
+                        if len(matches) != 1:
+                            raise ValueError(f"{record_id} 在后台无法唯一定位，请刷新重试。")
+                        current_row = sheet_rows[matches[0] - 1]
+                        current_timestamp = current_row[12] if len(current_row) > 12 else ""
+                        if current_timestamp != str(original_by_id.loc[record_id, "更新时间"]):
+                            raise ValueError(f"{record_id} 已被其他操作更新，请刷新后重试。")
+                        batch.append({
+                            "range": f"A{matches[0]}:M{matches[0]}",
+                            "values": [[str(update[column]) for column in EXPENSE_COLS]],
+                        })
+                    worksheet.batch_update(batch, value_input_option="RAW")
+                except Exception as error:
+                    st.error(f"修改未保存：{error}")
+                    continue
+                st.session_state.sheet_versions[EXPENSE_SHEET] = st.session_state.sheet_versions.get(EXPENSE_SHEET, 0) + 1
+                invalidate_data_cache(EXPENSE_SHEET)
+                st.success(f"已更新 {len(updates)} 笔记录。")
+                st.rerun()
 
 
 def render_jewel_operations_dashboard():
