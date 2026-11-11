@@ -3316,6 +3316,20 @@ def _expense_category_summary(frame):
     )
 
 
+def _expense_sgd_amount(amount, currency, rate):
+    value = pd.to_numeric(amount, errors="coerce")
+    if pd.isna(value) or value <= 0:
+        raise ValueError("支出金额必须大于 0。")
+    if currency == "SGD":
+        return round(float(value), 2)
+    if currency != "CNY":
+        raise ValueError("支出币种无效。")
+    numeric_rate = pd.to_numeric(rate, errors="coerce")
+    if pd.isna(numeric_rate) or numeric_rate <= 1:
+        raise ValueError("人民币支出需填写 1 SGD = CNY 的汇率，不能沿用 SGD 的 1。")
+    return round(float(value) / float(numeric_rate), 2)
+
+
 def _expense_editor_updates(original, edited, updated_at):
     editable = ["日期", "归属系统", "类别", "项目", "原币金额", "币种", "换算汇率", "备注", "状态"]
     if len(original) != len(edited) or not original["记录ID"].is_unique or not edited["记录ID"].is_unique:
@@ -3340,6 +3354,15 @@ def _expense_editor_updates(original, edited, updated_at):
         if all(comparable(column, row[column]) == comparable(column, previous[column]) for column in editable):
             continue
         changed = {column: comparable(column, row[column]) for column in editable}
+        if changed["状态"] == "已作废" and all(
+            changed[column] == comparable(column, previous[column])
+            for column in editable if column != "状态"
+        ):
+            updated = previous.to_dict()
+            updated["状态"] = "已作废"
+            updated["更新时间"] = updated_at
+            updates.append(updated)
+            continue
         if not changed["日期"] or changed["归属系统"] not in EXPENSE_SCOPES:
             raise ValueError(f"{record_id} 的日期或归属系统无效。")
         if not changed["类别"] or not changed["项目"]:
@@ -3348,15 +3371,14 @@ def _expense_editor_updates(original, edited, updated_at):
             raise ValueError(f"{record_id} 的金额必须大于 0。")
         if changed["币种"] not in {"SGD", "CNY"} or changed["状态"] not in {"有效", "已作废"}:
             raise ValueError(f"{record_id} 的币种或状态无效。")
-        if changed["币种"] == "CNY" and (changed["换算汇率"] is None or changed["换算汇率"] <= 0):
-            raise ValueError(f"{record_id} 的人民币换算汇率必须大于 0。")
+        sgd_amount = _expense_sgd_amount(changed["原币金额"], changed["币种"], changed["换算汇率"])
         rate = 1 if changed["币种"] == "SGD" else round(changed["换算汇率"], 4)
         amount = round(changed["原币金额"], 2)
         updated = previous.to_dict()
         updated.update(changed)
         updated["原币金额"] = amount
         updated["换算汇率"] = rate
-        updated["新币金额"] = round(amount / rate, 2)
+        updated["新币金额"] = sgd_amount
         updated["更新时间"] = updated_at
         updates.append(updated)
     return updates
@@ -6500,6 +6522,15 @@ def render_admin_expenses():
     ))
 
     with st.expander("＋ 新增支出", expanded=records.empty):
+        expense_currency = st.radio("币种", ["SGD", "CNY"], horizontal=True, key="expense_create_currency")
+        default_expense_rate = 0.0
+        if expense_currency == "CNY":
+            try:
+                fx_quote = _fetch_daily_cny_per_sgd()
+                default_expense_rate = round(float(fx_quote["rate"]), 4)
+                st.caption(f"参考汇率：1 SGD = {default_expense_rate:.4f} CNY（ECB {fx_quote['date']}）；可按实际付款汇率修改。")
+            except Exception:
+                st.caption("暂无法取得参考汇率，请填写实际付款汇率。")
         with st.form("expense_create_form", clear_on_submit=True):
             left, middle, right = st.columns(3)
             expense_date = left.date_input("支出日期", value=datetime.now().date())
@@ -6507,10 +6538,15 @@ def render_admin_expenses():
             expense_category = right.selectbox("类别", categories + ["自定义类别"])
             custom_category = st.text_input("自定义类别（选择自定义时填写）")
             expense_item = st.text_input("支出项目")
-            amount_col, currency_col, rate_col = st.columns(3)
-            expense_amount = amount_col.number_input("原币金额", min_value=0.0, step=1.0, format="%.2f")
-            expense_currency = currency_col.selectbox("币种", ["SGD", "CNY"])
-            expense_rate = rate_col.number_input("换算汇率（1 SGD = CNY）", min_value=0.0001, value=5.3, step=0.01, format="%.4f")
+            amount_col, rate_col = st.columns(2)
+            expense_amount = amount_col.number_input(f"金额（{expense_currency}）", min_value=0.0, step=1.0, format="%.2f")
+            expense_rate = (
+                rate_col.number_input(
+                    "换算汇率（1 SGD = CNY）", min_value=0.0,
+                    value=default_expense_rate, step=0.01, format="%.4f",
+                )
+                if expense_currency == "CNY" else 1
+            )
             expense_note = st.text_input("备注（选填）")
             create_expense = st.form_submit_button("保存支出", type="primary")
         if create_expense:
@@ -6518,18 +6554,22 @@ def render_admin_expenses():
             if not category_name or not expense_item.strip() or expense_amount <= 0:
                 st.error("请填写类别、项目和大于 0 的金额。")
             else:
-                now = datetime.now()
-                sgd_amount = expense_amount if expense_currency == "SGD" else expense_amount / expense_rate
-                row = [
-                    f"EXP-{now:%Y%m%d%H%M%S%f}", expense_date.strftime("%Y/%m/%d"),
-                    expense_scope, category_name, expense_item.strip(), round(expense_amount, 2),
-                    expense_currency, 1 if expense_currency == "SGD" else round(expense_rate, 4),
-                    round(sgd_amount, 2), expense_note.strip(), "有效",
-                    st.session_state.get("current_user", "店长"), now.strftime("%Y/%m/%d %H:%M:%S"),
-                ]
-                append_rows_data(EXPENSE_SHEET, [row], EXPENSE_COLS)
-                st.success("支出已保存。")
-                st.rerun()
+                try:
+                    sgd_amount = _expense_sgd_amount(expense_amount, expense_currency, expense_rate)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    now = datetime.now()
+                    row = [
+                        f"EXP-{now:%Y%m%d%H%M%S%f}", expense_date.strftime("%Y/%m/%d"),
+                        expense_scope, category_name, expense_item.strip(), round(expense_amount, 2),
+                        expense_currency, 1 if expense_currency == "SGD" else round(expense_rate, 4),
+                        sgd_amount, expense_note.strip(), "有效",
+                        st.session_state.get("current_user", "店长"), now.strftime("%Y/%m/%d %H:%M:%S"),
+                    ]
+                    append_rows_data(EXPENSE_SHEET, [row], EXPENSE_COLS)
+                    st.success("支出已保存。")
+                    st.rerun()
 
     if records.empty:
         st.info("还没有支出记录。")
@@ -6598,26 +6638,48 @@ def render_admin_expenses():
             editor_columns = ["日期", "归属系统", "类别", "项目", "原币金额", "币种", "换算汇率", "新币金额", "备注", "状态"]
             editor_table = source_rows[editor_columns].copy()
             editor_table["日期"] = editor_table["日期"].dt.date
+            editor_table["换算汇率"] = editor_table["换算汇率"].where(editor_table["币种"].eq("CNY"))
+            editor_table.insert(0, "删除", False)
             editor_key = "expense_inline_" + hashlib.sha256(category_name.encode("utf-8")).hexdigest()[:12]
             edited_table = st.data_editor(
                 editor_table, key=editor_key, hide_index=True, use_container_width=True,
                 num_rows="fixed", disabled=["新币金额"],
                 column_config={
+                    "删除": st.column_config.CheckboxColumn("删除", help="勾选后点击下方删除按钮；记录会保留为已作废，可恢复。"),
                     "日期": st.column_config.DateColumn("日期", format="YYYY/MM/DD", required=True),
                     "归属系统": st.column_config.SelectboxColumn("归属系统", options=EXPENSE_SCOPES, required=True),
                     "类别": st.column_config.TextColumn("类别", required=True),
                     "项目": st.column_config.TextColumn("项目", required=True),
                     "原币金额": st.column_config.NumberColumn("原币金额", min_value=0.01, step=0.01, format="%.2f", required=True),
-                    "币种": st.column_config.SelectboxColumn("币种", options=["SGD", "CNY"], required=True),
-                    "换算汇率": st.column_config.NumberColumn("1 SGD = CNY", min_value=0.0001, step=0.01, format="%.4f", required=True),
+                    "币种": st.column_config.SelectboxColumn("币种", options=["SGD", "CNY"], required=True, help="切换币种后请核对原币金额；人民币还需填写汇率。"),
+                    "换算汇率": st.column_config.NumberColumn("CNY/SGD 汇率", min_value=1.0001, step=0.01, format="%.4f", help="仅人民币支出填写；1 SGD 可兑换多少 CNY。"),
                     "新币金额": st.column_config.NumberColumn("新币金额", format="%.2f"),
                     "状态": st.column_config.SelectboxColumn("状态", options=["有效", "已作废"], required=True),
                 },
             )
-            if st.button("保存本类修改", key=f"expense_save_{editor_key}"):
+            save_col, delete_col = st.columns([1, 1])
+            save_clicked = save_col.button("保存本类修改", key=f"expense_save_{editor_key}")
+            delete_clicked = delete_col.button(
+                "删除勾选", key=f"expense_delete_{editor_key}",
+                help="从汇总和明细中移除勾选记录；后台保留作废记录，可通过“显示已作废”恢复。",
+            )
+            if save_clicked or delete_clicked:
                 edited_rows = source_rows.copy()
-                for column in editor_columns:
-                    edited_rows[column] = edited_table[column].tolist()
+                if delete_clicked:
+                    to_delete = edited_table["删除"].fillna(False).astype(bool).tolist()
+                    if not any(to_delete):
+                        st.warning("请先勾选要删除的记录。")
+                        continue
+                    edited_rows.loc[to_delete, "状态"] = "已作废"
+                else:
+                    for column in editor_columns:
+                        if column == "换算汇率":
+                            edited_rows[column] = [
+                                1 if currency == "SGD" else rate
+                                for currency, rate in zip(edited_table["币种"], edited_table["换算汇率"])
+                            ]
+                        else:
+                            edited_rows[column] = edited_table[column].tolist()
                 try:
                     updates = _expense_editor_updates(
                         source_rows, edited_rows, datetime.now().strftime("%Y/%m/%d %H:%M:%S.%f"),
