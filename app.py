@@ -3224,6 +3224,13 @@ LAZADA_IMPORT_COLUMNS = [
 ]
 PRODUCT_CATEGORY_SHEET = "Product_Category_Map"
 MARKET_INSIGHT_SHEET = "Market_Insight_Snapshots"
+EXPENSE_SHEET = "Operating_Expenses"
+EXPENSE_COLS = [
+    "记录ID", "日期", "归属系统", "类别", "项目", "原币金额", "币种",
+    "换算汇率", "新币金额", "备注", "状态", "记录人", "更新时间",
+]
+EXPENSE_SCOPES = ["钛杯系统", "丝绸系统", "共同支出"]
+EXPENSE_DEFAULT_CATEGORIES = ["物流运输", "场地与租赁", "营销推广", "包装耗材", "设备与工具", "行政杂费", "其他"]
 MARKET_INSIGHT_COLS = [
     "来源档期指纹", "公开档期名称", "品类", "偏好占比%",
     "偏好等级", "排名", "发布状态", "发布时间", "发布人",
@@ -3262,6 +3269,40 @@ DAILY_CLOSE_COLS = [
 ]
 
 all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET, PRODUCT_CATEGORY_SHEET, MARKET_INSIGHT_SHEET]
+
+
+def _normalize_expense_rows(frame):
+    result = frame.copy()
+    for column in EXPENSE_COLS:
+        if column not in result.columns:
+            result[column] = ""
+    result = result[EXPENSE_COLS].copy()
+    for column in ["原币金额", "换算汇率", "新币金额"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
+    result["状态"] = result["状态"].fillna("").astype(str).str.strip()
+    result.loc[result["状态"].eq(""), "状态"] = "有效"
+    result["日期"] = pd.to_datetime(result["日期"], errors="coerce")
+    return result
+
+
+def _upsert_expense_row(frame, row):
+    result = frame.copy()
+    for column in EXPENSE_COLS:
+        if column not in result.columns:
+            result[column] = ""
+    result = result[EXPENSE_COLS].copy()
+    record_id = str(row.get("记录ID", "")).strip()
+    if not record_id:
+        raise ValueError("支出记录缺少 ID")
+    matching = result["记录ID"].astype(str).eq(record_id)
+    if matching.sum() > 1:
+        raise ValueError("支出记录 ID 重复，请先核对后台数据")
+    values = [row.get(column, "") for column in EXPENSE_COLS]
+    if matching.any():
+        result.loc[matching, EXPENSE_COLS] = values
+    else:
+        result.loc[len(result)] = values
+    return result
 
 
 def _resolve_person_role(position):
@@ -5089,9 +5130,12 @@ with st.sidebar:
                 if st.button("🔒 脱敏数据 / 市场洞察", use_container_width=True):
                     st.session_state.admin_page = "market_insight"
                     st.rerun()
+            if st.button("🧾 支出管理", use_container_width=True):
+                st.session_state.admin_page = "expenses"
+                st.rerun()
             if st.session_state.get("admin_page") in {
                 "campaign_bi", "product_category_sales", "market_insight",
-                "market_insight_preview",
+                "market_insight_preview", "expenses",
             }:
                 if st.button("↩️ 返回日常管理台", use_container_width=True):
                     st.session_state.admin_page = "main"
@@ -6389,6 +6433,140 @@ def render_market_insight_admin():
                     st.error("取消发布后的回读核验未通过，请刷新确认。")
 
 
+def render_admin_expenses():
+    st.title("🧾 支出管理")
+    st.caption("记录额外运营开支。这里的金额独立于现有净利润核算；已计入商品进价或打卡工资的费用请勿重复录入。")
+    records = _normalize_expense_rows(load_data(EXPENSE_SHEET, EXPENSE_COLS))
+    categories = list(dict.fromkeys(
+        EXPENSE_DEFAULT_CATEGORIES
+        + [str(value).strip() for value in records["类别"] if str(value).strip()]
+    ))
+
+    with st.expander("＋ 新增支出", expanded=records.empty):
+        with st.form("expense_create_form", clear_on_submit=True):
+            left, middle, right = st.columns(3)
+            expense_date = left.date_input("支出日期", value=datetime.now().date())
+            expense_scope = middle.selectbox("归属系统", EXPENSE_SCOPES)
+            expense_category = right.selectbox("类别", categories + ["自定义类别"])
+            custom_category = st.text_input("自定义类别（选择自定义时填写）")
+            expense_item = st.text_input("支出项目")
+            amount_col, currency_col, rate_col = st.columns(3)
+            expense_amount = amount_col.number_input("原币金额", min_value=0.0, step=1.0, format="%.2f")
+            expense_currency = currency_col.selectbox("币种", ["SGD", "CNY"])
+            expense_rate = rate_col.number_input("换算汇率（1 SGD = CNY）", min_value=0.0001, value=5.3, step=0.01, format="%.4f")
+            expense_note = st.text_input("备注（选填）")
+            create_expense = st.form_submit_button("保存支出", type="primary")
+        if create_expense:
+            category_name = custom_category.strip() if expense_category == "自定义类别" else expense_category
+            if not category_name or not expense_item.strip() or expense_amount <= 0:
+                st.error("请填写类别、项目和大于 0 的金额。")
+            else:
+                now = datetime.now()
+                sgd_amount = expense_amount if expense_currency == "SGD" else expense_amount / expense_rate
+                row = [
+                    f"EXP-{now:%Y%m%d%H%M%S%f}", expense_date.strftime("%Y/%m/%d"),
+                    expense_scope, category_name, expense_item.strip(), round(expense_amount, 2),
+                    expense_currency, 1 if expense_currency == "SGD" else round(expense_rate, 4),
+                    round(sgd_amount, 2), expense_note.strip(), "有效",
+                    st.session_state.get("current_user", "店长"), now.strftime("%Y/%m/%d %H:%M:%S"),
+                ]
+                append_rows_data(EXPENSE_SHEET, [row], EXPENSE_COLS)
+                st.success("支出已保存。")
+                st.rerun()
+
+    if records.empty:
+        st.info("还没有支出记录。")
+        return
+
+    filter_cols = st.columns([2, 1, 1])
+    today = datetime.now().date()
+    selected_dates = filter_cols[0].date_input(
+        "日期范围", value=(today - timedelta(days=30), today), key="expense_filter_dates",
+    )
+    selected_scope = filter_cols[1].selectbox("系统", ["全部"] + EXPENSE_SCOPES, key="expense_filter_scope")
+    selected_category = filter_cols[2].selectbox("类别", ["全部"] + categories, key="expense_filter_category")
+    visible = records.loc[records["状态"].eq("有效")].copy()
+    if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+        visible = visible.loc[visible["日期"].dt.date.between(start_date, end_date)]
+    if selected_scope != "全部":
+        visible = visible.loc[visible["归属系统"].eq(selected_scope)]
+    if selected_category != "全部":
+        visible = visible.loc[visible["类别"].eq(selected_category)]
+
+    st.metric("筛选范围内支出（SGD）", f"${visible['新币金额'].sum():,.2f}")
+    totals = visible.groupby("归属系统")["新币金额"].sum()
+    metric_cols = st.columns(3)
+    for column, scope in zip(metric_cols, EXPENSE_SCOPES):
+        column.metric(scope, f"${totals.get(scope, 0):,.2f}")
+
+    st.subheader("支出明细")
+    table = visible.sort_values("日期", ascending=False).copy()
+    table["日期"] = table["日期"].dt.strftime("%Y/%m/%d")
+    st.dataframe(
+        table[["日期", "归属系统", "类别", "项目", "原币金额", "币种", "换算汇率", "新币金额", "备注"]],
+        use_container_width=True, hide_index=True,
+    )
+
+    with st.expander("修改或作废记录"):
+        record_options = records.loc[records["记录ID"].fillna("").astype(str).ne("")].copy()
+        record_options = record_options.sort_values("日期", ascending=False)
+        labels = {
+            str(row["记录ID"]): f"{row['日期']:%Y/%m/%d} · {row['项目']} · ${row['新币金额']:,.2f} · {row['状态']}"
+            for _, row in record_options.iterrows() if pd.notna(row["日期"])
+        }
+        if not labels:
+            st.info("暂无可修改的记录。")
+        else:
+            selected_id = st.selectbox("选择记录", list(labels), format_func=lambda value: labels[value])
+            selected = records.loc[records["记录ID"].astype(str).eq(selected_id)].iloc[0]
+            with st.form(f"expense_edit_form_{selected_id}"):
+                edit_date = st.date_input("日期", value=selected["日期"].date() if pd.notna(selected["日期"]) else today)
+                edit_scope = st.selectbox("归属系统", EXPENSE_SCOPES, index=EXPENSE_SCOPES.index(selected["归属系统"]) if selected["归属系统"] in EXPENSE_SCOPES else 0)
+                edit_category = st.text_input("类别", value=str(selected["类别"]))
+                edit_item = st.text_input("项目", value=str(selected["项目"]))
+                edit_amount = st.number_input("原币金额", min_value=0.0, value=float(selected["原币金额"]), step=1.0, format="%.2f")
+                edit_currency = st.selectbox("币种", ["SGD", "CNY"], index=1 if selected["币种"] == "CNY" else 0)
+                edit_rate = st.number_input("换算汇率（1 SGD = CNY）", min_value=0.0001, value=float(selected["换算汇率"]) if selected["换算汇率"] > 0 else 5.3, step=0.01, format="%.4f")
+                edit_note = st.text_input("备注", value=str(selected["备注"]))
+                edit_status = st.selectbox("状态", ["有效", "已作废"], index=1 if selected["状态"] == "已作废" else 0)
+                save_expense = st.form_submit_button("保存修改", type="primary")
+            if save_expense:
+                if not edit_category.strip() or not edit_item.strip() or edit_amount <= 0:
+                    st.error("请填写类别、项目和大于 0 的金额。")
+                else:
+                    worksheet = get_worksheet_cached(EXPENSE_SHEET)
+                    sheet_rows = worksheet.get_all_values()
+                    if not sheet_rows or sheet_rows[0][:len(EXPENSE_COLS)] != EXPENSE_COLS:
+                        st.error("后台支出表的列结构不符合预期，未保存修改。")
+                        return
+                    matching_rows = [index for index, values in enumerate(sheet_rows[1:], start=2) if values and values[0] == selected_id]
+                    if len(matching_rows) != 1:
+                        st.error("后台记录已变化，未保存修改；请刷新后重试。")
+                        return
+                    sgd_amount = edit_amount if edit_currency == "SGD" else edit_amount / edit_rate
+                    edited = {
+                        "记录ID": selected_id, "日期": edit_date.strftime("%Y/%m/%d"),
+                        "归属系统": edit_scope, "类别": edit_category.strip(), "项目": edit_item.strip(),
+                        "原币金额": round(edit_amount, 2), "币种": edit_currency,
+                        "换算汇率": 1 if edit_currency == "SGD" else round(edit_rate, 4),
+                        "新币金额": round(sgd_amount, 2), "备注": edit_note.strip(),
+                        "状态": edit_status, "记录人": selected["记录人"],
+                        "更新时间": datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+                    }
+                    updated = _upsert_expense_row(pd.DataFrame([dict(zip(EXPENSE_COLS, sheet_rows[matching_rows[0] - 1]))]), edited)
+                    values = [str(updated.iloc[0][column]) for column in EXPENSE_COLS]
+                    try:
+                        worksheet.update(values=[values], range_name=f"A{matching_rows[0]}:M{matching_rows[0]}")
+                    except Exception as error:
+                        st.error(f"保存失败，请检查连接后重试：{error}")
+                        return
+                    st.session_state.sheet_versions[EXPENSE_SHEET] = st.session_state.sheet_versions.get(EXPENSE_SHEET, 0) + 1
+                    invalidate_data_cache(EXPENSE_SHEET)
+                    st.success("记录已更新。")
+                    st.rerun()
+
+
 def render_jewel_operations_dashboard():
     st.title("Jewel 档期运营看板")
     st.caption("只读运营数据。请选择一个已保存档期查看客流、交易与营业表现。")
@@ -6479,6 +6657,10 @@ if is_admin and st.session_state.get("admin_page") == "campaign_bi":
 
 if is_admin and st.session_state.get("admin_page") == "product_category_sales":
     render_product_category_sales_center()
+    st.stop()
+
+if is_admin and st.session_state.get("admin_page") == "expenses":
+    render_admin_expenses()
     st.stop()
 
 if is_admin:
