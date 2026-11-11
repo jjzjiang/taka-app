@@ -3071,7 +3071,7 @@ def sort_sales_latest_first(df):
     )
     return out.drop(columns=['_order_sort_dt', '_date_sort_dt', '_orig_sort_pos'], errors='ignore')
 
-def append_rows_data(sheet_name, rows, columns):
+def append_rows_data(sheet_name, rows, columns, value_input_option="USER_ENTERED"):
     if not rows:
         return
     try:
@@ -3084,7 +3084,7 @@ def append_rows_data(sheet_name, rows, columns):
     last_error = None
     for attempt in range(3):
         try:
-            worksheet.append_rows(safe_rows, value_input_option="USER_ENTERED")
+            worksheet.append_rows(safe_rows, value_input_option=value_input_option)
             # 写入成功后必须清掉全局 cache。否则刷新页面后新 session 的 sheet_versions 会回到 0，
             # 可能命中旧的 load_raw_data(sheet_name, 0) 缓存，导致新销售/SKU/补货看起来消失。
             st.session_state.sheet_versions[sheet_name] = st.session_state.sheet_versions.get(sheet_name, 0) + 1
@@ -3281,7 +3281,7 @@ def _normalize_expense_rows(frame):
         result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
     result["状态"] = result["状态"].fillna("").astype(str).str.strip()
     result.loc[result["状态"].eq(""), "状态"] = "有效"
-    result["日期"] = pd.to_datetime(result["日期"], errors="coerce")
+    result["日期"] = pd.to_datetime(result["日期"], errors="coerce", format="mixed")
     return result
 
 
@@ -6574,6 +6574,9 @@ def render_market_insight_admin():
 def render_admin_expenses():
     st.title("🧾 支出管理")
     st.caption("记录额外运营开支。这里的金额独立于现有净利润核算；已计入商品进价或打卡工资的费用请勿重复录入。")
+    saved_expense = st.session_state.pop("expense_flash", None)
+    if saved_expense:
+        st.success(saved_expense)
     records = _normalize_expense_rows(load_data(EXPENSE_SHEET, EXPENSE_COLS))
     categories = list(dict.fromkeys(
         EXPENSE_DEFAULT_CATEGORIES
@@ -6582,6 +6585,7 @@ def render_admin_expenses():
 
     with st.expander("＋ 新增支出", expanded=records.empty):
         expense_currency = st.radio("币种", ["SGD", "CNY"], horizontal=True, key="expense_create_currency")
+        expense_category = st.selectbox("支出类别", categories + ["自定义类别"], key="expense_create_category")
         default_expense_rate = 0.0
         if expense_currency == "CNY":
             try:
@@ -6590,23 +6594,28 @@ def render_admin_expenses():
                 st.caption(f"参考汇率：1 SGD = {default_expense_rate:.4f} CNY（ECB {fx_quote['date']}）；可按实际付款汇率修改。")
             except Exception:
                 st.caption("暂无法取得参考汇率，请填写实际付款汇率。")
-        with st.form("expense_create_form", clear_on_submit=True):
-            left, middle, right = st.columns(3)
-            expense_date = left.date_input("支出日期", value=datetime.now().date())
-            expense_scope = middle.selectbox("归属系统", EXPENSE_SCOPES)
-            expense_category = right.selectbox("类别", categories + ["自定义类别"])
-            custom_category = st.text_input("自定义类别（选择自定义时填写）")
-            expense_item = st.text_input("支出项目")
-            amount_col, rate_col = st.columns(2)
-            expense_amount = amount_col.number_input(f"金额（{expense_currency}）", min_value=0.0, step=1.0, format="%.2f")
+        form_version = st.session_state.get("expense_form_version", 0)
+        with st.form(f"expense_create_form_{form_version}", clear_on_submit=False):
+            expense_date = st.date_input("支出日期", value=datetime.now().date(), key=f"expense_date_{form_version}")
+            expense_scope = st.selectbox("归属系统", EXPENSE_SCOPES, key=f"expense_scope_{form_version}")
+            custom_category = (
+                st.text_input("新类别名称", key=f"expense_custom_category_{form_version}")
+                if expense_category == "自定义类别" else ""
+            )
+            expense_item = st.text_input("支出项目", key=f"expense_item_{form_version}")
+            expense_amount = st.number_input(
+                f"金额（{expense_currency}）", min_value=0.0, step=1.0, format="%.2f",
+                key=f"expense_amount_{form_version}",
+            )
             expense_rate = (
-                rate_col.number_input(
+                st.number_input(
                     "换算汇率（1 SGD = CNY）", min_value=0.0,
                     value=default_expense_rate, step=0.01, format="%.4f",
+                    key=f"expense_rate_{form_version}",
                 )
                 if expense_currency == "CNY" else 1
             )
-            expense_note = st.text_input("备注（选填）")
+            expense_note = st.text_input("备注（选填）", key=f"expense_note_{form_version}")
             create_expense = st.form_submit_button("保存支出", type="primary")
         if create_expense:
             category_name = custom_category.strip() if expense_category == "自定义类别" else expense_category
@@ -6626,9 +6635,25 @@ def render_admin_expenses():
                         sgd_amount, expense_note.strip(), "有效",
                         st.session_state.get("current_user", "店长"), now.strftime("%Y/%m/%d %H:%M:%S"),
                     ]
-                    append_rows_data(EXPENSE_SHEET, [row], EXPENSE_COLS)
-                    st.success("支出已保存。")
-                    st.rerun()
+                    append_rows_data(EXPENSE_SHEET, [row], EXPENSE_COLS, value_input_option="RAW")
+                    try:
+                        saved_rows = get_worksheet_cached(EXPENSE_SHEET).get_all_values()
+                    except Exception as error:
+                        st.warning(f"提交后暂无法核实后台记录，请勿重复提交，刷新后再检查：{error}")
+                    else:
+                        matches = [values for values in saved_rows[1:] if values and values[0] == row[0]]
+                        if len(matches) != 1:
+                            st.warning("提交后暂未在后台唯一找到这笔记录，请勿重复提交，刷新后再检查。")
+                        else:
+                            st.session_state["expense_flash"] = (
+                                f"已保存：{expense_date:%Y/%m/%d} · {category_name} · {expense_item.strip()}"
+                                f" · {expense_currency} {expense_amount:,.2f}（SGD {sgd_amount:,.2f}）"
+                            )
+                            st.session_state["expense_form_version"] = form_version + 1
+                            st.session_state.pop("expense_filter_dates_v2", None)
+                            st.session_state["expense_filter_scope"] = "全部"
+                            st.session_state["expense_show_voided"] = False
+                            st.rerun()
 
     if records.empty:
         st.info("还没有支出记录。")
