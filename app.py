@@ -3205,7 +3205,9 @@ DAILY_CLOSE_SHEET = "Daily_Close_Reports"
 STOCK_COLS = ['商品名称', '颜色', '进价成本', '人民币进价', '售卖价格', '应收到数量', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '总库存']
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期', '登录密码', '状态', SYSTEM_PERMISSION_COL]
-ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资']
+ATT_SCOPE_COL = '归属系统'
+ATT_SCOPES = ['钛杯系统', '丝绸系统', '共用']
+ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资', ATT_SCOPE_COL]
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
 RESTOCK_COLS = ['记录日期', '操作类型', '商品名称', '颜色', '变动数量', '库位详情', '单件成本', '备注']
@@ -3231,6 +3233,11 @@ EXPENSE_COLS = [
 ]
 EXPENSE_SCOPES = ["钛杯系统", "丝绸系统", "共同支出"]
 EXPENSE_DEFAULT_CATEGORIES = ["物流运输", "场地与租赁", "营销推广", "包装耗材", "设备与工具", "行政杂费", "其他"]
+OTHER_INCOME_SHEET = "Other_Income"
+OTHER_INCOME_COLS = [
+    "记录ID", "日期", "归属系统", "类别", "项目", "原币金额", "币种",
+    "换算汇率", "新币金额", "备注", "状态", "记录人", "更新时间",
+]
 MARKET_INSIGHT_COLS = [
     "来源档期指纹", "公开档期名称", "品类", "偏好占比%",
     "偏好等级", "排名", "发布状态", "发布时间", "发布人",
@@ -3316,6 +3323,34 @@ def _expense_category_summary(frame):
     )
 
 
+def _expense_income_summary(titanium_sales, silk_sales, lazada_sales, start_date, end_date, scope="全部"):
+    def channel_total(frame, amount_column, order_column):
+        if frame is None or frame.empty or "日期" not in frame.columns or amount_column not in frame.columns:
+            return 0.0
+        dates = pd.to_datetime(frame["日期"], errors="coerce", format="mixed").dt.date
+        amounts = pd.to_numeric(frame[amount_column], errors="coerce").fillna(0.0)
+        included = dates.between(start_date, end_date)
+        if order_column in frame.columns:
+            order_ids = frame[order_column].fillna("").astype(str).str.upper().str.strip()
+            included &= ~order_ids.str.startswith(("EXC-", "EMPBUY-"))
+        return round(float(amounts.loc[included].sum()), 2)
+
+    totals = {
+        "钛杯POS": channel_total(titanium_sales, "总营业额", "订单号"),
+        "丝绸POS": channel_total(silk_sales, "总营业额", "订单号"),
+        "Lazada": channel_total(lazada_sales, "商品营业额", "Lazada订单号"),
+    }
+    if scope == "钛杯系统":
+        totals["丝绸POS"] = 0.0
+    elif scope == "丝绸系统":
+        totals["钛杯POS"] = 0.0
+        totals["Lazada"] = 0.0
+    elif scope == "共同支出":
+        totals = {key: 0.0 for key in totals}
+    totals["总销售额"] = round(sum(totals.values()), 2)
+    return totals
+
+
 def _expense_sgd_amount(amount, currency, rate):
     value = pd.to_numeric(amount, errors="coerce")
     if pd.isna(value) or value <= 0:
@@ -3328,6 +3363,82 @@ def _expense_sgd_amount(amount, currency, rate):
     if pd.isna(numeric_rate) or numeric_rate <= 1:
         raise ValueError("人民币支出需填写 1 SGD = CNY 的汇率，不能沿用 SGD 的 1。")
     return round(float(value) / float(numeric_rate), 2)
+
+
+def _attendance_cost_breakdown(frame, start_date, end_date):
+    totals = {scope: 0.0 for scope in ATT_SCOPES}
+    totals['待分配'] = 0.0
+    if frame is None or frame.empty:
+        return totals
+    rows = frame.copy()
+    for column in ['日期', '核算薪资', ATT_SCOPE_COL]:
+        if column not in rows.columns:
+            rows[column] = ''
+    dates = pd.to_datetime(rows['日期'], errors='coerce', format='mixed').dt.date
+    rows = rows.loc[dates.between(start_date, end_date)].copy()
+    rows['核算薪资'] = pd.to_numeric(rows['核算薪资'], errors='coerce').fillna(0)
+    scopes = rows[ATT_SCOPE_COL].fillna('').astype(str).str.strip()
+    rows[ATT_SCOPE_COL] = scopes.where(scopes.isin(ATT_SCOPES), '待分配')
+    for scope, amount in rows.groupby(ATT_SCOPE_COL)['核算薪资'].sum().items():
+        totals[scope] = round(float(amount), 2)
+    return totals
+
+
+def _lazada_contribution(stock_df, lazada_df, start_date, end_date):
+    empty = {'营业额': 0.0, '商品成本': 0.0, '毛贡献': 0.0, '缺成本件数': 0.0}
+    if lazada_df is None or lazada_df.empty:
+        return empty
+    sales = lazada_df.copy()
+    for column in ['日期', '商品名称', '颜色', '销售数量', '商品营业额']:
+        if column not in sales.columns:
+            sales[column] = ''
+    dates = pd.to_datetime(sales['日期'], errors='coerce', format='mixed').dt.date
+    sales = sales.loc[dates.between(start_date, end_date)].copy()
+    if sales.empty:
+        return empty
+    stock = stock_df.copy() if stock_df is not None else pd.DataFrame()
+    for column in ['商品名称', '颜色', '进价成本']:
+        if column not in stock.columns:
+            stock[column] = ''
+    stock = stock[['商品名称', '颜色', '进价成本']].drop_duplicates(['商品名称', '颜色'], keep='last')
+    sales = sales.merge(stock, on=['商品名称', '颜色'], how='left')
+    quantity = pd.to_numeric(sales['销售数量'], errors='coerce').fillna(0)
+    revenue = pd.to_numeric(sales['商品营业额'], errors='coerce').fillna(0)
+    cost = pd.to_numeric(sales['进价成本'], errors='coerce')
+    missing = float(quantity.loc[cost.isna()].clip(lower=0).sum())
+    cogs = float((quantity * cost.fillna(0)).sum())
+    gross = float(revenue.sum())
+    return {'营业额': round(gross, 2), '商品成本': round(cogs, 2),
+            '毛贡献': round(gross - cogs, 2), '缺成本件数': missing}
+
+
+def _other_income_summary(frame, start_date, end_date):
+    if frame is None or frame.empty:
+        return 0.0
+    rows = frame.copy()
+    for column in ['日期', '新币金额', '状态']:
+        if column not in rows.columns:
+            rows[column] = ''
+    dates = pd.to_datetime(rows['日期'], errors='coerce', format='mixed').dt.date
+    active = rows['状态'].fillna('').astype(str).str.strip().isin(['', '有效'])
+    amounts = pd.to_numeric(rows['新币金额'], errors='coerce').fillna(0)
+    return round(float(amounts.loc[dates.between(start_date, end_date) & active].sum()), 2)
+
+
+def _calculate_total_earnings(titanium_daily, silk_daily, wages, lazada, other_income, expenses):
+    def net(frame):
+        if frame is None or frame.empty or '真实净利润' not in frame.columns:
+            return 0.0
+        return float(pd.to_numeric(frame['真实净利润'], errors='coerce').fillna(0).sum())
+
+    titanium = net(titanium_daily)
+    silk = net(silk_daily)
+    shared = float(wages.get('共用', 0))
+    unassigned = float(wages.get('待分配', 0))
+    total = titanium + silk + float(lazada['毛贡献']) + float(other_income) - float(expenses) - shared - unassigned
+    return {'钛杯净利': round(titanium, 2), '丝绸净利': round(silk, 2),
+            '共用人工': round(shared, 2), '待分配人工': round(unassigned, 2),
+            '总收益': round(total, 2)}
 
 
 def _selected_expense_delete_ids(source_rows, selection_values):
@@ -5268,7 +5379,7 @@ with st.sidebar:
                 if st.button("🔒 脱敏数据 / 市场洞察", use_container_width=True):
                     st.session_state.admin_page = "market_insight"
                     st.rerun()
-            if st.button("🧾 支出管理", use_container_width=True):
+            if st.button("🧾 经营收支", use_container_width=True):
                 st.session_state.admin_page = "expenses"
                 st.rerun()
             if st.session_state.get("admin_page") in {
@@ -6572,7 +6683,6 @@ def render_market_insight_admin():
 
 
 def render_admin_expenses():
-    st.title("🧾 支出管理")
     st.caption("记录额外运营开支。这里的金额独立于现有净利润核算；已计入商品进价或打卡工资的费用请勿重复录入。")
     saved_expense = st.session_state.pop("expense_flash", None)
     if saved_expense:
@@ -6582,6 +6692,9 @@ def render_admin_expenses():
         EXPENSE_DEFAULT_CATEGORIES
         + [str(value).strip() for value in records["类别"] if str(value).strip()]
     ))
+    titanium_income = load_data("Sales", SALES_COLS)
+    silk_income = load_data("Silk_Sales", SALES_COLS)
+    lazada_income = load_data(LAZADA_SHEET, LAZADA_COLS)
 
     with st.expander("＋ 新增支出", expanded=records.empty):
         expense_currency = st.radio("币种", ["SGD", "CNY"], horizontal=True, key="expense_create_currency")
@@ -6650,14 +6763,13 @@ def render_admin_expenses():
                                 f" · {expense_currency} {expense_amount:,.2f}（SGD {sgd_amount:,.2f}）"
                             )
                             st.session_state["expense_form_version"] = form_version + 1
-                            st.session_state.pop("expense_filter_dates_v2", None)
+                            st.session_state.pop("expense_filter_dates_v3", None)
                             st.session_state["expense_filter_scope"] = "全部"
                             st.session_state["expense_show_voided"] = False
                             st.rerun()
 
     if records.empty:
         st.info("还没有支出记录。")
-        return
 
     latest_deleted = _latest_expense_deletion_batch(records)
     if not latest_deleted.empty:
@@ -6683,12 +6795,16 @@ def render_admin_expenses():
                     st.rerun()
 
     today = datetime.now().date()
-    dated = records["日期"].dropna()
+    date_columns = [records["日期"]]
+    for sales_frame in (titanium_income, silk_income, lazada_income):
+        if "日期" in sales_frame.columns and not sales_frame.empty:
+            date_columns.append(pd.to_datetime(sales_frame["日期"], errors="coerce", format="mixed"))
+    dated = pd.concat(date_columns, ignore_index=True).dropna()
     earliest = dated.min().date() if not dated.empty else today
     latest = max(today, dated.max().date()) if not dated.empty else today
     filter_cols = st.columns([2, 1, 1])
     selected_dates = filter_cols[0].date_input(
-        "日期范围", value=(earliest, latest), key="expense_filter_dates_v2",
+        "日期范围", value=(earliest, latest), key="expense_filter_dates_v3",
     )
     selected_scope = filter_cols[1].selectbox("系统", ["全部"] + EXPENSE_SCOPES, key="expense_filter_scope")
     show_voided = filter_cols[2].checkbox("显示已作废", value=False, key="expense_show_voided")
@@ -6705,10 +6821,31 @@ def render_admin_expenses():
 
     summary = _expense_category_summary(active)
     total = float(active["新币金额"].sum())
-    st.metric("总支出（SGD）", f"${total:,.2f}")
-    totals_by_scope = active.groupby("归属系统")["新币金额"].sum()
-    for column, scope in zip(st.columns(3), EXPENSE_SCOPES):
-        column.metric(scope, f"${totals_by_scope.get(scope, 0):,.2f}")
+    income = _expense_income_summary(
+        titanium_income, silk_income, lazada_income, start_date, end_date, selected_scope,
+    )
+    st.subheader("经营收支")
+    if selected_scope == "共同支出":
+        st.metric("已录共同支出", f"${total:,.2f}")
+        st.caption("共同支出尚未分摊到钛杯或丝绸，不与单个系统收入直接相减。")
+    else:
+        total_col, expense_col, difference_col = st.columns(3)
+        total_col.metric("总销售额", f"${income['总销售额']:,.2f}")
+        expense_col.metric("已录运营支出", f"${total:,.2f}")
+        difference_col.metric("销售额减已录支出", f"${income['总销售额'] - total:,.2f}")
+        titanium_col, silk_col, lazada_col = st.columns(3)
+        titanium_col.metric("钛杯 POS", f"${income['钛杯POS']:,.2f}")
+        silk_col.metric("丝绸 POS", f"${income['丝绸POS']:,.2f}")
+        lazada_col.metric("Lazada", f"${income['Lazada']:,.2f}")
+        st.caption(
+            "POS 为含税成交额，Lazada 为商品营业额；B2B 未计入。"
+            "差额只减去这里已录的运营支出，未扣商品成本、工资、GST、商场抽成或平台费用，不是实际到账或净利润。"
+        )
+        if selected_scope in EXPENSE_SCOPES[:2]:
+            st.caption("共同支出尚未分摊到单个系统；单系统视图中的支出与差额不包含共同支出。")
+        first_expense_date = records["日期"].dropna().min()
+        if pd.notna(first_expense_date) and start_date < first_expense_date.date() and income["总销售额"] != 0:
+            st.info(f"支出记录从 {first_expense_date:%Y-%m-%d} 才开始，之前的开支尚未完整录入，历史差额仅供参考。")
 
     if not summary.empty:
         st.subheader("各类支出")
@@ -6822,6 +6959,164 @@ def render_admin_expenses():
                 st.rerun()
 
 
+def render_admin_total_earnings():
+    st.caption("独立汇总：钛杯和丝绸 POS 净利、Lazada 商品毛贡献、其他收入，减去共用人工、待分配人工及额外运营支出。B2B 暂不计入。")
+    today = datetime.now().date()
+    selected_dates = st.date_input(
+        "收益日期范围", value=(today.replace(day=1), today), key="total_earnings_dates",
+    )
+    if not isinstance(selected_dates, (tuple, list)) or len(selected_dates) != 2:
+        st.info("请选择完整日期范围。")
+        return
+    start_date, end_date = selected_dates
+
+    titanium_stock = load_data("Stock", STOCK_COLS)
+    titanium_sales = load_data("Sales", SALES_COLS)
+    silk_stock = load_data("Silk_Stock", STOCK_COLS)
+    silk_sales = load_data("Silk_Sales", SALES_COLS)
+    attendance = load_data(ATT_SHEET, ATT_COLS)
+    lazada_sales = load_data(LAZADA_SHEET, LAZADA_COLS)
+    expenses = _normalize_expense_rows(load_data(EXPENSE_SHEET, EXPENSE_COLS))
+    income_rows = load_data(OTHER_INCOME_SHEET, OTHER_INCOME_COLS)
+
+    with st.expander("＋ 登记其他收入"):
+        currency = st.radio("收入币种", ["SGD", "CNY"], horizontal=True, key="other_income_currency")
+        reference_rate = 0.0
+        if currency == "CNY":
+            try:
+                reference_rate = round(float(_fetch_daily_cny_per_sgd()["rate"]), 4)
+            except Exception:
+                st.caption("无法取得参考汇率，请填写实际入账汇率。")
+        with st.form("other_income_create"):
+            col1, col2 = st.columns(2)
+            income_date = col1.date_input("收入日期", value=today)
+            income_scope = col2.selectbox("归属", ["钛杯系统", "丝绸系统", "共同收入"])
+            category = st.text_input("收入类别", placeholder="例如：活动补贴")
+            item = st.text_input("收入项目")
+            amount = st.number_input(f"收入金额（{currency}）", min_value=0.0, format="%.2f")
+            rate = (st.number_input("实际汇率（1 SGD = CNY）", min_value=0.0,
+                                    value=reference_rate, format="%.4f") if currency == "CNY" else 1.0)
+            note = st.text_input("备注（选填）")
+            save_income = st.form_submit_button("保存收入", type="primary")
+        if save_income:
+            if not category.strip() or not item.strip() or amount <= 0:
+                st.error("请填写收入类别、项目和大于 0 的金额。")
+            else:
+                try:
+                    sgd_amount = _expense_sgd_amount(amount, currency, rate)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    now = datetime.now()
+                    row = [
+                        f"INC-{now:%Y%m%d%H%M%S%f}", income_date.strftime("%Y/%m/%d"),
+                        income_scope, category.strip(), item.strip(), round(amount, 2), currency,
+                        1 if currency == "SGD" else round(rate, 4), sgd_amount, note.strip(),
+                        "有效", st.session_state.get("current_user", "店长"),
+                        now.strftime("%Y/%m/%d %H:%M:%S"),
+                    ]
+                    append_rows_data(OTHER_INCOME_SHEET, [row], OTHER_INCOME_COLS, value_input_option="RAW")
+                    try:
+                        saved = get_worksheet_cached(OTHER_INCOME_SHEET).get_all_values()
+                    except Exception as error:
+                        st.warning(f"已提交但暂无法核对后台，请勿重复提交：{error}")
+                    else:
+                        if sum(1 for values in saved[1:] if values and values[0] == row[0]) != 1:
+                            st.warning("已提交但回读未找到唯一记录，请勿重复提交。")
+                        else:
+                            st.success("其他收入已保存。")
+                            st.rerun()
+
+    wages = _attendance_cost_breakdown(attendance, start_date, end_date)
+    titanium_att = attendance.loc[attendance[ATT_SCOPE_COL].eq("钛杯系统")]
+    silk_att = attendance.loc[attendance[ATT_SCOPE_COL].eq("丝绸系统")]
+    titanium_daily = _period_daily_financials(
+        _dashboard_sales_with_cost(titanium_stock, titanium_sales, start_date, end_date),
+        titanium_att, start_date, end_date,
+    )
+    silk_daily = _period_daily_financials(
+        _dashboard_sales_with_cost(silk_stock, silk_sales, start_date, end_date),
+        silk_att, start_date, end_date,
+    )
+    lazada = _lazada_contribution(titanium_stock, lazada_sales, start_date, end_date)
+    other_income = _other_income_summary(income_rows, start_date, end_date)
+    dated_expenses = expenses.loc[
+        expenses["日期"].dt.date.between(start_date, end_date) & expenses["状态"].eq("有效")
+    ]
+    expense_total = round(float(dated_expenses["新币金额"].sum()), 2)
+    result = _calculate_total_earnings(
+        titanium_daily, silk_daily, wages, lazada, other_income, expense_total,
+    )
+
+    st.subheader("总收益（估算）")
+    left, right, third = st.columns(3)
+    left.metric("钛杯 POS 净利", f"${result['钛杯净利']:,.2f}")
+    right.metric("丝绸 POS 净利", f"${result['丝绸净利']:,.2f}")
+    third.metric("总收益", f"${result['总收益']:,.2f}")
+    detail = pd.DataFrame([
+        ("钛杯 POS 净利", result["钛杯净利"]),
+        ("丝绸 POS 净利", result["丝绸净利"]),
+        ("Lazada 商品营业额", lazada["营业额"]),
+        ("Lazada 商品进价", -lazada["商品成本"]),
+        ("其他收入", other_income),
+        ("共用人工", -result["共用人工"]),
+        ("待分配人工", -result["待分配人工"]),
+        ("额外运营支出", -expense_total),
+    ], columns=["项目", "金额 (SGD)"])
+    st.dataframe(detail, hide_index=True, use_container_width=True,
+                 column_config={"金额 (SGD)": st.column_config.NumberColumn(format="$%.2f")})
+    if result["待分配人工"]:
+        st.warning("旧考勤尚未分配系统：已在总收益中扣除一次，但没有计入钛杯或丝绸单独净利。可到考勤页逐条更正。")
+    if lazada["缺成本件数"]:
+        st.warning(f"Lazada 有 {lazada['缺成本件数']:g} 件商品缺少进价，当前贡献额可能偏高。")
+    st.caption("Lazada 仅扣当前 SKU 进价；平台佣金、物流、GST 等尚未自动扣除，发生时请登记为额外运营支出。历史 SKU 进价变更也会影响本页估算。")
+
+    active_income = income_rows.copy()
+    if not active_income.empty:
+        dates = pd.to_datetime(active_income["日期"], errors="coerce", format="mixed").dt.date
+        active_income = active_income.loc[
+            dates.between(start_date, end_date) & active_income["状态"].astype(str).isin(["", "有效"])
+        ]
+    st.subheader("其他收入明细")
+    if active_income.empty:
+        st.info("该日期范围内暂无其他收入记录。")
+    else:
+        st.dataframe(active_income[["日期", "归属系统", "类别", "项目", "原币金额", "币种", "新币金额", "备注"]],
+                     hide_index=True, use_container_width=True)
+        options = {
+            f"{row['日期']} · {row['类别']} · {row['项目']} · SGD {row['新币金额']} · {row['记录ID']}": row['记录ID']
+            for _, row in active_income.iterrows()
+        }
+        selected_label = st.selectbox("选择需要作废的收入", list(options), key="void_income_choice")
+        if st.button("作废所选收入", key="void_income_button"):
+            worksheet = get_worksheet_cached(OTHER_INCOME_SHEET)
+            sheet_rows = worksheet.get_all_values()
+            selected_id = options[selected_label]
+            matches = [index for index, row in enumerate(sheet_rows[1:], start=2)
+                       if row and row[0] == selected_id]
+            if len(matches) != 1 or sheet_rows[0][:len(OTHER_INCOME_COLS)] != OTHER_INCOME_COLS:
+                st.error("后台记录无法唯一匹配，未作废。")
+            else:
+                worksheet.update(values=[["作废"]], range_name=f"K{matches[0]}")
+                verified = worksheet.row_values(matches[0])
+                if len(verified) <= 10 or verified[0] != selected_id or verified[10] != "作废":
+                    st.error("作废后的回读未通过，请刷新核对，不要重复操作。")
+                else:
+                    st.session_state.sheet_versions[OTHER_INCOME_SHEET] = st.session_state.sheet_versions.get(OTHER_INCOME_SHEET, 0) + 1
+                    invalidate_data_cache(OTHER_INCOME_SHEET)
+                    st.success("这笔收入已作废。")
+                    st.rerun()
+
+
+def render_admin_finances():
+    st.title("经营收支")
+    expense_tab, earnings_tab = st.tabs(["支出明细", "总收益"])
+    with expense_tab:
+        render_admin_expenses()
+    with earnings_tab:
+        render_admin_total_earnings()
+
+
 def render_jewel_operations_dashboard():
     st.title("Jewel 档期运营看板")
     st.caption("只读运营数据。请选择一个已保存档期查看客流、交易与营业表现。")
@@ -6915,7 +7210,7 @@ if is_admin and st.session_state.get("admin_page") == "product_category_sales":
     st.stop()
 
 if is_admin and st.session_state.get("admin_page") == "expenses":
-    render_admin_expenses()
+    render_admin_finances()
     st.stop()
 
 if is_admin:
@@ -6931,6 +7226,117 @@ else:
     t1, t2, t3 = st.tabs([t("📊 实时库存查询", "📊 Inventory Snapshot"), t("🛒 智能POS收银台", "🛒 Smart POS"), t("⏰ 考勤打卡", "⏰ Timeclock")])
 
 # ================= 🚀 公共核心组件函数化 (防丢利器) =================
+
+def _sku_detail_data(name, color, stock_df, sales_df, restock_df,
+                     staff_purchase_df=None, lazada_df=None):
+    def matching(frame):
+        rows = frame.copy() if frame is not None else pd.DataFrame()
+        for column in ('商品名称', '颜色'):
+            if column not in rows.columns:
+                rows[column] = ''
+        return rows.loc[
+            rows['商品名称'].fillna('').astype(str).str.strip().eq(str(name).strip())
+            & rows['颜色'].fillna('').astype(str).str.strip().eq(str(color).strip())
+        ].copy()
+
+    stock = matching(stock_df)
+    sales = matching(sales_df)
+    restock = matching(restock_df)
+    for column in ('日期', '订单号', '收银员', '销售数量', '成交单价', '总营业额'):
+        if column not in sales.columns:
+            sales[column] = ''
+    for column in ('记录日期', '操作类型', '变动数量', '库位详情', '备注'):
+        if column not in restock.columns:
+            restock[column] = ''
+    sales['销售数量'] = pd.to_numeric(sales['销售数量'], errors='coerce').fillna(0)
+    sales['成交单价'] = pd.to_numeric(sales['成交单价'], errors='coerce').fillna(0)
+    sales['总营业额'] = pd.to_numeric(sales['总营业额'], errors='coerce').fillna(0)
+    sales['_date'] = pd.to_datetime(sales['日期'], errors='coerce', format='mixed')
+    sales = sales.sort_values('_date', ascending=False, kind='stable').drop(columns='_date')
+    restock['变动数量'] = pd.to_numeric(restock['变动数量'], errors='coerce').fillna(0)
+    restock['_date'] = pd.to_datetime(restock['记录日期'], errors='coerce', format='mixed')
+    inbound = restock.loc[restock['操作类型'].astype(str).str.strip().isin(['初始建档', '入库', 'Initial Setup', 'Inbound'])]
+    last_inbound = (inbound['_date'].max().strftime('%Y/%m/%d')
+                    if not inbound.empty and pd.notna(inbound['_date'].max()) else None)
+    restock_events = pd.DataFrame({
+        '日期': restock['记录日期'], '类型': restock['操作类型'],
+        '数量变化': restock['变动数量'], '单据': '',
+        '库位/说明': restock['库位详情'].fillna('').astype(str) + ' ' + restock['备注'].fillna('').astype(str),
+    })
+    sales_events = pd.DataFrame({
+        '日期': sales['日期'],
+        '类型': sales['订单号'].fillna('').astype(str).str.startswith('EXC-').map({True: '换货流水', False: 'POS 销售'}),
+        '数量变化': -sales['销售数量'], '单据': sales['订单号'],
+        '库位/说明': sales['收银员'],
+    })
+    purchases = matching(staff_purchase_df)
+    for column in ('日期', '内购单号', '员工姓名', '购买数量', '是否扣库存'):
+        if column not in purchases.columns:
+            purchases[column] = ''
+    purchases = purchases.loc[purchases['是否扣库存'].astype(str).str.strip().eq('是')]
+    purchase_events = pd.DataFrame({
+        '日期': purchases['日期'], '类型': '员工内购',
+        '数量变化': -pd.to_numeric(purchases['购买数量'], errors='coerce').fillna(0),
+        '单据': purchases['内购单号'], '库位/说明': purchases['员工姓名'],
+    })
+    lazada = matching(lazada_df)
+    for column in ('日期', 'Lazada订单号', '销售数量'):
+        if column not in lazada.columns:
+            lazada[column] = ''
+    lazada_events = pd.DataFrame({
+        '日期': lazada['日期'], '类型': 'Lazada 销售',
+        '数量变化': -pd.to_numeric(lazada['销售数量'], errors='coerce').fillna(0),
+        '单据': lazada['Lazada订单号'], '库位/说明': '',
+    })
+    events = pd.concat([restock_events, sales_events, purchase_events, lazada_events], ignore_index=True)
+    events['_date'] = pd.to_datetime(events['日期'], errors='coerce', format='mixed')
+    events = events.sort_values('_date', ascending=False, kind='stable').drop(columns='_date').reset_index(drop=True)
+    return {'stock': stock, 'sales': sales, 'events': events,
+            'last_inbound': last_inbound, 'has_inbound_history': not inbound.empty}
+
+
+@st.dialog('SKU 详情')
+def show_sku_detail(name, color):
+    detail = _sku_detail_data(
+        name, color, df_stock, df_sales, df_restock, df_staff_purchase,
+        df_lazada_sales if ACTIVE_CATEGORY_SYSTEM == 'titanium' else None,
+    )
+    st.subheader(f'{name} ({color})')
+    st.caption(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}")
+    stock_rows = detail['stock']
+    if not stock_rows.empty:
+        current = stock_rows.iloc[0]
+        cols = st.columns(4)
+        for col, field, label in zip(cols, ['总库存', '展示数量', '货柜数量', '储物间数量'],
+                                     ['当前总库存', '展示', '货柜', '储物间']):
+            col.metric(label, f"{to_int(current.get(field, 0))} 件")
+    st.caption(f"最近入库：{detail['last_inbound'] or '无可核实入库日期'}")
+    if not detail['has_inbound_history']:
+        st.warning('现有流水中找不到该 SKU 的入库/建档记录；不能据此推算历史期初库存。')
+    sales_tab, timeline_tab = st.tabs(['逐笔销售', '库存时间线'])
+    with sales_tab:
+        sales = detail['sales']
+        if sales.empty:
+            st.info('暂无销售记录。')
+        else:
+            dated = pd.to_datetime(sales['日期'], errors='coerce', format='mixed').dropna()
+            if dated.empty:
+                filtered = sales
+            else:
+                bounds = st.date_input('销售日期范围', value=(dated.min().date(), dated.max().date()),
+                                       key=f"sku_sales_dates_{ACTIVE_CATEGORY_SYSTEM}_{hashlib.sha256((name + color).encode()).hexdigest()[:10]}")
+                filtered = sales
+                if isinstance(bounds, (tuple, list)) and len(bounds) == 2:
+                    dates = pd.to_datetime(sales['日期'], errors='coerce', format='mixed').dt.date
+                    filtered = sales.loc[dates.between(bounds[0], bounds[1])]
+            st.dataframe(filtered[['日期', '订单号', '收银员', '销售数量', '成交单价', '总营业额']],
+                         hide_index=True, use_container_width=True)
+    with timeline_tab:
+        if detail['events'].empty:
+            st.info('暂无可查的库存变化流水。')
+        else:
+            st.caption('旧流水可能只有日期；同一天多笔记录的先后顺序未必可核实。入库记录数量可能包含坏货，不能直接视为可售库存。')
+            st.dataframe(detail['events'], hide_index=True, use_container_width=True)
 
 def render_inventory_snapshot(role_prefix):
     st.subheader(t("📊 实时库存快照", "📊 Real-time Inventory Snapshot"))
@@ -7035,13 +7441,14 @@ def render_inventory_snapshot(role_prefix):
             selected_stock = edited_stock[edited_stock[sel_col_name] == True] if sel_col_name in edited_stock.columns else pd.DataFrame()
             
             if len(selected_stock) == 1:
-                st.markdown("### ⚙️ SKU 档案修改机")
-                
                 orig_disp_name = str(selected_stock.iloc[0]['Product' if st.session_state.lang == 'en' else '商品名称'])
                 orig_disp_color = str(selected_stock.iloc[0]['Variant' if st.session_state.lang == 'en' else '颜色'])
                 
                 real_orig_name = t_val(orig_disp_name, 'cn')
                 real_orig_color = t_val(orig_disp_color, 'cn')
+                if st.button('查看 SKU 详情', key='inventory_open_sku_detail'):
+                    show_sku_detail(real_orig_name, real_orig_color)
+                st.markdown("### ⚙️ SKU 档案修改机")
                 
                 raw_cost = str(selected_stock.iloc[0][c_col]).replace('$', '').replace(',', '')
                 raw_rmb_cost = str(selected_stock.iloc[0][rmb_col]).replace('¥', '').replace(',', '')
@@ -8811,6 +9218,8 @@ if is_admin:
                     del_order_id = str(r_del['Order ID' if st.session_state.lang == 'en' else '订单号']).strip()
                     del_product = str(r_del['Product' if st.session_state.lang == 'en' else '商品名称']).strip()
                     del_variant = str(r_del['Variant' if st.session_state.lang == 'en' else '颜色']).strip()
+                    if st.button('查看 SKU 详情', key='sales_open_sku_detail'):
+                        show_sku_detail(t_val(del_product, 'cn'), t_val(del_variant, 'cn'))
                     del_qty = to_int(r_del['Qty' if st.session_state.lang == 'en' else '销售数量'])
                     del_amount = to_float(r_del['Total Amount' if st.session_state.lang == 'en' else '总营业额'])
                     st.warning(f"即将撤销 1 条销售流水：`{del_order_id}` / `{del_product} ({del_variant})` / 数量 `{del_qty}` / 金额 `${del_amount:.2f}`。此操作会同步回补库存。")
@@ -9213,6 +9622,11 @@ if is_admin:
                     c3, c4 = st.columns(2)
                     att_start = c3.time_input("上班时间", value=time(10, 0))
                     att_end = c4.time_input("下班时间", value=time(18, 0))
+                    att_scope = st.selectbox(
+                        "本班归属", ATT_SCOPES,
+                        index=ATT_SCOPES.index(ACTIVE_SYSTEM_CONFIG['label']),
+                        key="admin_attendance_scope",
+                    )
                     
                     if st.form_submit_button("确认记录考勤"):
                         fresh_att = JIT_fetch([ATT_SHEET])[ATT_SHEET]
@@ -9229,7 +9643,7 @@ if is_admin:
                         new_att = pd.DataFrame([[
                             att_name, att_date.strftime("%Y/%m/%d"), 
                             att_start.strftime("%H:%M"), att_end.strftime("%H:%M"), 
-                            round(duration_hours, 2), round(total_wage, 2)
+                            round(duration_hours, 2), round(total_wage, 2), att_scope
                         ]], columns=ATT_COLS)
                         
                         fresh_att = pd.concat([new_att, fresh_att], ignore_index=True)
@@ -9257,6 +9671,32 @@ if is_admin:
                     key=f"att_editor_{st.session_state.att_reset_key}"
                 )
                 selected_att = edited_att[edited_att["选择"] == True]
+
+                if len(selected_att) == 1:
+                    selected_shift = selected_att.iloc[0]
+                    current_scope = str(selected_shift.get(ATT_SCOPE_COL, '')).strip()
+                    scope_options = ATT_SCOPES
+                    corrected_scope = st.selectbox(
+                        "选中班次归属", scope_options,
+                        index=scope_options.index(current_scope) if current_scope in scope_options else 0,
+                        key="admin_selected_attendance_scope",
+                    )
+                    if st.button("保存班次归属", key="save_attendance_scope"):
+                        fresh_att = JIT_fetch([ATT_SHEET])[ATT_SHEET]
+                        match = (
+                            fresh_att['员工姓名'].astype(str).str.strip().eq(str(selected_shift['员工姓名']).strip())
+                            & fresh_att['日期'].astype(str).str.strip().eq(str(selected_shift['日期']).strip())
+                            & fresh_att['开始时间'].astype(str).str.strip().eq(str(selected_shift['开始时间']).strip())
+                            & fresh_att['结束时间'].astype(str).str.strip().eq(str(selected_shift['结束时间']).strip())
+                        )
+                        if int(match.sum()) != 1:
+                            st.error("无法唯一定位这条考勤，请先核对重复记录。")
+                        else:
+                            fresh_att.loc[match, ATT_SCOPE_COL] = corrected_scope
+                            save_data(fresh_att, ATT_SHEET)
+                            st.session_state.att_reset_key += 1
+                            st.success("班次归属已更新。")
+                            st.rerun()
                 
                 if not selected_att.empty:
                     col_btn1, col_btn2, _ = st.columns([1.5, 1.5, 4])
@@ -10977,6 +11417,17 @@ elif is_employee:
             c1, c2 = st.columns(2)
             att_start = c1.time_input(t("上班时间", "Clock In Time"), value=time(10, 0))
             att_end = c2.time_input(t("下班时间", "Clock Out Time"), value=time(18, 0))
+            allowed_shift_systems = st.session_state.get('allowed_category_systems', [ACTIVE_CATEGORY_SYSTEM])
+            shift_scopes = [CATEGORY_SYSTEMS[key]['label'] for key in allowed_shift_systems if key in CATEGORY_SYSTEMS]
+            if len(shift_scopes) > 1:
+                shift_scopes.append('共用')
+            if not shift_scopes:
+                shift_scopes = [ACTIVE_SYSTEM_CONFIG['label']]
+            active_shift_scope = ACTIVE_SYSTEM_CONFIG['label']
+            att_scope = st.selectbox(
+                t("本班归属", "Shift system"), shift_scopes,
+                index=shift_scopes.index(active_shift_scope) if active_shift_scope in shift_scopes else 0,
+            )
             
             if st.form_submit_button(t("✅ 确认打卡 (提交本班次)", "✅ Submit Time"), type="primary", use_container_width=True):
                 fresh_att = JIT_fetch([ATT_SHEET])[ATT_SHEET]
@@ -10998,7 +11449,7 @@ elif is_employee:
                 new_att = pd.DataFrame([[
                     emp_name, att_date.strftime("%Y/%m/%d"), 
                     att_start.strftime("%H:%M"), att_end.strftime("%H:%M"), 
-                    round(duration_hours, 2), round(total_wage, 2)
+                    round(duration_hours, 2), round(total_wage, 2), att_scope
                 ]], columns=ATT_COLS)
                 
                 fresh_att = pd.concat([new_att, fresh_att], ignore_index=True)
