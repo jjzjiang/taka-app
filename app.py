@@ -11,7 +11,6 @@ import time as pytime
 import plotly.express as px
 from io import BytesIO
 from urllib.request import Request, urlopen
-from urllib.parse import urlencode
 import xml.etree.ElementTree as ET
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -7228,13 +7227,6 @@ else:
 
 # ================= 🚀 公共核心组件函数化 (防丢利器) =================
 
-def _sku_detail_link(base_url, auth_params, system_key, name, color, label):
-    params = {key: str(auth_params.get(key, '')) for key in ('role', 'user', 'auth')}
-    params.update({'sku_system': system_key, 'sku_name': name, 'sku_color': color})
-    base = str(base_url or './').split('?', 1)[0].split('#', 1)[0]
-    return f"{base}?{urlencode(params)}#sku={str(label).replace('#', '＃')}"
-
-
 def _sku_detail_data(name, color, stock_df, sales_df, restock_df,
                      staff_purchase_df=None, lazada_df=None):
     def matching(frame):
@@ -7346,20 +7338,9 @@ def render_sku_detail_content(name, color):
             st.dataframe(detail['events'], hide_index=True, use_container_width=True)
 
 
-if is_admin and _qp_get('sku_name') and _qp_get('sku_color'):
-    requested_system = _qp_get('sku_system')
-    if requested_system not in CATEGORY_SYSTEMS:
-        st.error('商品详情链接的系统无效。')
-        st.stop()
-    if requested_system != ACTIVE_CATEGORY_SYSTEM:
-        update_category_system_state(st.session_state, requested_system)
-        st.rerun()
-    if st.button('返回管理台', key='return_from_sku_link'):
-        for parameter in ('sku_system', 'sku_name', 'sku_color'):
-            st.query_params.pop(parameter, None)
-        st.rerun()
-    render_sku_detail_content(_qp_get('sku_name'), _qp_get('sku_color'))
-    st.stop()
+@st.dialog('SKU 详情')
+def show_sku_detail(name, color):
+    render_sku_detail_content(name, color)
 
 def render_inventory_snapshot(role_prefix):
     st.subheader(t("📊 实时库存快照", "📊 Real-time Inventory Snapshot"))
@@ -7408,7 +7389,6 @@ def render_inventory_snapshot(role_prefix):
             return "0.0%"
             
         v_df['单品毛利率'] = v_df.apply(calc_margin, axis=1)
-        v_df.insert(0, "选择", False)
         v_df['__sku_original_name'] = v_df['商品名称'].astype(str)
         v_df['__sku_original_color'] = v_df['颜色'].astype(str)
         
@@ -7427,7 +7407,7 @@ def render_inventory_snapshot(role_prefix):
                 st.dataframe(df_disp.style.format({p_col: '${:.2f}'}), use_container_width=True, hide_index=True)
             
         elif role_prefix == 'admin':
-            display_cols = ['选择', '商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '售卖价格', '进价成本', '人民币进价', '单品毛利率']
+            display_cols = ['商品名称', '颜色', '期间售出', '总库存', '展示数量', '货柜数量', '储物间数量', '坏货数量', '已售出数量', '售卖价格', '进价成本', '人民币进价', '单品毛利率']
             df_disp = v_df[display_cols + ['__sku_original_name', '__sku_original_color']].copy()
             if st.session_state.lang == 'en': df_disp.rename(columns=col_map, inplace=True)
             
@@ -7437,47 +7417,45 @@ def render_inventory_snapshot(role_prefix):
             stk_col = 'Total Stock' if st.session_state.lang == 'en' else '总库存'
             name_col = 'Product' if st.session_state.lang == 'en' else '商品名称'
             color_col = 'Variant' if st.session_state.lang == 'en' else '颜色'
-            sel_col_name = "Sel" if st.session_state.lang == 'en' else "选择"
-            link_base = getattr(getattr(st, 'context', None), 'url', None) or './'
-            link_auth = {'role': 'admin', 'user': st.session_state.get('current_user', '店长')}
-            link_auth['auth'] = _qp_get('auth') or make_auth_token('admin', link_auth['user'])
-            df_disp[name_col] = [
-                _sku_detail_link(link_base, link_auth, ACTIVE_CATEGORY_SYSTEM, raw_name, raw_color, label)
-                for raw_name, raw_color, label in zip(
-                    df_disp['__sku_original_name'], df_disp['__sku_original_color'], df_disp[name_col]
-                )
-            ]
             low_stock_cols = {name_col, color_col, stk_col}
             warning_style = 'background-color: #ffe6e6; color: #cc0000; font-weight: bold;'
             
             def highlight_low_stock(row):
                 try:
                     if int(row[stk_col]) <= 2:
-                        return [warning_style if col in low_stock_cols else '' for col in row.index]
+                        return [warning_style + (' text-decoration: underline;' if col == name_col else '')
+                                if col in low_stock_cols else '' for col in row.index]
                 except: pass
-                return [''] * len(row)
+                return ['color: #0b65c2; text-decoration: underline;' if col == name_col else ''
+                        for col in row.index]
 
             def format_rmb_cost(value):
                 number = pd.to_numeric(value, errors='coerce')
                 return '' if pd.isna(number) or float(number) <= 0 else f'¥{float(number):.2f}'
                 
             styled_df = df_disp.style.format({c_col: '${:.2f}', p_col: '${:.2f}', rmb_col: format_rmb_cost}).apply(highlight_low_stock, axis=1)
-            d_disable = [c for c in df_disp.columns if c not in ["选择", "Sel"]]
-            
-            edited_stock = st.data_editor(
+            stock_event = st.dataframe(
                 styled_df,
                 column_config={
-                    sel_col_name: st.column_config.CheckboxColumn(sel_col_name, default=False),
-                    name_col: st.column_config.LinkColumn(name_col, display_text=r'#sku=(.*)$'),
+                    name_col: st.column_config.TextColumn(name_col, help='点击商品名查看详情；点击其他数据可修改档案'),
                     '__sku_original_name': None, '__sku_original_color': None,
                 },
                 column_order=[col for col in df_disp.columns if not col.startswith('__')],
-                disabled=d_disable,
                 use_container_width=True, hide_index=True, 
-                key=f"stock_editor_{st.session_state.stock_reset_key}"
+                on_select='rerun', selection_mode='single-cell',
+                key=f"stock_detail_table_{st.session_state.stock_reset_key}"
             )
-            
-            selected_stock = edited_stock[edited_stock[sel_col_name] == True] if sel_col_name in edited_stock.columns else pd.DataFrame()
+
+            selected_stock = pd.DataFrame()
+            if stock_event.selection.cells:
+                row_pos, clicked_col = stock_event.selection.cells[0]
+                if 0 <= row_pos < len(df_disp):
+                    clicked_row = df_disp.iloc[row_pos]
+                    if clicked_col == name_col:
+                        st.session_state.stock_reset_key += 1
+                        show_sku_detail(str(clicked_row['__sku_original_name']), str(clicked_row['__sku_original_color']))
+                    else:
+                        selected_stock = df_disp.iloc[[row_pos]]
             
             if len(selected_stock) == 1:
                 real_orig_name = str(selected_stock.iloc[0]['__sku_original_name'])
@@ -9204,9 +9182,6 @@ if is_admin:
             f_sl_sel['商品名称'] = translate_series(f_sl_sel['商品名称'])
             f_sl_sel['颜色'] = translate_series(f_sl_sel['颜色'])
             
-            sel_col_name = "Sel" if st.session_state.lang == 'en' else "选择"
-            f_sl_sel.insert(0, sel_col_name, False)
-            
             fx_column_map = {
                 '人民币进价': 'Purchase Cost CNY',
                 '档案进价 SGD': 'Recorded Cost SGD',
@@ -9218,16 +9193,6 @@ if is_admin:
             if st.session_state.lang == 'en':
                 f_sl_sel.rename(columns={**col_map, **fx_column_map}, inplace=True)
             sales_name_col = 'Product' if st.session_state.lang == 'en' else '商品名称'
-            link_base = getattr(getattr(st, 'context', None), 'url', None) or './'
-            link_auth = {'role': 'admin', 'user': st.session_state.get('current_user', '店长')}
-            link_auth['auth'] = _qp_get('auth') or make_auth_token('admin', link_auth['user'])
-            f_sl_sel[sales_name_col] = [
-                _sku_detail_link(link_base, link_auth, ACTIVE_CATEGORY_SYSTEM, raw_name, raw_color, label)
-                for raw_name, raw_color, label in zip(
-                    f_sl_sel['__sku_original_name'], f_sl_sel['__sku_original_color'], f_sl_sel[sales_name_col]
-                )
-            ]
-            
             u_col = 'Unit Price' if st.session_state.lang == 'en' else '成交单价'
             t_col = 'Total Amount' if st.session_state.lang == 'en' else '总营业额'
             rmb_cost_col = 'Purchase Cost CNY' if st.session_state.lang == 'en' else '人民币进价'
@@ -9236,26 +9201,35 @@ if is_admin:
             money_formats.update({column: '${:.2f}' for column in fx_money_cols if column in f_sl_sel.columns and column != rmb_cost_col})
             if rmb_cost_col in f_sl_sel.columns:
                 money_formats[rmb_cost_col] = '¥{:.2f}'
-            styled_sl = f_sl_sel.style.format(money_formats, na_rep='—')
-            
-            d_disable = [c for c in f_sl_sel.columns if c != sel_col_name]
-            visible_sales_cols = [c for c in f_sl_sel.columns if not c.startswith('__')]
-            
-            edt = st.data_editor(
-                styled_sl, 
-                column_config={
-                    sel_col_name: st.column_config.CheckboxColumn(sel_col_name, default=False),
-                    '__sales_source_index': None,
-                    '__sku_original_name': None, '__sku_original_color': None,
-                    sales_name_col: st.column_config.LinkColumn(sales_name_col, display_text=r'#sku=(.*)$'),
-                }, 
-                column_order=visible_sales_cols,
-                disabled=d_disable, 
-                use_container_width=True, hide_index=True, 
-                key=f"sales_editor_{st.session_state.sales_reset_key}"
+            styled_sl = f_sl_sel.style.format(money_formats, na_rep='—').map(
+                lambda _: 'color: #0b65c2; text-decoration: underline;', subset=[sales_name_col]
             )
             
-            sel = edt[edt[sel_col_name] == True] if sel_col_name in edt.columns else pd.DataFrame()
+            visible_sales_cols = [c for c in f_sl_sel.columns if not c.startswith('__')]
+            
+            sales_event = st.dataframe(
+                styled_sl, 
+                column_config={
+                    '__sales_source_index': None,
+                    '__sku_original_name': None, '__sku_original_color': None,
+                    sales_name_col: st.column_config.TextColumn(sales_name_col, help='点击商品名查看详情；点击其他数据可撤销流水'),
+                }, 
+                column_order=visible_sales_cols,
+                use_container_width=True, hide_index=True, 
+                on_select='rerun', selection_mode='single-cell',
+                key=f"sales_detail_table_{st.session_state.sales_reset_key}"
+            )
+
+            sel = pd.DataFrame()
+            if sales_event.selection.cells:
+                row_pos, clicked_col = sales_event.selection.cells[0]
+                if 0 <= row_pos < len(f_sl_sel):
+                    clicked_row = f_sl_sel.iloc[row_pos]
+                    if clicked_col == sales_name_col:
+                        st.session_state.sales_reset_key += 1
+                        show_sku_detail(str(clicked_row['__sku_original_name']), str(clicked_row['__sku_original_color']))
+                    else:
+                        sel = f_sl_sel.iloc[[row_pos]]
             
             if not sel.empty:
                 if len(sel) > 1:
