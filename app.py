@@ -12,6 +12,7 @@ import plotly.express as px
 from io import BytesIO
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
+from itertools import combinations
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -2300,7 +2301,7 @@ def close_report_status(row):
 
 
 def daily_close_snapshot_statuses(snapshot):
-    statuses = {"titanium": "待加载", "silk": "待加载"}
+    statuses = {key: "待加载" for key in ("titanium", "silk", "titanium_new", "ceramic")}
     if not snapshot:
         return statuses
 
@@ -2319,7 +2320,8 @@ def daily_close_snapshot_statuses(snapshot):
         .astype(str)
         .str.strip()
     )
-    system_labels = {"titanium": "钛杯系统", "silk": "丝绸系统"}
+    system_labels = {"titanium": "钛杯系统", "silk": "丝绸系统",
+                     "titanium_new": "钛杯新品牌", "ceramic": "景德镇瓷器"}
     for system_key, system_label in system_labels.items():
         matching_rows = records.loc[
             record_dates.eq(report_day.date())
@@ -3074,6 +3076,7 @@ def sort_sales_latest_first(df):
 def append_rows_data(sheet_name, rows, columns, value_input_option="USER_ENTERED"):
     if not rows:
         return
+    _assert_legacy_sheet_write_allowed(sheet_name)
     try:
         worksheet = get_worksheet_cached(sheet_name)
     except WorksheetNotFound:
@@ -3133,8 +3136,49 @@ CATEGORY_SYSTEMS = {
         "staff_purchase": "Silk_Staff_Purchases",
         "inventory_snapshot": "Silk_Inventory_Snapshots",
     },
+    "titanium_new": {
+        "label": "钛杯新品牌",
+        "stock": "NewTi_Stock",
+        "sales": "NewTi_Sales",
+        "restock": "NewTi_Restock_Log",
+        "traffic": "NewTi_Traffic_Log",
+        "campaign": "NewTi_Campaigns",
+        "b2b": "NewTi_B2B_Orders",
+        "feedback": "NewTi_Feedback",
+        "staff_purchase": "NewTi_Staff_Purchases",
+        "inventory_snapshot": "NewTi_Inventory_Snapshots",
+    },
+    "ceramic": {
+        "label": "景德镇瓷器",
+        "stock": "Ceramic_Stock",
+        "sales": "Ceramic_Sales",
+        "restock": "Ceramic_Restock_Log",
+        "traffic": "Ceramic_Traffic_Log",
+        "campaign": "Ceramic_Campaigns",
+        "b2b": "Ceramic_B2B_Orders",
+        "feedback": "Ceramic_Feedback",
+        "staff_purchase": "Ceramic_Staff_Purchases",
+        "inventory_snapshot": "Ceramic_Inventory_Snapshots",
+    },
 }
 CATEGORY_SCOPED_SESSION_KEYS = ["pos_cart", "last_order_id", "lazada_cart"]
+SYSTEM_SETTINGS_SHEET = "System_Settings"
+SYSTEM_SETTINGS_COLS = ["系统键", "状态", "更新时间"]
+
+def system_operating_state(settings, system_key):
+    rows = settings.to_dict('records') if hasattr(settings, 'to_dict') else settings
+    for row in rows or []:
+        if str(row.get('系统键', '')).strip() == system_key:
+            return '暂停' if str(row.get('状态', '')).strip() == '暂停' else '运营中'
+    return '运营中'
+
+def filter_operating_systems(system_keys, settings):
+    return [key for key in system_keys if key in CATEGORY_SYSTEMS
+            and system_operating_state(settings, key) == '运营中']
+
+def legacy_write_allowed(sheet_name, settings):
+    legacy_sheets = set(resolve_system_sheets('titanium').values())
+    return sheet_name not in legacy_sheets or system_operating_state(settings, 'titanium') == '运营中'
 
 def get_category_system_config(system_key):
     system_key = str(system_key or DEFAULT_CATEGORY_SYSTEM).strip()
@@ -3185,6 +3229,12 @@ def update_category_system_state(state, system_key):
 def employee_has_system_access(permission_value, system_key):
     return system_key in parse_allowed_systems(permission_value)
 
+def grant_new_titanium_permission(permission_value):
+    allowed = parse_allowed_systems(permission_value)
+    if 'titanium_new' not in allowed:
+        allowed.append('titanium_new')
+    return ', '.join(CATEGORY_SYSTEMS[key]['label'] for key in allowed)
+
 ACTIVE_CATEGORY_SYSTEM = get_active_system_from_state(st.session_state)
 ACTIVE_SYSTEM_CONFIG = get_category_system_config(ACTIVE_CATEGORY_SYSTEM)
 ACTIVE_SYSTEM_SHEETS = resolve_system_sheets(ACTIVE_CATEGORY_SYSTEM)
@@ -3206,7 +3256,7 @@ STOCK_COLS = ['商品名称', '颜色', '进价成本', '人民币进价', '售�
 SALES_COLS = ['订单号', '日期', '收银员', '商品名称', '颜色', '销售数量', '成交单价', '总营业额']
 EMP_COLS = ['员工姓名', '职位', '时薪', '联系方式', '入职日期', '登录密码', '状态', SYSTEM_PERMISSION_COL]
 ATT_SCOPE_COL = '归属系统'
-ATT_SCOPES = ['钛杯系统', '丝绸系统', '共用']
+ATT_SCOPES = ['钛杯系统', '丝绸系统', '钛杯新品牌', '景德镇瓷器', '共用']
 ATT_COLS = ['员工姓名', '日期', '开始时间', '结束时间', '工作时长', '核算薪资', ATT_SCOPE_COL]
 B2B_COLS = ['创建日期', '客户名称', '商品名称', '颜色', '采购数量', 'B2B单价', '总计应收', '货物成本', '物流成本', '关税', '已收定金', '待收尾款', '约定交期', '订单状态', '备注']
 FEEDBACK_COLS = ['反馈日期', '商品名称', '客户画像', '反馈类型', '详细原话', '跟进状态']
@@ -3231,7 +3281,7 @@ EXPENSE_COLS = [
     "记录ID", "日期", "归属系统", "类别", "项目", "原币金额", "币种",
     "换算汇率", "新币金额", "备注", "状态", "记录人", "更新时间",
 ]
-EXPENSE_SCOPES = ["钛杯系统", "丝绸系统", "共同支出"]
+EXPENSE_SCOPES = ["钛杯系统", "丝绸系统", "钛杯新品牌", "景德镇瓷器", "共同支出"]
 EXPENSE_DEFAULT_CATEGORIES = ["物流运输", "场地与租赁", "营销推广", "包装耗材", "设备与工具", "行政杂费", "其他"]
 OTHER_INCOME_SHEET = "Other_Income"
 OTHER_INCOME_COLS = [
@@ -3275,7 +3325,7 @@ DAILY_CLOSE_COLS = [
     '最后提交时间',
 ]
 
-all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET, PRODUCT_CATEGORY_SHEET, MARKET_INSIGHT_SHEET]
+all_sheets = [STOCK_SHEET, SALES_SHEET, EMP_SHEET, ATT_SHEET, B2B_SHEET, FEEDBACK_SHEET, RESTOCK_SHEET, TRAFFIC_SHEET, CAMP_SHEET, STAFF_PURCHASE_SHEET, INVENTORY_SNAPSHOT_SHEET, LAZADA_SHEET, PRODUCT_CATEGORY_SHEET, MARKET_INSIGHT_SHEET, SYSTEM_SETTINGS_SHEET]
 
 
 def _normalize_expense_rows(frame):
@@ -3323,7 +3373,8 @@ def _expense_category_summary(frame):
     )
 
 
-def _expense_income_summary(titanium_sales, silk_sales, lazada_sales, start_date, end_date, scope="全部"):
+def _expense_income_summary(titanium_sales, silk_sales, lazada_sales, start_date, end_date, scope="全部",
+                            new_titanium_sales=None, ceramic_sales=None):
     def channel_total(frame, amount_column, order_column):
         if frame is None or frame.empty or "日期" not in frame.columns or amount_column not in frame.columns:
             return 0.0
@@ -3340,13 +3391,19 @@ def _expense_income_summary(titanium_sales, silk_sales, lazada_sales, start_date
         "丝绸POS": channel_total(silk_sales, "总营业额", "订单号"),
         "Lazada": channel_total(lazada_sales, "商品营业额", "Lazada订单号"),
     }
-    if scope == "钛杯系统":
-        totals["丝绸POS"] = 0.0
-    elif scope == "丝绸系统":
-        totals["钛杯POS"] = 0.0
-        totals["Lazada"] = 0.0
-    elif scope == "共同支出":
-        totals = {key: 0.0 for key in totals}
+    if new_titanium_sales is not None:
+        totals["新钛杯POS"] = channel_total(new_titanium_sales, "总营业额", "订单号")
+    if ceramic_sales is not None:
+        totals["瓷器POS"] = channel_total(ceramic_sales, "总营业额", "订单号")
+    scoped_channels = {
+        "钛杯系统": {"钛杯POS", "Lazada"},
+        "丝绸系统": {"丝绸POS"},
+        "钛杯新品牌": {"新钛杯POS"},
+        "景德镇瓷器": {"瓷器POS"},
+    }
+    if scope != "全部":
+        included = scoped_channels.get(scope, set())
+        totals = {key: value if key in included else 0.0 for key, value in totals.items()}
     totals["总销售额"] = round(sum(totals.values()), 2)
     return totals
 
@@ -3425,7 +3482,8 @@ def _other_income_summary(frame, start_date, end_date):
     return round(float(amounts.loc[dates.between(start_date, end_date) & active].sum()), 2)
 
 
-def _calculate_total_earnings(titanium_daily, silk_daily, wages, lazada, other_income, expenses):
+def _calculate_total_earnings(titanium_daily, silk_daily, wages, lazada, other_income, expenses,
+                              new_titanium_daily=None, ceramic_daily=None):
     def net(frame):
         if frame is None or frame.empty or '真实净利润' not in frame.columns:
             return 0.0
@@ -3433,10 +3491,13 @@ def _calculate_total_earnings(titanium_daily, silk_daily, wages, lazada, other_i
 
     titanium = net(titanium_daily)
     silk = net(silk_daily)
+    new_titanium = net(new_titanium_daily)
+    ceramic = net(ceramic_daily)
     shared = float(wages.get('共用', 0))
     unassigned = float(wages.get('待分配', 0))
-    total = titanium + silk + float(lazada['毛贡献']) + float(other_income) - float(expenses) - shared - unassigned
+    total = titanium + silk + new_titanium + ceramic + float(lazada['毛贡献']) + float(other_income) - float(expenses) - shared - unassigned
     return {'钛杯净利': round(titanium, 2), '丝绸净利': round(silk, 2),
+            '新钛杯净利': round(new_titanium, 2), '瓷器净利': round(ceramic, 2),
             '共用人工': round(shared, 2), '待分配人工': round(unassigned, 2),
             '总收益': round(total, 2)}
 
@@ -4786,7 +4847,10 @@ def _save_lazada_sales_frames(
     worksheet_getter=None,
     version_state=None,
     cache_invalidator=None,
+    write_guard=None,
 ):
+    if write_guard is not None:
+        write_guard("Stock")
     spreadsheet = sh if spreadsheet is None else spreadsheet
     worksheet_getter = (
         get_worksheet_cached if worksheet_getter is None else worksheet_getter
@@ -4861,7 +4925,11 @@ def _save_bulk_inventory_frames(
     worksheet_getter=None,
     version_state=None,
     cache_invalidator=None,
+    write_guard=None,
 ):
+    if write_guard is not None:
+        write_guard(stock_sheet)
+        write_guard(restock_sheet)
     spreadsheet = sh if spreadsheet is None else spreadsheet
     worksheet_getter = (
         get_worksheet_cached if worksheet_getter is None else worksheet_getter
@@ -4880,7 +4948,12 @@ def _save_bulk_inventory_frames(
     frames = [(stock_sheet, stock_df), (restock_sheet, restock_df)]
     batch_data = []
     for sheet_name, frame in frames:
-        worksheet = worksheet_getter(sheet_name)
+        try:
+            worksheet = worksheet_getter(sheet_name)
+        except WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(
+                title=sheet_name, rows="1000", cols=str(max(20, len(frame.columns) + 5))
+            )
         safe_frame = frame.fillna("").astype(str)
         values = [safe_frame.columns.tolist()] + safe_frame.values.tolist()
         required_rows = max(1000, len(values) + 100)
@@ -4911,7 +4984,21 @@ def _save_bulk_inventory_frames(
         cache_invalidator(sheet_name)
 
 
+def _assert_legacy_sheet_write_allowed(sheet_name):
+    if sheet_name not in set(resolve_system_sheets('titanium').values()):
+        return
+    try:
+        rows = sh.worksheet(SYSTEM_SETTINGS_SHEET).get_all_records()
+    except WorksheetNotFound:
+        rows = []
+    except Exception as error:
+        raise RuntimeError('无法确认旧钛杯系统状态，已停止写入。') from error
+    if not legacy_write_allowed(sheet_name, rows):
+        raise PermissionError('旧钛杯系统已暂停运营，不能修改其库存或销售。')
+
+
 def save_data(df, sheet_name):
+    _assert_legacy_sheet_write_allowed(sheet_name)
     try:
         worksheet = get_worksheet_cached(sheet_name)
     except WorksheetNotFound:
@@ -5123,6 +5210,9 @@ def convert_df_to_csv(df):
 df_stock = pd.DataFrame(columns=STOCK_COLS)
 df_sales = pd.DataFrame(columns=SALES_COLS)
 df_employee = load_safe_emp()
+df_system_settings = load_data(SYSTEM_SETTINGS_SHEET, SYSTEM_SETTINGS_COLS)
+LEGACY_TITANIUM_PAUSED = system_operating_state(df_system_settings, 'titanium') == '暂停'
+ACTIVE_SYSTEM_PAUSED = system_operating_state(df_system_settings, ACTIVE_CATEGORY_SYSTEM) == '暂停'
 df_attendance = pd.DataFrame(columns=ATT_COLS)
 df_staff_purchase = pd.DataFrame(columns=STAFF_PURCHASE_COLS)
 df_b2b = pd.DataFrame(columns=B2B_COLS)
@@ -5228,8 +5318,12 @@ def persist_login_to_url(role, user):
         st.query_params["auth"] = token
 
 def apply_employee_system_access(emp_row):
-    allowed_systems = parse_allowed_systems(emp_row.get(SYSTEM_PERMISSION_COL, ""))
+    allowed_systems = filter_operating_systems(
+        parse_allowed_systems(emp_row.get(SYSTEM_PERMISSION_COL, "")), df_system_settings
+    )
     st.session_state.allowed_category_systems = allowed_systems
+    if not allowed_systems:
+        return False
     chosen_system = choose_employee_default_system(allowed_systems)
     return update_category_system_state(st.session_state, chosen_system or allowed_systems[0])
 
@@ -5255,7 +5349,7 @@ with st.sidebar:
         else: user_emoji = "🧑‍💼"
         
         st.success(t(f"{user_emoji} 欢迎回来：{st.session_state.current_user}", f"{user_emoji} Welcome back: {st.session_state.current_user}"))
-        st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
+        st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}{'（旧品牌）' if ACTIVE_CATEGORY_SYSTEM == 'titanium' else ''}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
         
         if st.button(t("🚪 退出系统 (交接班)", "🚪 Logout (Handover)"), use_container_width=True):
             st.session_state.role = None
@@ -5272,16 +5366,64 @@ with st.sidebar:
         
         if is_admin:
             system_keys = list(CATEGORY_SYSTEMS.keys())
-            system_labels = [CATEGORY_SYSTEMS[key]["label"] for key in system_keys]
+            system_labels = [CATEGORY_SYSTEMS[key]["label"] + ("（旧品牌·已暂停）" if key == 'titanium' and LEGACY_TITANIUM_PAUSED else "（旧品牌）" if key == 'titanium' else "") for key in system_keys]
             current_idx = system_keys.index(ACTIVE_CATEGORY_SYSTEM) if ACTIVE_CATEGORY_SYSTEM in system_keys else 0
             selected_label = st.radio("当前系统", system_labels, index=current_idx, key="admin_category_system_selector")
             selected_key = system_keys[system_labels.index(selected_label)]
             if selected_key != st.session_state.get("current_category_system", DEFAULT_CATEGORY_SYSTEM):
                 update_category_system_state(st.session_state, selected_key)
                 st.rerun()
+            if ACTIVE_CATEGORY_SYSTEM == 'titanium':
+                with st.expander('旧钛杯运营状态', expanded=ACTIVE_SYSTEM_PAUSED):
+                    st.info('当前已暂停，可查历史但不能写入。' if ACTIVE_SYSTEM_PAUSED else '当前仍在运营；确认暂停后将关闭旧品牌写入。')
+                    confirm_state = st.checkbox('确认切换旧品牌运营状态', key='confirm_legacy_state')
+                    if st.button('恢复旧品牌运营' if ACTIVE_SYSTEM_PAUSED else '暂停旧品牌运营',
+                                 disabled=not confirm_state, use_container_width=True):
+                        st.session_state.sheet_versions[SYSTEM_SETTINGS_SHEET] = st.session_state.sheet_versions.get(SYSTEM_SETTINGS_SHEET, 0) + 1
+                        latest_settings = load_data(SYSTEM_SETTINGS_SHEET, SYSTEM_SETTINGS_COLS)
+                        if (system_operating_state(latest_settings, 'titanium') == '暂停') != ACTIVE_SYSTEM_PAUSED:
+                            st.error('旧品牌状态刚被其他页面修改，请刷新后再试。')
+                        else:
+                            latest_settings = latest_settings[latest_settings['系统键'].astype(str).str.strip().ne('titanium')].reset_index(drop=True)
+                            latest_settings.loc[len(latest_settings)] = ['titanium', '运营中' if ACTIVE_SYSTEM_PAUSED else '暂停', datetime.now().strftime('%Y/%m/%d %H:%M:%S')]
+                            save_data(latest_settings, SYSTEM_SETTINGS_SHEET)
+                            st.rerun()
+                    staff_roles = {'店长', '全职店员', '兼职店员', '实习生'}
+                    migration_candidates = df_employee.loc[
+                        df_employee['职位'].isin(staff_roles)
+                        & df_employee['状态'].ne('离职')
+                        & df_employee[SYSTEM_PERMISSION_COL].map(lambda value: 'titanium' in parse_allowed_systems(value) and 'titanium_new' not in parse_allowed_systems(value))
+                    ]
+                    if not migration_candidates.empty:
+                        st.caption(f"可授权新钛杯的现有店员：{', '.join(migration_candidates['员工姓名'].astype(str))}")
+                        confirm_grant = st.checkbox('确认给上列店员增加新钛杯权限', key='confirm_new_titanium_staff')
+                        if st.button('批量增加新钛杯权限', disabled=not confirm_grant, use_container_width=True):
+                            fresh_emp = JIT_fetch([EMP_SHEET])[EMP_SHEET]
+                            changed_names = set()
+                            for row_idx, row in fresh_emp.iterrows():
+                                name = str(row.get('员工姓名', '')).strip()
+                                if (name in set(migration_candidates['员工姓名'].astype(str))
+                                        and str(row.get('职位', '')) in staff_roles
+                                        and str(row.get('状态', '')) != '离职'
+                                        and 'titanium' in parse_allowed_systems(row.get(SYSTEM_PERMISSION_COL, ''))
+                                        and 'titanium_new' not in parse_allowed_systems(row.get(SYSTEM_PERMISSION_COL, ''))):
+                                    fresh_emp.at[row_idx, SYSTEM_PERMISSION_COL] = grant_new_titanium_permission(row[SYSTEM_PERMISSION_COL])
+                                    changed_names.add(name)
+                            if changed_names:
+                                save_data(fresh_emp, EMP_SHEET)
+                                verified = JIT_fetch([EMP_SHEET])[EMP_SHEET]
+                                verified_names = {str(row['员工姓名']).strip() for _, row in verified.iterrows()
+                                                  if 'titanium_new' in parse_allowed_systems(row.get(SYSTEM_PERMISSION_COL, ''))}
+                                if changed_names <= verified_names:
+                                    st.success(f'已为 {len(changed_names)} 位店员增加新钛杯权限。')
+                                    st.rerun()
+                                else:
+                                    st.error('权限回读未通过，请刷新核对后再试。')
             st.divider()
             st.header("🛠️ 核心管理")
             with st.expander("➕ 新增产品建档 (Add SKU)"):
+                if ACTIVE_SYSTEM_PAUSED:
+                    st.warning('旧品牌已暂停，建档提交已禁用。')
                 try:
                     new_sku_fx_quote = _fetch_daily_cny_per_sgd()
                     new_sku_default_fx_rate = round(
@@ -5333,7 +5475,7 @@ with st.sidebar:
                     st.caption(
                         "填写人民币进价时，系统会在确认建档时自动计算并锁定新币进价。"
                     )
-                    if st.form_submit_button("确认建档"):
+                    if st.form_submit_button("确认建档", disabled=ACTIVE_SYSTEM_PAUSED):
                         if n_name and n_color:
                             try:
                                 resolved_n_cost = (
@@ -5369,17 +5511,17 @@ with st.sidebar:
                         else:
                             st.warning("请填写产品名称和颜色。")
             st.divider()
-            if st.button("📅 档期中心 / Popup 对比", use_container_width=True):
+            if st.button("📅 档期中心 / Popup 对比", use_container_width=True, disabled=ACTIVE_SYSTEM_PAUSED):
                 st.session_state.admin_page = "campaign_bi"
                 st.rerun()
             if ACTIVE_CATEGORY_SYSTEM == "titanium":
-                if st.button("📦 品类销售分析", use_container_width=True):
+                if st.button("📦 品类销售分析", use_container_width=True, disabled=ACTIVE_SYSTEM_PAUSED):
                     st.session_state.admin_page = "product_category_sales"
                     st.rerun()
-                if st.button("🔒 脱敏数据 / 市场洞察", use_container_width=True):
+                if st.button("🔒 脱敏数据 / 市场洞察", use_container_width=True, disabled=ACTIVE_SYSTEM_PAUSED):
                     st.session_state.admin_page = "market_insight"
                     st.rerun()
-            if st.button("🧾 经营收支", use_container_width=True):
+            if st.button("🧾 经营收支", use_container_width=True, disabled=ACTIVE_SYSTEM_PAUSED):
                 st.session_state.admin_page = "expenses"
                 st.rerun()
             if st.session_state.get("admin_page") in {
@@ -5390,8 +5532,21 @@ with st.sidebar:
                     st.session_state.admin_page = "main"
                     st.rerun()
         elif st.session_state.role == "employee":
-            allowed_systems = st.session_state.get("allowed_category_systems", [DEFAULT_CATEGORY_SYSTEM])
-            allowed_systems = [s for s in allowed_systems if s in CATEGORY_SYSTEMS] or [DEFAULT_CATEGORY_SYSTEM]
+            matching_employee = df_employee.loc[
+                df_employee['员工姓名'].fillna('').astype(str).str.strip().eq(str(st.session_state.current_user).strip())
+            ]
+            current_permissions = (parse_allowed_systems(matching_employee.iloc[0][SYSTEM_PERMISSION_COL])
+                                   if len(matching_employee) == 1 else st.session_state.get('allowed_category_systems', []))
+            allowed_systems = filter_operating_systems(
+                current_permissions, df_system_settings
+            )
+            st.session_state.allowed_category_systems = allowed_systems
+            if not allowed_systems:
+                st.warning('当前授权的系统已暂停，请联系管理员为你开通新系统。')
+                st.stop()
+            if ACTIVE_CATEGORY_SYSTEM not in allowed_systems:
+                update_category_system_state(st.session_state, allowed_systems[0])
+                st.rerun()
             if len(allowed_systems) > 1:
                 system_labels = [CATEGORY_SYSTEMS[key]["label"] for key in allowed_systems]
                 current_idx = allowed_systems.index(ACTIVE_CATEGORY_SYSTEM) if ACTIVE_CATEGORY_SYSTEM in allowed_systems else 0
@@ -5521,7 +5676,7 @@ if not is_market_insight_surface:
     col_title, col_lang = st.columns([8, 2])
     with col_title:
         st.title(t("🏙️ Takashimaya 零售管理系统 (云端同步版)", "🏙️ Takashimaya Retail System (Cloud Sync)"))
-        st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
+        st.caption(t(f"当前系统：{ACTIVE_SYSTEM_CONFIG['label']}{'（旧品牌）' if ACTIVE_CATEGORY_SYSTEM == 'titanium' else ''}", f"Current system: {ACTIVE_SYSTEM_CONFIG['label']}"))
     with col_lang:
         lang_choice = st.radio("🌐 Language", ["中文", "English"], index=0 if st.session_state.lang == 'cn' else 1, horizontal=True)
         if (lang_choice == "中文" and st.session_state.lang != "cn") or (lang_choice == "English" and st.session_state.lang != "en"):
@@ -5545,6 +5700,17 @@ is_supplier = st.session_state.role == "supplier"
 is_employee = st.session_state.role == "employee"
 is_showcase = st.session_state.role == "showcase"
 is_jewel = st.session_state.role == "jewel"
+
+if is_admin and ACTIVE_SYSTEM_PAUSED:
+    st.warning('旧钛杯品牌已暂停运营。这里仅供查阅历史；如需重新销售，请在左侧恢复运营。')
+    history_stock, history_sales, history_restock = st.tabs(['历史库存', '历史 POS 销售', '历史入库流水'])
+    with history_stock:
+        st.dataframe(df_stock, hide_index=True, use_container_width=True)
+    with history_sales:
+        st.dataframe(df_sales, hide_index=True, use_container_width=True)
+    with history_restock:
+        st.dataframe(df_restock, hide_index=True, use_container_width=True)
+    st.stop()
 
 def _campaign_options():
     if df_campaign.empty:
@@ -6694,6 +6860,8 @@ def render_admin_expenses():
     ))
     titanium_income = load_data("Sales", SALES_COLS)
     silk_income = load_data("Silk_Sales", SALES_COLS)
+    new_titanium_income = load_data("NewTi_Sales", SALES_COLS)
+    ceramic_income = load_data("Ceramic_Sales", SALES_COLS)
     lazada_income = load_data(LAZADA_SHEET, LAZADA_COLS)
 
     with st.expander("＋ 新增支出", expanded=records.empty):
@@ -6710,7 +6878,9 @@ def render_admin_expenses():
         form_version = st.session_state.get("expense_form_version", 0)
         with st.form(f"expense_create_form_{form_version}", clear_on_submit=False):
             expense_date = st.date_input("支出日期", value=datetime.now().date(), key=f"expense_date_{form_version}")
-            expense_scope = st.selectbox("归属系统", EXPENSE_SCOPES, key=f"expense_scope_{form_version}")
+            create_scopes = [scope for scope in EXPENSE_SCOPES
+                             if scope != '钛杯系统' or not LEGACY_TITANIUM_PAUSED]
+            expense_scope = st.selectbox("归属系统", create_scopes, key=f"expense_scope_{form_version}")
             custom_category = (
                 st.text_input("新类别名称", key=f"expense_custom_category_{form_version}")
                 if expense_category == "自定义类别" else ""
@@ -6796,7 +6966,7 @@ def render_admin_expenses():
 
     today = datetime.now().date()
     date_columns = [records["日期"]]
-    for sales_frame in (titanium_income, silk_income, lazada_income):
+    for sales_frame in (titanium_income, silk_income, new_titanium_income, ceramic_income, lazada_income):
         if "日期" in sales_frame.columns and not sales_frame.empty:
             date_columns.append(pd.to_datetime(sales_frame["日期"], errors="coerce", format="mixed"))
     dated = pd.concat(date_columns, ignore_index=True).dropna()
@@ -6823,11 +6993,12 @@ def render_admin_expenses():
     total = float(active["新币金额"].sum())
     income = _expense_income_summary(
         titanium_income, silk_income, lazada_income, start_date, end_date, selected_scope,
+        new_titanium_sales=new_titanium_income, ceramic_sales=ceramic_income,
     )
     st.subheader("经营收支")
     if selected_scope == "共同支出":
         st.metric("已录共同支出", f"${total:,.2f}")
-        st.caption("共同支出尚未分摊到钛杯或丝绸，不与单个系统收入直接相减。")
+        st.caption("共同支出尚未分摊到单个系统，不与单个系统收入直接相减。")
     else:
         total_col, expense_col, difference_col = st.columns(3)
         total_col.metric("总销售额", f"${income['总销售额']:,.2f}")
@@ -6837,11 +7008,14 @@ def render_admin_expenses():
         titanium_col.metric("钛杯 POS", f"${income['钛杯POS']:,.2f}")
         silk_col.metric("丝绸 POS", f"${income['丝绸POS']:,.2f}")
         lazada_col.metric("Lazada", f"${income['Lazada']:,.2f}")
+        new_col, ceramic_col = st.columns(2)
+        new_col.metric("新钛杯 POS", f"${income['新钛杯POS']:,.2f}")
+        ceramic_col.metric("景德镇瓷器 POS", f"${income['瓷器POS']:,.2f}")
         st.caption(
             "POS 为含税成交额，Lazada 为商品营业额；B2B 未计入。"
             "差额只减去这里已录的运营支出，未扣商品成本、工资、GST、商场抽成或平台费用，不是实际到账或净利润。"
         )
-        if selected_scope in EXPENSE_SCOPES[:2]:
+        if selected_scope in EXPENSE_SCOPES[:-1]:
             st.caption("共同支出尚未分摊到单个系统；单系统视图中的支出与差额不包含共同支出。")
         first_expense_date = records["日期"].dropna().min()
         if pd.notna(first_expense_date) and start_date < first_expense_date.date() and income["总销售额"] != 0:
@@ -6855,7 +7029,7 @@ def render_admin_expenses():
         fig = px.bar(
             summary, x="新币金额", y="类别", color="归属系统", orientation="h",
             category_orders={"类别": category_order, "归属系统": EXPENSE_SCOPES},
-            color_discrete_map={"钛杯系统": "#1864ab", "丝绸系统": "#b95d47", "共同支出": "#4e906e"},
+            color_discrete_map={"钛杯系统": "#1864ab", "丝绸系统": "#b95d47", "钛杯新品牌": "#168c82", "景德镇瓷器": "#9c6c20", "共同支出": "#4e906e"},
             labels={"新币金额": "SGD", "类别": "", "归属系统": "归属"},
         )
         fig.update_layout(
@@ -6960,7 +7134,7 @@ def render_admin_expenses():
 
 
 def render_admin_total_earnings():
-    st.caption("独立汇总：钛杯和丝绸 POS 净利、Lazada 商品毛贡献、其他收入，减去共用人工、待分配人工及额外运营支出。B2B 暂不计入。")
+    st.caption("独立汇总：各系统 POS 净利、旧钛杯 Lazada 商品毛贡献、其他收入，减去共用人工、待分配人工及额外运营支出。B2B 暂不计入。")
     today = datetime.now().date()
     selected_dates = st.date_input(
         "收益日期范围", value=(today.replace(day=1), today), key="total_earnings_dates",
@@ -6974,6 +7148,10 @@ def render_admin_total_earnings():
     titanium_sales = load_data("Sales", SALES_COLS)
     silk_stock = load_data("Silk_Stock", STOCK_COLS)
     silk_sales = load_data("Silk_Sales", SALES_COLS)
+    new_titanium_stock = load_data("NewTi_Stock", STOCK_COLS)
+    new_titanium_sales = load_data("NewTi_Sales", SALES_COLS)
+    ceramic_stock = load_data("Ceramic_Stock", STOCK_COLS)
+    ceramic_sales = load_data("Ceramic_Sales", SALES_COLS)
     attendance = load_data(ATT_SHEET, ATT_COLS)
     lazada_sales = load_data(LAZADA_SHEET, LAZADA_COLS)
     expenses = _normalize_expense_rows(load_data(EXPENSE_SHEET, EXPENSE_COLS))
@@ -6990,7 +7168,10 @@ def render_admin_total_earnings():
         with st.form("other_income_create"):
             col1, col2 = st.columns(2)
             income_date = col1.date_input("收入日期", value=today)
-            income_scope = col2.selectbox("归属", ["钛杯系统", "丝绸系统", "共同收入"])
+            income_scopes = ["钛杯系统", "丝绸系统", "钛杯新品牌", "景德镇瓷器", "共同收入"]
+            if LEGACY_TITANIUM_PAUSED:
+                income_scopes.remove('钛杯系统')
+            income_scope = col2.selectbox("归属", income_scopes)
             category = st.text_input("收入类别", placeholder="例如：活动补贴")
             item = st.text_input("收入项目")
             amount = st.number_input(f"收入金额（{currency}）", min_value=0.0, format="%.2f")
@@ -7030,6 +7211,8 @@ def render_admin_total_earnings():
     wages = _attendance_cost_breakdown(attendance, start_date, end_date)
     titanium_att = attendance.loc[attendance[ATT_SCOPE_COL].eq("钛杯系统")]
     silk_att = attendance.loc[attendance[ATT_SCOPE_COL].eq("丝绸系统")]
+    new_titanium_att = attendance.loc[attendance[ATT_SCOPE_COL].eq("钛杯新品牌")]
+    ceramic_att = attendance.loc[attendance[ATT_SCOPE_COL].eq("景德镇瓷器")]
     titanium_daily = _period_daily_financials(
         _dashboard_sales_with_cost(titanium_stock, titanium_sales, start_date, end_date),
         titanium_att, start_date, end_date,
@@ -7037,6 +7220,14 @@ def render_admin_total_earnings():
     silk_daily = _period_daily_financials(
         _dashboard_sales_with_cost(silk_stock, silk_sales, start_date, end_date),
         silk_att, start_date, end_date,
+    )
+    new_titanium_daily = _period_daily_financials(
+        _dashboard_sales_with_cost(new_titanium_stock, new_titanium_sales, start_date, end_date),
+        new_titanium_att, start_date, end_date,
+    )
+    ceramic_daily = _period_daily_financials(
+        _dashboard_sales_with_cost(ceramic_stock, ceramic_sales, start_date, end_date),
+        ceramic_att, start_date, end_date,
     )
     lazada = _lazada_contribution(titanium_stock, lazada_sales, start_date, end_date)
     other_income = _other_income_summary(income_rows, start_date, end_date)
@@ -7046,16 +7237,22 @@ def render_admin_total_earnings():
     expense_total = round(float(dated_expenses["新币金额"].sum()), 2)
     result = _calculate_total_earnings(
         titanium_daily, silk_daily, wages, lazada, other_income, expense_total,
+        new_titanium_daily=new_titanium_daily, ceramic_daily=ceramic_daily,
     )
 
     st.subheader("总收益（估算）")
     left, right, third = st.columns(3)
-    left.metric("钛杯 POS 净利", f"${result['钛杯净利']:,.2f}")
+    left.metric("旧钛杯 POS 净利", f"${result['钛杯净利']:,.2f}")
     right.metric("丝绸 POS 净利", f"${result['丝绸净利']:,.2f}")
     third.metric("总收益", f"${result['总收益']:,.2f}")
+    new_col, ceramic_col = st.columns(2)
+    new_col.metric("新钛杯 POS 净利", f"${result['新钛杯净利']:,.2f}")
+    ceramic_col.metric("景德镇瓷器 POS 净利", f"${result['瓷器净利']:,.2f}")
     detail = pd.DataFrame([
-        ("钛杯 POS 净利", result["钛杯净利"]),
+        ("旧钛杯 POS 净利", result["钛杯净利"]),
         ("丝绸 POS 净利", result["丝绸净利"]),
+        ("新钛杯 POS 净利", result["新钛杯净利"]),
+        ("景德镇瓷器 POS 净利", result["瓷器净利"]),
         ("Lazada 商品营业额", lazada["营业额"]),
         ("Lazada 商品进价", -lazada["商品成本"]),
         ("其他收入", other_income),
@@ -7066,7 +7263,7 @@ def render_admin_total_earnings():
     st.dataframe(detail, hide_index=True, use_container_width=True,
                  column_config={"金额 (SGD)": st.column_config.NumberColumn(format="$%.2f")})
     if result["待分配人工"]:
-        st.warning("旧考勤尚未分配系统：已在总收益中扣除一次，但没有计入钛杯或丝绸单独净利。可到考勤页逐条更正。")
+        st.warning("旧考勤尚未分配系统：已在总收益中扣除一次，但没有计入单系统净利。可到考勤页逐条更正。")
     if lazada["缺成本件数"]:
         st.warning(f"Lazada 有 {lazada['缺成本件数']:g} 件商品缺少进价，当前贡献额可能偏高。")
     st.caption("Lazada 仅扣当前 SKU 进价；平台佣金、物流、GST 等尚未自动扣除，发生时请登记为额外运营支出。历史 SKU 进价变更也会影响本页估算。")
@@ -7899,7 +8096,7 @@ def render_lazada_workspace():
         result = _apply_lazada_sales_import(
             refreshed["rows"], latest_stock, latest_lazada
         )
-        _save_lazada_sales_frames(result["stock"], result["lazada"])
+        _save_lazada_sales_frames(result["stock"], result["lazada"], write_guard=_assert_legacy_sheet_write_allowed)
         readback = JIT_fetch(["Stock", LAZADA_SHEET])
         verified, message = _verify_lazada_sales_commit(
             refreshed["rows"],
@@ -8213,7 +8410,7 @@ def render_lazada_workspace():
                             matches[0],
                             normalized["rows"],
                         )
-                        _save_lazada_sales_frames(result["stock"], result["lazada"])
+                        _save_lazada_sales_frames(result["stock"], result["lazada"], write_guard=_assert_legacy_sheet_write_allowed)
                         readback = JIT_fetch(["Stock", LAZADA_SHEET])
                         verified, message = _verify_lazada_sales_commit(
                             normalized["rows"], result["stock"], readback[LAZADA_SHEET], readback["Stock"]
@@ -8255,7 +8452,7 @@ def render_lazada_workspace():
                         if len(matches) != 1:
                             raise ValueError("原流水已变化，请刷新后重新选择。")
                         result = _revoke_lazada_sale(latest_lazada, latest_stock, matches[0])
-                        _save_lazada_sales_frames(result["stock"], result["lazada"])
+                        _save_lazada_sales_frames(result["stock"], result["lazada"], write_guard=_assert_legacy_sheet_write_allowed)
                         readback = JIT_fetch(["Stock", LAZADA_SHEET])
                         remaining_mask = (
                             readback[LAZADA_SHEET]["Lazada订单号"].fillna("").astype(str).str.strip().eq(str(selected_record["Lazada订单号"]).strip())
@@ -8361,7 +8558,7 @@ if is_admin:
         with t1_d:
             st.markdown("### 📤 批量建档与入库")
             st.info(
-                f"本次文件只会写入当前的 **{ACTIVE_SYSTEM_CONFIG['label']}**。"
+                f"本次文件只会写入当前的 **{ACTIVE_SYSTEM_CONFIG['label']}{'（旧品牌）' if ACTIVE_CATEGORY_SYSTEM == 'titanium' else ''}**。"
                 "上传后先预览，点击确认前不会修改后台。"
             )
             bulk_flash = st.session_state.pop("bulk_inventory_import_flash", None)
@@ -8566,6 +8763,7 @@ if is_admin:
                                     applied_bulk["restock"],
                                     STOCK_SHEET,
                                     RESTOCK_SHEET,
+                                    write_guard=_assert_legacy_sheet_write_allowed,
                                 )
                             except Exception as bulk_save_error:
                                 st.error(
@@ -8803,6 +9001,7 @@ if is_admin:
                                     applied_count["restock"],
                                     STOCK_SHEET,
                                     RESTOCK_SHEET,
+                                    write_guard=_assert_legacy_sheet_write_allowed,
                                 )
                             except Exception as count_save_error:
                                 st.error(
@@ -9508,11 +9707,13 @@ if is_admin:
                 e_phone = c4.text_input("联系方式 (选填)")
                 e_date = c5.date_input("入职/开通日期", value=datetime.now())
                 system_labels = [cfg["label"] for cfg in CATEGORY_SYSTEMS.values()]
+                new_staff_system = ('titanium_new' if LEGACY_TITANIUM_PAUSED
+                                    else DEFAULT_CATEGORY_SYSTEM)
                 e_systems = st.multiselect(
                     "可进入系统",
                     system_labels,
-                    default=[CATEGORY_SYSTEMS[DEFAULT_CATEGORY_SYSTEM]["label"]],
-                    help="只授权丝绸系统的员工，登录后会直接进入丝绸系统；授权两个系统的员工可自行切换。",
+                    default=[CATEGORY_SYSTEMS[new_staff_system]["label"]],
+                    help="员工仅能进入获授权且正在运营的系统；多系统员工可自行切换。",
                 )
                 if st.form_submit_button("保存人员信息"):
                     employee_name_key = e_name.strip().casefold()
@@ -9559,11 +9760,11 @@ if is_admin:
             v_emp.insert(0, "选择", False)
             
             v_emp['时薪'] = pd.to_numeric(v_emp['时薪'], errors='coerce').fillna(0.0)
-            permission_options = [
-                "钛杯系统",
-                "丝绸系统",
-                "钛杯系统, 丝绸系统",
-            ]
+            labels = [config['label'] for config in CATEGORY_SYSTEMS.values()]
+            permission_options = [', '.join(group) for count in range(1, len(labels) + 1)
+                                  for group in combinations(labels, count)]
+            permission_options += [value for value in v_emp[SYSTEM_PERMISSION_COL].fillna('').astype(str).unique()
+                                   if value and value not in permission_options]
             v_emp[SYSTEM_PERMISSION_COL] = v_emp[SYSTEM_PERMISSION_COL].fillna("").astype(str).replace("", "钛杯系统")
             
             editor_key = f"emp_editor_{st.session_state.emp_reset_key}"
@@ -9746,7 +9947,9 @@ if is_admin:
             (
                 "🧾 每日关店报告｜"
                 f"钛杯：{admin_daily_close_title_statuses['titanium']}｜"
-                f"丝绸：{admin_daily_close_title_statuses['silk']}"
+                f"丝绸：{admin_daily_close_title_statuses['silk']}｜"
+                f"新钛杯：{admin_daily_close_title_statuses['titanium_new']}｜"
+                f"瓷器：{admin_daily_close_title_statuses['ceramic']}"
             ),
             expanded=False,
         ):
@@ -9759,7 +9962,7 @@ if is_admin:
                 )
                 admin_daily_close_scope = admin_close_c2.selectbox(
                     "查看范围",
-                    ["全部", "钛杯系统", "丝绸系统"],
+                    ["全部"] + [config['label'] for config in CATEGORY_SYSTEMS.values()],
                     key="admin_daily_close_scope",
                 )
                 admin_daily_close_submitted = st.form_submit_button(
