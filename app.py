@@ -5421,6 +5421,18 @@ with st.sidebar:
                                     st.error('权限回读未通过，请刷新核对后再试。')
             st.divider()
             st.header("🛠️ 核心管理")
+            if st.button("📤 批量建档 / 入库", use_container_width=True, disabled=ACTIVE_SYSTEM_PAUSED):
+                st.session_state.admin_page = "bulk_inventory"
+                st.rerun()
+            st.download_button(
+                "⬇️ 下载入库模板",
+                data=_build_bulk_inventory_template_bytes(),
+                file_name="Taka_批量入库模板.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                disabled=ACTIVE_SYSTEM_PAUSED,
+                key="sidebar_bulk_inventory_template",
+            )
             with st.expander("➕ 新增产品建档 (Add SKU)"):
                 if ACTIVE_SYSTEM_PAUSED:
                     st.warning('旧品牌已暂停，建档提交已禁用。')
@@ -5526,7 +5538,7 @@ with st.sidebar:
                 st.rerun()
             if st.session_state.get("admin_page") in {
                 "campaign_bi", "product_category_sales", "market_insight",
-                "market_insight_preview", "expenses",
+                "market_insight_preview", "expenses", "bulk_inventory",
             }:
                 if st.button("↩️ 返回日常管理台", use_container_width=True):
                     st.session_state.admin_page = "main"
@@ -7385,6 +7397,255 @@ if is_showcase:
     render_market_insight_showcase(df_market_insights)
     st.stop()
 
+def render_bulk_inventory_import():
+    st.markdown("### 📤 批量建档与入库")
+    st.info(
+        f"本次文件只会写入当前的 **{ACTIVE_SYSTEM_CONFIG['label']}{'（旧品牌）' if ACTIVE_CATEGORY_SYSTEM == 'titanium' else ''}**。"
+        "上传后先预览，点击确认前不会修改后台。"
+    )
+    bulk_flash = st.session_state.pop("bulk_inventory_import_flash", None)
+    if bulk_flash:
+        if bulk_flash.get("verified"):
+            st.success(bulk_flash.get("message", "批量入库完成。"))
+        else:
+            st.warning(bulk_flash.get("message", "批量写入后回读核对未完成。"))
+
+    bulk_top1, bulk_top2 = st.columns(2)
+    bulk_default_date = bulk_top1.date_input(
+        "默认入库日期",
+        value=datetime.now().date(),
+        key="bulk_inventory_default_date",
+        help="模板中的入库日期留空时，采用这里的日期。",
+    )
+    bulk_batch_name = bulk_top2.text_input(
+        "批次名称（选填）",
+        placeholder="例如：早班到货、晚间补货、厂商第二箱",
+        key="bulk_inventory_batch_name",
+    )
+    st.download_button(
+        "⬇️ 下载标准模板",
+        data=_build_bulk_inventory_template_bytes(),
+        file_name="Taka_批量入库模板.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="download_bulk_inventory_template",
+    )
+    bulk_upload = st.file_uploader(
+        "上传入库文件",
+        type=["xlsx", "csv"],
+        key="bulk_inventory_file",
+        help="请使用标准模板；完全空白行会自动忽略。",
+    )
+
+    if bulk_upload is not None:
+        bulk_file_bytes = bulk_upload.getvalue()
+        bulk_file_fingerprint = hashlib.sha256(bulk_file_bytes).hexdigest()[:12]
+        try:
+            if bulk_upload.name.lower().endswith(".csv"):
+                bulk_raw = pd.read_csv(BytesIO(bulk_file_bytes), dtype=object)
+            else:
+                bulk_raw = pd.read_excel(
+                    BytesIO(bulk_file_bytes),
+                    sheet_name=0,
+                    dtype=object,
+                )
+        except Exception as bulk_read_error:
+            bulk_raw = None
+            st.error(f"文件无法读取，请检查格式或重新下载模板。错误：{bulk_read_error}")
+
+        if bulk_raw is not None:
+            bulk_normalized = _normalize_bulk_inventory_import(
+                bulk_raw,
+                bulk_default_date,
+            )
+            bulk_rows = bulk_normalized["rows"]
+            bulk_errors = list(bulk_normalized["errors"])
+            bulk_warnings = list(bulk_normalized["warnings"])
+            bulk_preview = _build_bulk_inventory_preview(
+                bulk_rows,
+                df_stock,
+            )
+            duplicate_backend = bulk_preview[
+                bulk_preview["状态"].eq("后台重复 SKU")
+            ]
+            for _, duplicate_row in duplicate_backend.iterrows():
+                bulk_errors.append(
+                    f"后台存在重复 SKU：{duplicate_row['商品名称']} "
+                    f"({duplicate_row['颜色']})，请先整理档案。"
+                )
+
+            history_notes = (
+                df_restock.get("备注", pd.Series(dtype="object"))
+                .fillna("")
+                .astype(str)
+            )
+            fingerprint_marker = f"[文件指纹:{bulk_file_fingerprint}]"
+            bulk_seen_before = history_notes.str.contains(
+                fingerprint_marker,
+                regex=False,
+            ).any()
+            if bulk_seen_before:
+                st.warning(
+                    "这份文件的内容以前导入过。若它确实代表另一批新到货，"
+                    "可以在下方二次确认后继续。"
+                )
+
+            total_inbound = (
+                int(bulk_preview["本批入库"].sum())
+                if not bulk_preview.empty
+                else 0
+            )
+            new_count = int(bulk_preview["状态"].eq("新增 SKU").sum())
+            restock_count = int(
+                bulk_preview["状态"].eq("已有 SKU 补货").sum()
+            )
+            price_update_count = int(
+                bulk_preview["价格将更新"].fillna(False).sum()
+            ) if not bulk_preview.empty else 0
+            bm1, bm2, bm3, bm4 = st.columns(4)
+            bm1.metric("有效 SKU", len(bulk_preview))
+            bm2.metric("新增 / 补货", f"{new_count} / {restock_count}")
+            bm3.metric("本批入库", f"{total_inbound} 件")
+            bm4.metric("价格资料更新", f"{price_update_count} 个 SKU")
+
+            for message in bulk_errors:
+                st.error(message)
+            for message in bulk_warnings:
+                st.warning(message)
+
+            if not bulk_preview.empty:
+                display_preview = bulk_preview.drop(
+                    columns=["_Excel行号"], errors="ignore"
+                ).copy()
+                st.dataframe(
+                    display_preview,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            confirm_repeated_file = True
+            if bulk_seen_before:
+                confirm_repeated_file = st.checkbox(
+                    "确认这是新的到货批次，不是重复点击",
+                    value=False,
+                    key=f"confirm_repeated_bulk_{bulk_file_fingerprint}",
+                )
+
+            bulk_submit_disabled = bool(bulk_errors) or not confirm_repeated_file
+            if st.button(
+                "✅ 确认批量入库",
+                type="primary",
+                use_container_width=True,
+                disabled=bulk_submit_disabled,
+                key="confirm_bulk_inventory_import",
+            ):
+                fresh_bulk = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
+                latest_bulk_stock = fresh_bulk[STOCK_SHEET]
+                latest_bulk_restock = fresh_bulk[RESTOCK_SHEET]
+                final_normalized = _normalize_bulk_inventory_import(
+                    bulk_raw,
+                    bulk_default_date,
+                )
+                final_rows = final_normalized["rows"]
+                final_preview = _build_bulk_inventory_preview(
+                    final_rows,
+                    latest_bulk_stock,
+                )
+                final_errors = list(final_normalized["errors"])
+                if final_preview["状态"].eq("后台重复 SKU").any():
+                    final_errors.append("最新后台存在重复 SKU，已停止导入。")
+
+                latest_notes = (
+                    latest_bulk_restock.get(
+                        "备注", pd.Series(dtype="object")
+                    )
+                    .fillna("")
+                    .astype(str)
+                )
+                latest_seen_before = latest_notes.str.contains(
+                    fingerprint_marker,
+                    regex=False,
+                ).any()
+                if latest_seen_before and not bulk_seen_before:
+                    final_errors.append(
+                        "这份文件在预览后已被另一笔操作导入。请刷新页面，"
+                        "确认它确实是新批次后再提交。"
+                    )
+                elif latest_seen_before and not confirm_repeated_file:
+                    final_errors.append("检测到相同文件，请先确认它是新的到货批次。")
+
+                if final_errors:
+                    for message in final_errors:
+                        st.error(message)
+                else:
+                    upload_now = datetime.now()
+                    batch_seed = (
+                        f"{upload_now.isoformat()}|{bulk_file_fingerprint}|"
+                        f"{st.session_state.get('current_user', '店长')}"
+                    )
+                    batch_suffix = hashlib.sha1(
+                        batch_seed.encode("utf-8")
+                    ).hexdigest()[:4].upper()
+                    bulk_batch_id = (
+                        f"IN-{upload_now.strftime('%Y%m%d-%H%M%S')}-"
+                        f"{batch_suffix}"
+                    )
+                    applied_bulk = _apply_bulk_inventory_import(
+                        final_rows,
+                        latest_bulk_stock,
+                        latest_bulk_restock,
+                        batch_id=bulk_batch_id,
+                        upload_timestamp=upload_now.strftime("%Y-%m-%d %H:%M:%S"),
+                        batch_name=bulk_batch_name,
+                        file_fingerprint=bulk_file_fingerprint,
+                    )
+                    try:
+                        _save_bulk_inventory_frames(
+                            applied_bulk["stock"],
+                            applied_bulk["restock"],
+                            STOCK_SHEET,
+                            RESTOCK_SHEET,
+                            write_guard=_assert_legacy_sheet_write_allowed,
+                        )
+                    except Exception as bulk_save_error:
+                        st.error(
+                            "批量入库未能提交，后台没有返回成功。"
+                            f"请检查网络后重试。错误：{bulk_save_error}"
+                        )
+                    else:
+                        readback_bulk = JIT_fetch(
+                            [STOCK_SHEET, RESTOCK_SHEET]
+                        )
+                        bulk_verified, verify_message = (
+                            _verify_bulk_inventory_commit(
+                                applied_bulk["stock"],
+                                readback_bulk[STOCK_SHEET],
+                                readback_bulk[RESTOCK_SHEET],
+                                final_rows,
+                                bulk_batch_id,
+                                applied_bulk["summary"]["流水数"],
+                            )
+                        )
+                        if bulk_verified:
+                            flash_message = (
+                                f"批量入库完成：批次 {bulk_batch_id}，"
+                                f"新增 {applied_bulk['summary']['新增SKU数']} 个 SKU，"
+                                f"补货 {applied_bulk['summary']['补货SKU数']} 个 SKU，"
+                                f"共入库 {applied_bulk['summary']['本批入库件数']} 件。"
+                            )
+                        else:
+                            flash_message = (
+                                f"批次 {bulk_batch_id} 已提交，但自动回读核对未完成："
+                                f"{verify_message} 请先查看底单流水，不要立即重复上传。"
+                            )
+                        st.session_state["bulk_inventory_import_flash"] = {
+                            "verified": bulk_verified,
+                            "message": flash_message,
+                        }
+                        st.rerun()
+
+
+
 if is_admin and st.session_state.get("admin_page") == "market_insight_preview":
     render_market_insight_showcase(
         df_market_insights,
@@ -7408,6 +7669,10 @@ if is_admin and st.session_state.get("admin_page") == "product_category_sales":
 
 if is_admin and st.session_state.get("admin_page") == "expenses":
     render_admin_finances()
+    st.stop()
+
+if is_admin and st.session_state.get("admin_page") == "bulk_inventory":
+    render_bulk_inventory_import()
     st.stop()
 
 if is_admin:
@@ -8556,252 +8821,7 @@ if is_admin:
                             st.error(f"⚠️ 找不到对应商品：{real_name} ({real_color})，请检查是否已被删除。")
 
         with t1_d:
-            st.markdown("### 📤 批量建档与入库")
-            st.info(
-                f"本次文件只会写入当前的 **{ACTIVE_SYSTEM_CONFIG['label']}{'（旧品牌）' if ACTIVE_CATEGORY_SYSTEM == 'titanium' else ''}**。"
-                "上传后先预览，点击确认前不会修改后台。"
-            )
-            bulk_flash = st.session_state.pop("bulk_inventory_import_flash", None)
-            if bulk_flash:
-                if bulk_flash.get("verified"):
-                    st.success(bulk_flash.get("message", "批量入库完成。"))
-                else:
-                    st.warning(bulk_flash.get("message", "批量写入后回读核对未完成。"))
-
-            bulk_top1, bulk_top2 = st.columns(2)
-            bulk_default_date = bulk_top1.date_input(
-                "默认入库日期",
-                value=datetime.now().date(),
-                key="bulk_inventory_default_date",
-                help="模板中的入库日期留空时，采用这里的日期。",
-            )
-            bulk_batch_name = bulk_top2.text_input(
-                "批次名称（选填）",
-                placeholder="例如：早班到货、晚间补货、厂商第二箱",
-                key="bulk_inventory_batch_name",
-            )
-            st.download_button(
-                "⬇️ 下载标准模板",
-                data=_build_bulk_inventory_template_bytes(),
-                file_name="Taka_批量入库模板.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="download_bulk_inventory_template",
-            )
-            bulk_upload = st.file_uploader(
-                "上传入库文件",
-                type=["xlsx", "csv"],
-                key="bulk_inventory_file",
-                help="请使用标准模板；完全空白行会自动忽略。",
-            )
-
-            if bulk_upload is not None:
-                bulk_file_bytes = bulk_upload.getvalue()
-                bulk_file_fingerprint = hashlib.sha256(bulk_file_bytes).hexdigest()[:12]
-                try:
-                    if bulk_upload.name.lower().endswith(".csv"):
-                        bulk_raw = pd.read_csv(BytesIO(bulk_file_bytes), dtype=object)
-                    else:
-                        bulk_raw = pd.read_excel(
-                            BytesIO(bulk_file_bytes),
-                            sheet_name=0,
-                            dtype=object,
-                        )
-                except Exception as bulk_read_error:
-                    bulk_raw = None
-                    st.error(f"文件无法读取，请检查格式或重新下载模板。错误：{bulk_read_error}")
-
-                if bulk_raw is not None:
-                    bulk_normalized = _normalize_bulk_inventory_import(
-                        bulk_raw,
-                        bulk_default_date,
-                    )
-                    bulk_rows = bulk_normalized["rows"]
-                    bulk_errors = list(bulk_normalized["errors"])
-                    bulk_warnings = list(bulk_normalized["warnings"])
-                    bulk_preview = _build_bulk_inventory_preview(
-                        bulk_rows,
-                        df_stock,
-                    )
-                    duplicate_backend = bulk_preview[
-                        bulk_preview["状态"].eq("后台重复 SKU")
-                    ]
-                    for _, duplicate_row in duplicate_backend.iterrows():
-                        bulk_errors.append(
-                            f"后台存在重复 SKU：{duplicate_row['商品名称']} "
-                            f"({duplicate_row['颜色']})，请先整理档案。"
-                        )
-
-                    history_notes = (
-                        df_restock.get("备注", pd.Series(dtype="object"))
-                        .fillna("")
-                        .astype(str)
-                    )
-                    fingerprint_marker = f"[文件指纹:{bulk_file_fingerprint}]"
-                    bulk_seen_before = history_notes.str.contains(
-                        fingerprint_marker,
-                        regex=False,
-                    ).any()
-                    if bulk_seen_before:
-                        st.warning(
-                            "这份文件的内容以前导入过。若它确实代表另一批新到货，"
-                            "可以在下方二次确认后继续。"
-                        )
-
-                    total_inbound = (
-                        int(bulk_preview["本批入库"].sum())
-                        if not bulk_preview.empty
-                        else 0
-                    )
-                    new_count = int(bulk_preview["状态"].eq("新增 SKU").sum())
-                    restock_count = int(
-                        bulk_preview["状态"].eq("已有 SKU 补货").sum()
-                    )
-                    price_update_count = int(
-                        bulk_preview["价格将更新"].fillna(False).sum()
-                    ) if not bulk_preview.empty else 0
-                    bm1, bm2, bm3, bm4 = st.columns(4)
-                    bm1.metric("有效 SKU", len(bulk_preview))
-                    bm2.metric("新增 / 补货", f"{new_count} / {restock_count}")
-                    bm3.metric("本批入库", f"{total_inbound} 件")
-                    bm4.metric("价格资料更新", f"{price_update_count} 个 SKU")
-
-                    for message in bulk_errors:
-                        st.error(message)
-                    for message in bulk_warnings:
-                        st.warning(message)
-
-                    if not bulk_preview.empty:
-                        display_preview = bulk_preview.drop(
-                            columns=["_Excel行号"], errors="ignore"
-                        ).copy()
-                        st.dataframe(
-                            display_preview,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                    confirm_repeated_file = True
-                    if bulk_seen_before:
-                        confirm_repeated_file = st.checkbox(
-                            "确认这是新的到货批次，不是重复点击",
-                            value=False,
-                            key=f"confirm_repeated_bulk_{bulk_file_fingerprint}",
-                        )
-
-                    bulk_submit_disabled = bool(bulk_errors) or not confirm_repeated_file
-                    if st.button(
-                        "✅ 确认批量入库",
-                        type="primary",
-                        use_container_width=True,
-                        disabled=bulk_submit_disabled,
-                        key="confirm_bulk_inventory_import",
-                    ):
-                        fresh_bulk = JIT_fetch([STOCK_SHEET, RESTOCK_SHEET])
-                        latest_bulk_stock = fresh_bulk[STOCK_SHEET]
-                        latest_bulk_restock = fresh_bulk[RESTOCK_SHEET]
-                        final_normalized = _normalize_bulk_inventory_import(
-                            bulk_raw,
-                            bulk_default_date,
-                        )
-                        final_rows = final_normalized["rows"]
-                        final_preview = _build_bulk_inventory_preview(
-                            final_rows,
-                            latest_bulk_stock,
-                        )
-                        final_errors = list(final_normalized["errors"])
-                        if final_preview["状态"].eq("后台重复 SKU").any():
-                            final_errors.append("最新后台存在重复 SKU，已停止导入。")
-
-                        latest_notes = (
-                            latest_bulk_restock.get(
-                                "备注", pd.Series(dtype="object")
-                            )
-                            .fillna("")
-                            .astype(str)
-                        )
-                        latest_seen_before = latest_notes.str.contains(
-                            fingerprint_marker,
-                            regex=False,
-                        ).any()
-                        if latest_seen_before and not bulk_seen_before:
-                            final_errors.append(
-                                "这份文件在预览后已被另一笔操作导入。请刷新页面，"
-                                "确认它确实是新批次后再提交。"
-                            )
-                        elif latest_seen_before and not confirm_repeated_file:
-                            final_errors.append("检测到相同文件，请先确认它是新的到货批次。")
-
-                        if final_errors:
-                            for message in final_errors:
-                                st.error(message)
-                        else:
-                            upload_now = datetime.now()
-                            batch_seed = (
-                                f"{upload_now.isoformat()}|{bulk_file_fingerprint}|"
-                                f"{st.session_state.get('current_user', '店长')}"
-                            )
-                            batch_suffix = hashlib.sha1(
-                                batch_seed.encode("utf-8")
-                            ).hexdigest()[:4].upper()
-                            bulk_batch_id = (
-                                f"IN-{upload_now.strftime('%Y%m%d-%H%M%S')}-"
-                                f"{batch_suffix}"
-                            )
-                            applied_bulk = _apply_bulk_inventory_import(
-                                final_rows,
-                                latest_bulk_stock,
-                                latest_bulk_restock,
-                                batch_id=bulk_batch_id,
-                                upload_timestamp=upload_now.strftime("%Y-%m-%d %H:%M:%S"),
-                                batch_name=bulk_batch_name,
-                                file_fingerprint=bulk_file_fingerprint,
-                            )
-                            try:
-                                _save_bulk_inventory_frames(
-                                    applied_bulk["stock"],
-                                    applied_bulk["restock"],
-                                    STOCK_SHEET,
-                                    RESTOCK_SHEET,
-                                    write_guard=_assert_legacy_sheet_write_allowed,
-                                )
-                            except Exception as bulk_save_error:
-                                st.error(
-                                    "批量入库未能提交，后台没有返回成功。"
-                                    f"请检查网络后重试。错误：{bulk_save_error}"
-                                )
-                            else:
-                                readback_bulk = JIT_fetch(
-                                    [STOCK_SHEET, RESTOCK_SHEET]
-                                )
-                                bulk_verified, verify_message = (
-                                    _verify_bulk_inventory_commit(
-                                        applied_bulk["stock"],
-                                        readback_bulk[STOCK_SHEET],
-                                        readback_bulk[RESTOCK_SHEET],
-                                        final_rows,
-                                        bulk_batch_id,
-                                        applied_bulk["summary"]["流水数"],
-                                    )
-                                )
-                                if bulk_verified:
-                                    flash_message = (
-                                        f"批量入库完成：批次 {bulk_batch_id}，"
-                                        f"新增 {applied_bulk['summary']['新增SKU数']} 个 SKU，"
-                                        f"补货 {applied_bulk['summary']['补货SKU数']} 个 SKU，"
-                                        f"共入库 {applied_bulk['summary']['本批入库件数']} 件。"
-                                    )
-                                else:
-                                    flash_message = (
-                                        f"批次 {bulk_batch_id} 已提交，但自动回读核对未完成："
-                                        f"{verify_message} 请先查看底单流水，不要立即重复上传。"
-                                    )
-                                st.session_state["bulk_inventory_import_flash"] = {
-                                    "verified": bulk_verified,
-                                    "message": flash_message,
-                                }
-                                st.rerun()
-
+            render_bulk_inventory_import()
         with t1_e:
             st.markdown("### 📋 批量盘点覆盖")
             inventory_count_mode = st.radio(
